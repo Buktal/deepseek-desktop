@@ -587,12 +587,16 @@ fn global_dsh_bin() -> Option<PathBuf> {
 }
 
 /// 安装包内置离线缓存目录(若存在)。
-/// 约定:<资源目录>/npm-cache,内含 npm cacache(index-v5/content-v2/tmp)。
-/// 仅当目录带 cacache 的 index-v5 标记时才视为「缓存存在」,避免打包遗漏时
-/// 空目录被误判为离线缓存。
+/// 约定:<资源目录>/npm-cache,内含 npm cacache。缓存存在性以 cacache 内部
+/// 结构为标记:`_cacache/index-v5` 与 `_cacache/content-v2` 两个目录都在才算。
+/// 刻意用 cacache 内部结构而非 npm 顶层 `index-v5` 元数据索引:npm 10.9+ 起
+/// 不再写顶层 index-v5(元数据并入 _cacache),而 `_cacache` 布局在 npm 7-12
+/// 全版本稳定(2026-08-14 实测 npm 10.9.7 生成的缓存;旧标记会把 #6 打包的
+/// 缓存漏判为不存在,离线安装静默失效)。
+/// 空目录 / 打包遗漏时不满足标记 → 不算缓存,回退网络安装。
 fn bundle_cache_dir(resource_dir: &Path) -> Option<PathBuf> {
     let dir = resource_dir.join(BUNDLE_CACHE_REL);
-    if dir.is_dir() && dir.join("index-v5").is_dir() {
+    if dir.join("_cacache/index-v5").is_dir() && dir.join("_cacache/content-v2").is_dir() {
         Some(dir)
     } else {
         None
@@ -1273,8 +1277,13 @@ mod tests {
         // 空目录不算缓存(打包遗漏时不得误判离线)
         std::fs::create_dir_all(dir.join("npm-cache")).unwrap();
         assert_eq!(bundle_cache_dir(&dir), None);
-        // 带 cacache index-v5 标记 → 视为存在
+        // 只有 npm 顶层 index-v5(旧 npm ≤10.8 元数据索引)也不算 ——
+        // 标记看 cacache 内部结构,不是 npm 顶层目录
         std::fs::create_dir_all(dir.join("npm-cache/index-v5")).unwrap();
+        assert_eq!(bundle_cache_dir(&dir), None);
+        // 带 cacache 内部标记(_cacache/index-v5 + _cacache/content-v2)→ 视为存在
+        std::fs::create_dir_all(dir.join("npm-cache/_cacache/index-v5")).unwrap();
+        std::fs::create_dir_all(dir.join("npm-cache/_cacache/content-v2")).unwrap();
         assert_eq!(bundle_cache_dir(&dir), Some(dir.join("npm-cache")));
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -1,0 +1,93 @@
+name: Release
+
+# 打 tag(v*) 触发:构建 + 签名 + 发 Release + 生成 latest.json。
+# 用法:`git tag v0.1.0 && git push origin v0.1.0`(详见 README「发布」章节)。
+#
+# 仅构建 Windows(windows-latest):
+#  - 产品是 Windows 桌面壳(NSIS passive 升级、托盘);macOS/Linux 无发布渠道
+#  - 安装包内置的 npm 离线缓存(@deepseek-ai/dsh 依赖树)在构建机上按平台
+#    解析(原生可选依赖如 esbuild),多平台矩阵会让缓存与实际平台错位
+# 若将来加平台,须各平台分别生成 npm-cache 再打包(见 scripts/prepare-npm-cache.mjs)。
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          # Note: the `corepack` input was removed from setup-node@v4;
+          # corepack is enabled explicitly in the step below instead.
+
+      - name: Enable Corepack (pinned Yarn 4)
+        run: corepack enable
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: yarn install
+
+      - name: Extract changelog for this release
+        # Pull this tag's section out of CHANGELOG.md → GitHub Release body.
+        # tauri-action copies the Release body into the updater's latest.json
+        # `notes`, shown in the in-app UpdateCard. shell: bash so the heredoc
+        # works on the Windows runner too.
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node scripts/extract-changelog.mjs > body.md
+          # Write a multi-line GITHUB_ENV value with printf so the closing
+          # delimiter always sits on its own line even if body.md lacks a
+          # trailing newline (extract-changelog.mjs trims its output).
+          printf 'RELEASE_BODY<<CHANGELOG_EOF\n' >> "$GITHUB_ENV"
+          cat body.md >> "$GITHUB_ENV"
+          printf '\nCHANGELOG_EOF\n' >> "$GITHUB_ENV"
+
+      - name: Build and publish
+        # Pinned to v0.5.20 as a known-good baseline (same as the reference
+        # project O_CC_One). Auto-update also requires
+        # bundle.createUpdaterArtifacts: true in tauri.conf.json — without it
+        # Tauri emits no signed updater artifact and the action skips latest.json
+        # ("Signature not found for the updater JSON"). Re-evaluate on a bump.
+        # 安装包内置 npm 离线缓存由 beforeBuildCommand
+        # (yarn web:build && node scripts/prepare-npm-cache.mjs)生成,随
+        # bundle.resources 打进安装包。
+        uses: tauri-apps/tauri-action@v0.5.20
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Ed25519 签名密钥(见 #5):tauri-action 为每个安装包生成 .sig、
+          # 组装 latest.json 更新清单并随 Release 发布。对应公钥在
+          # tauri.conf.json(plugins.updater.pubkey);私钥 + 密码在仓库
+          # Secrets 中 —— 打 tag 前须先设置(见 README「发布」章节)。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'DeepSeek Desktop ${{ github.ref_name }}'
+          releaseBody: ${{ env.RELEASE_BODY }}
+          releaseDraft: false
+          prerelease: false
+          # Windows 就地升级优先用 NSIS(带 npm-cache 的安装包)。
+          updaterJsonPreferNsis: true

@@ -7,7 +7,7 @@
   "build": {
     "beforeDevCommand": "yarn web:dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "yarn web:build",
+    "beforeBuildCommand": "yarn web:build && node scripts/prepare-npm-cache.mjs",
     "frontendDist": "../dist"
   },
   "app": {
@@ -39,8 +39,11 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": "nsis",
     "createUpdaterArtifacts": true,
+    "resources": {
+      "resources/npm-cache": "npm-cache"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
