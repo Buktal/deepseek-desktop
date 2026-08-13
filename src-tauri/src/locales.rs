@@ -9,6 +9,7 @@
 /// 语言判别。`lang_from_locale` 与前端 src/i18n/languages.ts 的 `resolveLanguage`
 /// 同规则(zh* → zh,en* → en,其余 → zh)。两个运行时各持一份实现——
 /// 各自是所在运行时的单一实现,跨运行时共享的规则以本注释为锚点,改动需同步。
+#[derive(Clone, Copy)]
 pub enum Lang {
     Zh,
     En,
@@ -28,7 +29,9 @@ pub fn detect_lang() -> Lang {
     lang_from_locale(sys_locale::get_locale().as_deref())
 }
 
-/// 原生界面文案表。&'static str 让 setup 阶段构建的托盘/对话框闭包无需持有 String。
+/// 原生界面文案表。&'static str 让 setup 阶段构建的托盘/对话框闭包无需持有 String;
+/// 动态数值(版本号等)经下方 `*_message` / `*_label` 函数插值,禁止拼串(#3 §6)。
+#[derive(Clone, Copy)]
 pub struct ShellTexts {
     pub tray_toggle: &'static str,
     pub tray_theme: &'static str,
@@ -42,6 +45,48 @@ pub struct ShellTexts {
     pub close_minimize: &'static str,
     pub close_cancel: &'static str,
     pub dsh_crashed: &'static str,
+    /// 手动检查发现新版对话框的按钮(升级 / 稍后,见 update.rs)
+    pub update_now: &'static str,
+    pub update_later: &'static str,
+    lang: Lang,
+}
+
+impl ShellTexts {
+    /// 手动检查发现新版:对话框正文(含中断影响明示,#3 §4)。
+    pub fn update_found_message(&self, version: &str, current: &str) -> String {
+        match self.lang {
+            Lang::Zh => format!(
+                "发现新版本 v{version}(当前 v{current})。升级将重启应用与 dsh 服务,当前页面会话会中断;数据保存在本机,不受影响"
+            ),
+            Lang::En => format!(
+                "New version v{version} available (current v{current}). Upgrading will restart the app and the dsh service, interrupting the current page session. Your data stays on this machine"
+            ),
+        }
+    }
+
+    /// 手动检查无新版:对话框正文。
+    pub fn update_up_to_date_message(&self, current: &str) -> String {
+        match self.lang {
+            Lang::Zh => format!("DeepSeek Desktop 已是最新版本(v{current})"),
+            Lang::En => format!("DeepSeek Desktop is up to date (v{current})"),
+        }
+    }
+
+    /// 托盘动态菜单项文案:「升级到 vX」(发现新版时插入菜单,#3 §1)。
+    pub fn tray_upgrade_label(&self, version: &str) -> String {
+        match self.lang {
+            Lang::Zh => format!("升级到 v{version}"),
+            Lang::En => format!("Upgrade to v{version}"),
+        }
+    }
+
+    /// 托盘 tooltip:发现新版时的提示。
+    pub fn tray_tooltip_available(&self, version: &str) -> String {
+        match self.lang {
+            Lang::Zh => format!("发现新版本 v{version}"),
+            Lang::En => format!("New version v{version} available"),
+        }
+    }
 }
 
 pub fn shell_texts(lang: Lang) -> ShellTexts {
@@ -60,6 +105,9 @@ pub fn shell_texts(lang: Lang) -> ShellTexts {
             close_minimize: "最小化到托盘",
             close_cancel: "取消",
             dsh_crashed: "dsh 进程意外退出,请重新启动应用",
+            update_now: "升级",
+            update_later: "稍后",
+            lang: Lang::Zh,
         },
         Lang::En => ShellTexts {
             tray_toggle: "Show/Hide window",
@@ -76,6 +124,9 @@ pub fn shell_texts(lang: Lang) -> ShellTexts {
             close_minimize: "Minimize to tray",
             close_cancel: "Cancel",
             dsh_crashed: "dsh exited unexpectedly; please restart the app",
+            update_now: "Upgrade",
+            update_later: "Later",
+            lang: Lang::En,
         },
     }
 }

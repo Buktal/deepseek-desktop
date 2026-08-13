@@ -32,6 +32,10 @@ export function useBoot() {
   // 跨边界保持结构化形态,ErrorScreen 渲染时才翻译(语言切换不冻结旧文案)
   const [error, setError] = useState<StructuredError | null>(null)
   const [logs, setLogs] = useState<BootLog[]>([])
+  // 挂载时快照是否已是 ready:true = 本地页由升级流程导航回来(dsh 已在跑),
+  // 升级卡片可展示(#5 路由);false = 本次挂载经历 boot 推进(全新启动),
+  // ready 事件到达后 Rust 即将导航去 dsh 页,不得中途切升级卡片。
+  const [mountSnapshotReady, setMountSnapshotReady] = useState(false)
 
   const fail = useCallback((e: StructuredError) => {
     setPhase("error")
@@ -46,6 +50,7 @@ export function useBoot() {
         setPhase(snap.phase)
         setError(toStructuredError(snap.error ?? null))
         setLogs(snap.logs)
+        if (snap.phase === "ready") setMountSnapshotReady(true)
       })
       .catch((e) =>
         // 命令拒绝(IPC/命令面异常):detail 透传原始串,框架文案渲染时翻译
@@ -94,5 +99,5 @@ export function useBoot() {
     invoke("quit_app").catch(() => {})
   }, [])
 
-  return { phase, error, logs, retry, quit }
+  return { phase, error, logs, retry, quit, mountSnapshotReady }
 }

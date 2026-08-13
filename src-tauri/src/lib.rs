@@ -1,12 +1,13 @@
 //! DeepSeek Desktop Tauri backend.
 //!
-//! 组装:dsh 生命周期管理 + 托盘 + 关闭三选对话框 + 退出收敛(杀子进程)+ 生产日志。
+//! 组装:dsh 生命周期管理 + 应用自身升级 + 托盘 + 关闭三选对话框 + 退出收敛(杀子进程)+ 生产日志。
 
 mod dsh;
 mod locales;
 mod logging;
 mod theme;
 mod tray;
+mod update;
 
 use tauri::{Manager, WindowEvent};
 use tauri_plugin_dialog::{
@@ -26,6 +27,11 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        // 应用自身升级:check/download/install 全在 Rust(update.rs,照搬
+        // O_CC_One 的插件组合——updater 检查下载 + process/opener 配套能力)
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // 生产日志:落盘到 <app_data_dir>/logs/app.log + stdout,panic 经 hook 同落盘。
             // 失败不致命:降级为仅控制台输出,应用照常启动。
@@ -41,6 +47,11 @@ pub fn run() {
             let manager = dsh::DshManager::new(app.handle().clone());
             app.manage(manager.clone());
 
+            // 应用升级管理器 + 常驻检查(启动探测 + 6h 轮询,#9:检查逻辑在 Rust 侧)
+            let updater = update::UpdateManager::new(app.handle().clone());
+            app.manage(updater.clone());
+            updater.start_resident_checks();
+
             // 托盘
             tray::setup_tray(app.handle())?;
 
@@ -54,7 +65,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             dsh::boot,
             dsh::quit_app,
-            theme::theme_state
+            theme::theme_state,
+            update::update_state,
+            update::update_apply,
+            update::update_restart,
+            update::update_dismiss
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

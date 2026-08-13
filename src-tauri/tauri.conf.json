@@ -26,9 +26,21 @@
       "csp": "default-src 'self'; img-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
     }
   },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/Buktal/deepseek-desktop/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU5RjdCNjMzNERDRjdGOUMKUldTY2Y4OU5NN2IzV1dZaUtHL2Q3eXN1VTRnL0xGM2UydUo0ZVJFajBvSHZ0Qmd4QnBvWURpOVIK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

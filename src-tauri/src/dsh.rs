@@ -208,6 +208,8 @@ pub struct DshManager {
     child: Arc<Mutex<Option<Child>>>,
     /// 安装中 npm 子进程 pid(退出收敛时一并杀掉;npm 会再拉起 node 子进程,按树杀)
     install_pid: Arc<Mutex<Option<u32>>>,
+    /// 当前 dsh 页 URL(boot 就绪时记录;#3 §7:升级卡片「稍后/返回」的导航目标)。
+    dsh_url: Arc<Mutex<Option<String>>>,
 }
 
 impl DshManager {
@@ -221,6 +223,14 @@ impl DshManager {
             })),
             child: Arc::new(Mutex::new(None)),
             install_pid: Arc::new(Mutex::new(None)),
+            dsh_url: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// 记录当前 dsh 页 URL(boot 就绪时调用;升级卡片「稍后」导航目标)。
+    fn record_dsh_url(&self, url: String) {
+        if let Ok(mut g) = self.dsh_url.lock() {
+            *g = Some(url);
         }
     }
 
@@ -397,6 +407,15 @@ fn kill_pid_tree(pid: u32) {
     {
         let _ = Command::new("kill").arg(pid.to_string()).status();
     }
+}
+
+/// 当前 dsh 页 URL(None = 尚未就绪过)。升级卡片「稍后/返回」的导航目标。
+pub fn dsh_url(manager: &DshManager) -> Option<String> {
+    manager
+        .dsh_url
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
 }
 
 /// 杀掉 dsh 子进程(进程树)与安装中的 npm 进程,幂等。
@@ -914,9 +933,11 @@ fn boot_pipeline(manager: &DshManager) {
     };
     log::info!("[dsh] boot: ready on port {port}");
 
-    // 6. 就绪:导航窗口到 dsh Web UI,窗口自此变纯 dsh 页面(只做显示,不干扰功能)
+    // 6. 就绪:记录 dsh URL(升级卡片「稍后/返回」导航目标,#3 §7)→ 导航窗口
+    //    到 dsh Web UI,窗口自此变纯 dsh 页面(只做显示,不干扰功能)
     manager.set_phase(Phase::Ready, None);
     let url = format!("http://127.0.0.1:{port}");
+    manager.record_dsh_url(url.clone());
     if let Some(win) = manager.app.get_webview_window("main") {
         if let Ok(u) = tauri::Url::parse(&url) {
             log::info!("[dsh] boot: navigate → {url}");

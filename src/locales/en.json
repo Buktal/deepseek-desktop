@@ -6,6 +6,7 @@
   "boot.ready.title": "Opening dsh…",
   "boot.starting.hint": "First start initializes the environment and may take a minute or two",
   "boot.starting.title": "Starting dsh…",
+  "common.close": "Close",
   "common.quit": "Quit",
   "common.retry": "Retry",
   "error.title": "Startup failed",
@@ -37,5 +38,19 @@
   "errors.NpmRootTimeout": "npm root -g timed out (no response in {{seconds}}s); cannot locate the global dsh. Check that npm works",
   "errors.NpmSpawnFailed": "Could not start the npm install: {{detail}}",
   "errors.ReadyPortUnavailable": "dsh printed a ready address but port {{port}} is not listening",
-  "errors.unknown": "Unknown error"
+  "errors.UpdateDownloadFailed": "Update download failed: {{detail}}",
+  "errors.unknown": "Unknown error",
+  "update.available.found": "New version v{{version}} available",
+  "update.current": "Current v{{version}}",
+  "update.downloaded": "Downloaded {{pct}}%",
+  "update.downloading": "Downloading update…",
+  "update.failed": "Auto-update failed",
+  "update.later": "Later",
+  "update.manualHint": "You can download the installer manually from GitHub.",
+  "update.openGithub": "Open GitHub",
+  "update.pleaseWait": "Please wait",
+  "update.ready": "Update ready",
+  "update.restartNow": "Restart now",
+  "update.restartToInstall": "Restart the app to finish installing. The dsh service restarts with it, interrupting this page session. Your data stays on this machine",
+  "update.updateNow": "Update now"
 }

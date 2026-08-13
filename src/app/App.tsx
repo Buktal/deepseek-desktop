@@ -1,14 +1,42 @@
-// Root app.启动编排:按 boot 阶段分发渲染。
+// Root app.启动编排:按 boot 阶段分发渲染;升级卡片(#5)优先于 boot 分发——
+// 挂载时若升级状态活跃(available/downloading/ready/failed)且快照已是 ready
+// (本地页由升级流程导航回来,dsh 已在跑),渲染升级卡片;否则走 boot 分发
+// (现状逻辑不变;全新启动时 ready 事件到达后 Rust 即将导航去 dsh 页,
+// 靠 useBoot 的 mountSnapshotReady 区分,不中途切卡片)。
 // ready 由 Rust 侧接管(窗口 navigate 到 dsh Web UI),前端只短暂显示过渡。
+import { UpgradeCard } from "@/components/update/UpgradeCard"
 import { BootScreen } from "@/components/boot/BootScreen"
 import { ErrorScreen } from "@/components/boot/ErrorScreen"
 import { useBoot } from "@/lib/useBoot"
 import { useThemeSync } from "@/lib/useThemeSync"
+import { isActiveUpdateStatus, useUpdateCheck } from "@/lib/useUpdateCheck"
 
 export default function App() {
-  const { phase, error, logs, retry, quit } = useBoot()
+  const { phase, error, logs, retry, quit, mountSnapshotReady } = useBoot()
   // 主题同步:Rust 下发生效主题 → <html>.dark(boot UI 全程生效)
   useThemeSync()
+  // 升级状态镜像(Rust 侧单一事实源,见 useUpdateCheck)
+  const update = useUpdateCheck()
+
+  // #3 §5:挂载时先查升级状态,有活跃态(且快照已 ready) → 升级卡片;
+  // 否则走 boot 分发。boot 命令在升级页挂载时仍被调用(phase=Ready 无副作用)。
+  if (mountSnapshotReady && isActiveUpdateStatus(update.status)) {
+    return (
+      <UpgradeCard
+        status={update.status}
+        version={update.version}
+        currentVersion={update.currentVersion}
+        notes={update.notes}
+        error={update.error}
+        downloadedBytes={update.downloadedBytes}
+        totalBytes={update.totalBytes}
+        onApply={update.applyUpdate}
+        onRestart={update.restartNow}
+        onDismiss={update.dismiss}
+        onOpenReleases={update.openReleases}
+      />
+    )
+  }
 
   if (phase === "error") {
     // error 是结构化失败原因,ErrorScreen 渲染时翻译(兜底 errors.unknown 在彼处)
