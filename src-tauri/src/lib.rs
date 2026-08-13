@@ -5,6 +5,7 @@
 mod dsh;
 mod locales;
 mod logging;
+mod theme;
 mod tray;
 
 use tauri::{Manager, WindowEvent};
@@ -32,6 +33,10 @@ pub fn run() {
                 eprintln!("[logging] init 失败,日志仅输出到控制台: {e}");
             }
 
+            // 主题:读持久化 → 内存 + 注册 OS 主题变化监听。
+            // 须在 setup_tray 之前:托盘勾选状态读 theme::current_choice()
+            theme::init(app.handle());
+
             // dsh 管理器(Clone 共享内部 Arc 状态)
             let manager = dsh::DshManager::new(app.handle().clone());
             app.manage(manager.clone());
@@ -46,7 +51,11 @@ pub fn run() {
             dsh::boot_start(&manager);
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![dsh::boot, dsh::quit_app])
+        .invoke_handler(tauri::generate_handler![
+            dsh::boot,
+            dsh::quit_app,
+            theme::theme_state
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {

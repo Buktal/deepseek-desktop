@@ -49,6 +49,8 @@
 }
 
 :root {
+    /* 原生控件/滚动条跟随主题(shadcn dark mode 惯例):亮色系 */
+    color-scheme: light;
     --background: oklch(1 0 0);
     --foreground: oklch(0.145 0 0);
     --card: oklch(1 0 0);
@@ -84,6 +86,8 @@
 }
 
 .dark {
+    /* 原生控件/滚动条跟随主题:暗色系(与 :root 的 color-scheme 配对) */
+    color-scheme: dark;
     --background: oklch(0.145 0 0);
     --foreground: oklch(0.985 0 0);
     --card: oklch(0.205 0 0);

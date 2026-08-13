@@ -16,10 +16,13 @@
 //! 图标:原生托盘菜单不支持图标(tauri 菜单项无图标参数,Windows 托盘菜单本就不渲染
 //! 图标),文案即全部表达。
 //!
-//! 主题三项与检查更新是 #8/#5 的功能占位:本文件定结构、文案与分发逻辑
-//! (菜单点击 → 事件推前端),功能本体由对应 ticket 挂接——
-//! - #8 主题切换:前端监听 `tray-theme` 事件(payload 为 "light"|"dark"|"system"
-//!   字符串),boot UI 应用主题;勾选状态以本模块内存为事实源。
+//! 主题三项与检查更新是 #8/#5 的功能入口:本文件定结构、文案与菜单分发,
+//! 功能本体由对应 ticket 落地——
+//! - #8 主题切换:点击主题项 → `theme::choose`(theme.rs 是主题的单一事实源:
+//!   更新内存、持久化、同步原生窗口、推 `theme-changed` 生效主题事件给 boot UI)。
+//!   勾选状态以 theme.rs 内存为事实源;本处仍按 #9 契约推 `tray-theme` 事件
+//!   (payload 为 "light"|"dark"|"system" 选择串),boot UI 实际消费的是
+//!   `theme-changed`("light"|"dark" 生效主题,见 theme.rs 模块文档)。
 //!   注意:事件只到 boot UI(dsh 页是 remote origin,ACL 拒绝,见 dsh.rs 安全语义),
 //!   与红线一致——dsh 页面不碰主题。
 //! - #5 应用自身升级:前端监听 `tray-check-update` 事件(无 payload)。
@@ -28,42 +31,15 @@
 //! - 退出:先杀 dsh 子进程再 exit(所有退出路径最终经 RunEvent::ExitRequested 再杀一次,
 //!   kill_child 幂等,无副作用)。
 
-use std::sync::Mutex;
-
 use tauri::menu::{CheckMenuItem, MenuBuilder, MenuItem, SubmenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, Wry};
 
-use crate::{dsh, locales};
-
-/// 主题选择:托盘勾选状态的内存事实源(#8 持久化后由持久化值初始化)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThemeChoice {
-    Light,
-    Dark,
-    System,
-}
-
-impl ThemeChoice {
-    fn menu_id(self) -> &'static str {
-        match self {
-            ThemeChoice::Light => "theme-light",
-            ThemeChoice::Dark => "theme-dark",
-            ThemeChoice::System => "theme-system",
-        }
-    }
-
-    /// 推给前端的事件 payload("light"|"dark"|"system")。
-    fn event_payload(self) -> &'static str {
-        match self {
-            ThemeChoice::Light => "light",
-            ThemeChoice::Dark => "dark",
-            ThemeChoice::System => "system",
-        }
-    }
-}
+use crate::{dsh, locales, theme};
+use crate::theme::ThemeChoice;
 
 /// 菜单事件 id → 主题选择。纯函数,可测;未知 id 返回 None。
+/// 主题状态与映射的单一事实源在 theme.rs(ThemeChoice::menu_id ↔ from_payload)。
 fn theme_choice_from_id(id: &str) -> Option<ThemeChoice> {
     match id {
         "theme-light" => Some(ThemeChoice::Light),
@@ -73,32 +49,19 @@ fn theme_choice_from_id(id: &str) -> Option<ThemeChoice> {
     }
 }
 
-/// 当前主题选择。默认"跟随系统"(与现状一致:外壳无主题能力,即跟随系统)。
-static THEME: Mutex<ThemeChoice> = Mutex::new(ThemeChoice::System);
-
-fn current_theme() -> ThemeChoice {
-    *THEME.lock().unwrap_or_else(|p| p.into_inner())
-}
-
-fn set_theme(choice: ThemeChoice) {
-    if let Ok(mut g) = THEME.lock() {
-        *g = choice;
-    }
-}
-
 pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     // 托盘文案跟随系统语言(启动时检测一次;无语言设置页,启动检测即终局)
     let t = locales::shell_texts(locales::detect_lang());
     let toggle = MenuItem::with_id(app, "toggle", t.tray_toggle, true, None::<&str>)?;
 
-    // 主题三项:勾选状态以 current_theme() 为单一事实来源;
-    // 菜单 id 以 ThemeChoice::menu_id() 为单一来源(事件分发经 theme_choice_from_id 回映)
+    // 主题三项:勾选状态以 theme::current_choice() 为单一事实来源(#8 落地后
+    // 由持久化值初始化,见 theme.rs);菜单 id 以 ThemeChoice::menu_id() 为单一来源
     let theme_light = CheckMenuItem::with_id(
         app,
         ThemeChoice::Light.menu_id(),
         t.tray_theme_light,
         true,
-        current_theme() == ThemeChoice::Light,
+        theme::current_choice() == ThemeChoice::Light,
         None::<&str>,
     )?;
     let theme_dark = CheckMenuItem::with_id(
@@ -106,7 +69,7 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         ThemeChoice::Dark.menu_id(),
         t.tray_theme_dark,
         true,
-        current_theme() == ThemeChoice::Dark,
+        theme::current_choice() == ThemeChoice::Dark,
         None::<&str>,
     )?;
     let theme_system = CheckMenuItem::with_id(
@@ -114,7 +77,7 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         ThemeChoice::System.menu_id(),
         t.tray_theme_system,
         true,
-        current_theme() == ThemeChoice::System,
+        theme::current_choice() == ThemeChoice::System,
         None::<&str>,
     )?;
     let theme = SubmenuBuilder::with_id(app, "theme", t.tray_theme)
@@ -177,8 +140,9 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// 主题菜单点击分发:更新内存选择 + 同步三个勾选 + 推 `tray-theme` 事件给前端。
-/// #8 在此挂接持久化与应用;当前点击已有真实勾选反馈(勾选状态即结构的一部分)。
+/// 主题菜单点击分发:状态变更收敛到 theme::choose(单一事实源,负责持久化与
+/// `theme-changed` 下发);本处只做托盘 UI 自己的事——同步三个勾选 +
+/// 按 #9 契约推 `tray-theme` 选择串事件。
 fn on_theme_chosen(
     app: &AppHandle,
     choice: ThemeChoice,
@@ -186,11 +150,11 @@ fn on_theme_chosen(
     dark: &CheckMenuItem<Wry>,
     system: &CheckMenuItem<Wry>,
 ) {
-    set_theme(choice);
+    theme::choose(app, choice);
     let _ = light.set_checked(choice == ThemeChoice::Light);
     let _ = dark.set_checked(choice == ThemeChoice::Dark);
     let _ = system.set_checked(choice == ThemeChoice::System);
-    log::info!("[tray] 主题切换: {:?} → 推 tray-theme 事件", choice);
+    log::info!("[tray] 主题切换: {choice:?} → 推 tray-theme 事件");
     let _ = app.emit_to("main", "tray-theme", choice.event_payload());
 }
 
@@ -225,6 +189,7 @@ mod tests {
     #[test]
     fn theme_menu_id_and_payload_roundtrip() {
         // 不变量:菜单 id ↔ 选择 ↔ 前端事件 payload 一一对应,互不漂移
+        // (映射的单一事实源在 theme.rs,这里守住托盘侧的不变量)
         for choice in [ThemeChoice::Light, ThemeChoice::Dark, ThemeChoice::System] {
             assert_eq!(theme_choice_from_id(choice.menu_id()), Some(choice));
             assert!(!choice.event_payload().is_empty());
@@ -233,11 +198,5 @@ mod tests {
         assert_eq!(ThemeChoice::Light.event_payload(), "light");
         assert_eq!(ThemeChoice::Dark.event_payload(), "dark");
         assert_eq!(ThemeChoice::System.event_payload(), "system");
-    }
-
-    #[test]
-    fn default_theme_is_system() {
-        // 无主题能力时外壳即跟随系统;任何测试不得修改 THEME(与本测试互斥由串行执行保证)
-        assert_eq!(current_theme(), ThemeChoice::System);
     }
 }

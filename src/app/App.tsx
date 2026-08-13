@@ -3,9 +3,12 @@
 import { BootScreen } from "@/components/boot/BootScreen"
 import { ErrorScreen } from "@/components/boot/ErrorScreen"
 import { useBoot } from "@/lib/useBoot"
+import { useThemeSync } from "@/lib/useThemeSync"
 
 export default function App() {
   const { phase, error, logs, retry, quit } = useBoot()
+  // 主题同步:Rust 下发生效主题 → <html>.dark(boot UI 全程生效)
+  useThemeSync()
 
   if (phase === "error") {
     // error 是结构化失败原因,ErrorScreen 渲染时翻译(兜底 errors.unknown 在彼处)
