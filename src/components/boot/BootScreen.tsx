@@ -1,25 +1,26 @@
-// loading 页:checking / installing / starting 三态共用
+// loading 页:idle / checking / installing / starting / ready 共用
 // 只显示阶段 + 不确定进度条;日志不推流(异常时经错误页携带)
-import { Logo } from "@/components/Logo"
+// 外壳界面不展示 Logo(品牌由托盘图标承担),旋转圆环仅作 loading 指示
 
-const COPY: Record<"checking" | "installing" | "starting", { title: string; hint?: string }> = {
+export type BootPhase = "idle" | "checking" | "installing" | "starting" | "ready"
+
+const COPY: Record<BootPhase, { title: string; hint?: string }> = {
+  idle: { title: "正在启动…" },
   checking: { title: "正在检查运行环境…" },
   installing: { title: "正在安装 dsh…", hint: "首次安装可能需要几分钟,请耐心等待" },
   starting: { title: "正在启动 dsh…", hint: "首次启动需要初始化环境,可能需要一两分钟" },
+  ready: { title: "正在打开 dsh…" },
 }
 
-export function BootScreen({ phase }: { phase: "checking" | "installing" | "starting" }) {
+export function BootScreen({ phase }: { phase: BootPhase }) {
   const copy = COPY[phase]
   return (
     <main className="flex h-screen w-screen flex-col items-center justify-center gap-7 bg-background text-foreground">
-      {/* Logo + 旋转圆环 */}
-      <div className="relative flex items-center justify-center">
-        <div
-          aria-hidden
-          className="absolute size-[124px] animate-spin rounded-full border-[3px] border-transparent border-t-indigo-500/80"
-        />
-        <Logo size={92} />
-      </div>
+      {/* 旋转圆环:loading 指示 */}
+      <div
+        aria-hidden
+        className="size-[124px] animate-spin rounded-full border-[3px] border-transparent border-t-indigo-500/80"
+      />
 
       <div className="text-center">
         <h1 className="text-lg font-medium">{copy.title}</h1>

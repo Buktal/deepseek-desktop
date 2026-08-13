@@ -1,8 +1,9 @@
 //! DeepSeek Desktop Tauri backend.
 //!
-//! 组装:dsh 生命周期管理 + 托盘 + 关闭三选对话框 + 退出收敛(杀子进程)。
+//! 组装:dsh 生命周期管理 + 托盘 + 关闭三选对话框 + 退出收敛(杀子进程)+ 生产日志。
 
 mod dsh;
+mod logging;
 mod tray;
 
 use tauri::{Manager, WindowEvent};
@@ -20,6 +21,12 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            // 生产日志:落盘到 <app_data_dir>/logs/app.log + stdout,panic 经 hook 同落盘。
+            // 失败不致命:降级为仅控制台输出,应用照常启动。
+            if let Err(e) = logging::init(app.handle()) {
+                eprintln!("[logging] init 失败,日志仅输出到控制台: {e}");
+            }
+
             // dsh 管理器(Clone 共享内部 Arc 状态)
             let manager = dsh::DshManager::new(app.handle().clone());
             app.manage(manager.clone());

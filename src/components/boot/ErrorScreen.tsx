@@ -1,5 +1,4 @@
-// 错误页:失败原因 + 最近日志 + 重试/退出
-import { Logo } from "@/components/Logo"
+// 错误页:失败原因 + 最近日志 + 重试/退出(外壳界面不展示 Logo)
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import type { BootLog } from "@/lib/useBoot"
@@ -18,8 +17,6 @@ export function ErrorScreen({
   const tail = logs.slice(-5)
   return (
     <main className="flex h-screen w-screen flex-col items-center justify-center gap-6 bg-background text-foreground">
-      <Logo size={72} />
-
       <div className="max-w-md text-center">
         <h1 className="text-lg font-medium">启动失败</h1>
         <p className="mt-1 text-sm leading-relaxed text-muted-foreground">{message}</p>
