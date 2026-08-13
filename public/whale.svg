@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- whale mark · P5 版画鲸:靛蓝渐变填充 + 深靛蓝粗描边 + 身体横纹 -->
+  <rect x="0" y="0" width="1024" height="1024" rx="220" fill="#fafafa"/>
+  <defs>
+    <linearGradient id="whale-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#193CB8"/>
+      <stop offset="100%" stop-color="#372AAC"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(-22.8 16) scale(15.5)">
+    <!-- 主体:渐变填充 + 粗深描边 -->
+    <path d="M 10 42 C 8 29, 17 17, 31 17 C 49 17, 61 29, 61 45 C 61 50, 57 54, 52 52 C 40 59, 15 57, 10 42 Z"
+          fill="url(#whale-grad)" stroke="#0b1a4d" stroke-width="3.5" stroke-linejoin="round"/>
+    <!-- 背鳍 -->
+    <path d="M 33 16 C 35 9, 40 6, 42 10 C 40 13, 37 15, 34 16 Z"
+          fill="url(#whale-grad)" stroke="#0b1a4d" stroke-width="2.5" stroke-linejoin="round"/>
+    <!-- 尾鳍刻痕 -->
+    <path d="M 57 43 L 61 40 L 59 47 Z" fill="#0b1a4d" stroke-linejoin="round"/>
+    <!-- 身体横纹 ×3 + 嘴弧 -->
+    <path d="M 16 47 C 26 51, 36 51, 45 47" stroke="#0b1a4d" stroke-width="1.8" stroke-linecap="round" fill="none"/>
+    <path d="M 13.5 51 C 23 54.5, 34 54.5, 43 51" stroke="#0b1a4d" stroke-width="1.8" stroke-linecap="round" fill="none"/>
+    <path d="M 12 54.5 C 20 57.5, 30 57.5, 39 54.5" stroke="#0b1a4d" stroke-width="1.8" stroke-linecap="round" fill="none"/>
+    <path d="M 12 38 C 19 43, 28 43, 33 38" stroke="#0b1a4d" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+    <!-- 眼 + 瞳孔 -->
+    <circle cx="24" cy="30" r="4.5" fill="#fafafa"/>
+    <circle cx="25.5" cy="31.5" r="2" fill="#0b1a4d"/>
+    <!-- 气泡环 -->
+    <circle cx="47" cy="20" r="2.5" stroke="#0b1a4d" stroke-width="2" fill="none"/>
+  </g>
+</svg>

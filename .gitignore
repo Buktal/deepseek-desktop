@@ -30,8 +30,10 @@ dist-ssr
 # Local
 .claude/
 .agents/
+docs/agents/
 docs/prototype
 docs/research
+CLAUDE.md
 
 # Vite cache
 .vite/

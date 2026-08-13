@@ -131,3 +131,17 @@
     @apply font-sans;
     }
 }
+
+/* 不确定进度条:loading 阶段滑动指示(不依赖真实进度,避免假百分比) */
+@keyframes loading-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
+}
+
+.animate-loading-slide {
+  animation: loading-slide 1.4s ease-in-out infinite;
+}
