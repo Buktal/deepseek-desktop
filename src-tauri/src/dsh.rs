@@ -9,7 +9,9 @@
 //!
 //! 安装策略(用户拍板):dsh 装到 **npm 全局**——「有则用,无则装」:
 //! - 全局已有 dsh(任意可用版本)直接用,不重装、不比较版本、不强制升级
-//! - 完全没有 → `npm install -g @deepseek-ai/dsh@latest`(bundle 离线缓存兜底待 #6 产物接入)
+//! - 完全没有 → `npm install -g @deepseek-ai/dsh@latest`;安装包内置离线缓存
+//!   (约定 `<资源目录>/npm-cache`,cacache 目录,CI 发版时打包,见 #6)存在时
+//!   加 `--prefer-offline --cache <目录>`:缓存命中秒级完成、缺失自动回退网络
 //! - 升级是独立的用户确认流程,boot 不阻塞在版本上
 //!
 //! 调研要点(见 docs/research):
@@ -47,6 +49,10 @@ const START_TIMEOUT: Duration = Duration::from_secs(180);
 const CHECK_NODE_TIMEOUT: Duration = Duration::from_secs(10);
 /// npm 安装超时。冷缓存首次安装可能要几分钟,给足 10 分钟;超时视为失败并报可读错误。
 const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
+/// 安装包内置 npm 离线缓存的相对目录名(位于 Tauri 资源目录下)。
+/// 约定由本文件与 #6(CI 发版打包)共同持有:CI 把发版时的 dsh 依赖树提前
+/// 下载成 npm cacache 打进安装包,本模块只消费、不校验内容。
+const BUNDLE_CACHE_REL: &str = "npm-cache";
 /// 日志环形缓冲容量(仅供异常时附上下文,不推流)
 const LOG_CAP: usize = 200;
 
@@ -472,16 +478,94 @@ fn global_dsh_bin() -> Option<PathBuf> {
     dsh_bin_path(&global_node_modules().ok()?)
 }
 
+/// 安装包内置离线缓存目录(若存在)。
+/// 约定:<资源目录>/npm-cache,内含 npm cacache(index-v5/content-v2/tmp)。
+/// 仅当目录带 cacache 的 index-v5 标记时才视为「缓存存在」,避免打包遗漏时
+/// 空目录被误判为离线缓存。
+fn bundle_cache_dir(resource_dir: &Path) -> Option<PathBuf> {
+    let dir = resource_dir.join(BUNDLE_CACHE_REL);
+    if dir.is_dir() && dir.join("index-v5").is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// npm 全局安装参数组装(纯函数,可测试)。
+/// 离线缓存目录存在时加 `--prefer-offline --cache <目录>`:
+/// 缓存命中走本地秒级完成,缺失自动回退网络(用户拍板语义)。
+fn npm_install_args(offline_cache: Option<&Path>) -> Vec<String> {
+    let mut args = vec!["install".to_string(), "-g".to_string()];
+    if let Some(dir) = offline_cache {
+        args.push("--prefer-offline".into());
+        args.push("--cache".into());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    args.push("@deepseek-ai/dsh@latest".into());
+    args.extend(["--no-audit".into(), "--no-fund".into(), "--no-progress".into()]);
+    args
+}
+
+/// 安装失败的可读错误信息(纯函数,可测试)。
+/// stderr_tail 是安装期间 stderr 的最后几行:EPERM/EACCES/权限类错误给出
+/// 可操作引导(管理员重试 / nvm 用户目录安装 / 手动命令),其余给网络引导。
+/// 结论写进正文:调研实测(#2)确认 npm 失败会保留旧版,失败重试即自愈。
+fn install_failure_message(exit_code: Option<i32>, stderr_tail: &[String]) -> String {
+    let code = exit_code
+        .map(|c| format!("退出码 {c}"))
+        .unwrap_or_else(|| "异常退出".to_string());
+    let is_permission = stderr_tail.iter().any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.contains("eperm")
+            || l.contains("eacces")
+            || l.contains("permission denied")
+            || l.contains("lack permission")
+    });
+    let guidance = if is_permission {
+        "可能是 npm 全局目录权限不足:请以管理员身份重试,或改用 nvm 把 Node.js 装到用户目录(从源头避免权限问题);也可手动执行 npm install -g @deepseek-ai/dsh 后点重试"
+    } else {
+        "请检查网络后点重试,或手动执行 npm install -g @deepseek-ai/dsh 排查"
+    };
+    let mut detail = String::new();
+    for l in stderr_tail.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).take(2) {
+        if l.chars().count() > 120 {
+            detail.push_str(&l.chars().take(120).collect::<String>());
+            detail.push('…');
+        } else {
+            detail.push_str(l);
+        }
+        detail.push(';');
+    }
+    if detail.is_empty() {
+        format!("dsh 安装失败({code})。{guidance}。")
+    } else {
+        format!("dsh 安装失败({code})。npm 提示:{detail}{guidance}。")
+    }
+}
+
 /// npm 全局安装 dsh(跟随 latest),stdout/stderr 逐行转发为日志事件。
 /// Windows 上 CreateProcess 不能直接执行 .cmd/.bat(npm 是 .cmd shim),须经 cmd.exe /c 包装。
 /// 带 NPM_INSTALL_TIMEOUT 超时;超时按进程树杀并报可读错误。
+/// 安装包内置离线缓存存在时优先走离线安装(见 bundle_cache_dir)。
 fn npm_install_global(manager: &DshManager) -> Result<(), String> {
+    let cache_dir = manager
+        .app
+        .path()
+        .resource_dir()
+        .ok()
+        .as_deref()
+        .and_then(bundle_cache_dir);
+    let args = npm_install_args(cache_dir.as_deref());
+    if let Some(dir) = &cache_dir {
+        log::info!("[dsh] 使用安装包内置离线缓存: {}", dir.display());
+    }
+
     let mut cmd = Command::new(if cfg!(windows) { "cmd.exe" } else { "npm" });
     if cfg!(windows) {
         cmd.args(["/c", "npm.cmd"]);
     }
     no_window(&mut cmd)
-        .args(["install", "-g", "@deepseek-ai/dsh@latest", "--no-audit", "--no-fund", "--no-progress"])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("无法启动 npm 安装: {e}"))?;
@@ -490,18 +574,27 @@ fn npm_install_global(manager: &DshManager) -> Result<(), String> {
 
     let stdout = child.stdout.take().expect("piped stdout");
     let m = manager.clone();
-    thread::spawn(move || {
+    let out_thread = thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines().map_while(Result::ok) {
             m.push_log("stdout", line);
         }
     });
+
     let stderr = child.stderr.take().expect("piped stderr");
     let m = manager.clone();
-    thread::spawn(move || {
+    // stderr 尾部捕获:失败时拼进可读错误信息(EPERM 权限引导等),与日志流并行
+    let stderr_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let tail = stderr_tail.clone();
+    let err_thread = thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(Result::ok) {
-            m.push_log("stderr", line);
+            m.push_log("stderr", line.clone());
+            let mut t = tail.lock().unwrap_or_else(|p| p.into_inner());
+            t.push(line);
+            while t.len() > 8 {
+                t.remove(0);
+            }
         }
     });
 
@@ -509,15 +602,22 @@ fn npm_install_global(manager: &DshManager) -> Result<(), String> {
     manager.clear_install_pid();
     match result {
         Ok(out) => {
+            // 进程已退出 → 管道 EOF → 读线程自然结束,join 确保 stderr 尾部收全
+            let _ = out_thread.join();
+            let _ = err_thread.join();
+            let tail: Vec<String> = stderr_tail.lock().unwrap_or_else(|p| p.into_inner()).clone();
             if out.status.success() {
                 Ok(())
             } else {
-                Err(format!("dsh 安装失败(退出码 {})", out.status.code().unwrap_or(-1)))
+                Err(install_failure_message(out.status.code(), &tail))
             }
         }
         Err(ChildWaitError::Timeout(_)) => {
             kill_pid_tree(child.id());
             let _ = child.wait();
+            // 杀进程后管道 EOF,join 防读线程泄漏
+            let _ = out_thread.join();
+            let _ = err_thread.join();
             Err(format!(
                 "dsh 安装超时({}s 内未完成)。请检查网络后点击重试",
                 NPM_INSTALL_TIMEOUT.as_secs()
@@ -941,5 +1041,117 @@ mod tests {
             .unwrap();
         assert!(out.status.success(), "npm.cmd 经 cmd.exe 启动失败: {}", String::from_utf8_lossy(&out.stderr));
         assert!(!String::from_utf8_lossy(&out.stdout).trim().is_empty());
+    }
+
+    #[test]
+    fn npm_install_args_without_bundle_cache_uses_plain_latest() {
+        // 无离线缓存:普通网络安装(生产路径参数必须逐字一致)
+        assert_eq!(
+            npm_install_args(None),
+            vec![
+                "install",
+                "-g",
+                "@deepseek-ai/dsh@latest",
+                "--no-audit",
+                "--no-fund",
+                "--no-progress"
+            ]
+        );
+    }
+
+    #[test]
+    fn npm_install_args_with_bundle_cache_prefers_offline() {
+        // 有离线缓存:加 --prefer-offline --cache <目录>(缓存命中秒级、缺失回退网络)
+        let cache = Path::new("C:/app resources/npm-cache");
+        assert_eq!(
+            npm_install_args(Some(cache)),
+            vec![
+                "install",
+                "-g",
+                "--prefer-offline",
+                "--cache",
+                "C:/app resources/npm-cache",
+                "@deepseek-ai/dsh@latest",
+                "--no-audit",
+                "--no-fund",
+                "--no-progress"
+            ]
+        );
+    }
+
+    #[test]
+    fn bundle_cache_dir_detects_real_cacache() {
+        // 生产路径:resource_dir() 下 <npm-cache> 目录;空目录不得误判为离线缓存
+        let dir = std::env::temp_dir().join(format!("dsh-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 目录不存在 → None(开发态资源目录里没有 npm-cache,走网络安装)
+        assert_eq!(bundle_cache_dir(&dir), None);
+        // 空目录不算缓存(打包遗漏时不得误判离线)
+        std::fs::create_dir_all(dir.join("npm-cache")).unwrap();
+        assert_eq!(bundle_cache_dir(&dir), None);
+        // 带 cacache index-v5 标记 → 视为存在
+        std::fs::create_dir_all(dir.join("npm-cache/index-v5")).unwrap();
+        assert_eq!(bundle_cache_dir(&dir), Some(dir.join("npm-cache")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_failure_message_guides_on_permission_error() {
+        // 权限失败(npm 实测报错形态:EPERM + "you lack permissions to access it")
+        let tail = vec![
+            "npm error code EPERM".to_string(),
+            "npm error The operation was rejected by your operating system.".to_string(),
+            "npm error you lack permissions to access it".to_string(),
+        ];
+        let msg = install_failure_message(Some(243), &tail);
+        assert!(msg.contains("退出码 243"), "{msg}");
+        assert!(msg.contains("权限不足"), "{msg}");
+        assert!(msg.contains("管理员"), "{msg}");
+        assert!(msg.contains("npm install -g @deepseek-ai/dsh"), "{msg}");
+
+        // EACCES 同理
+        let msg = install_failure_message(None, &["npm error EACCES: permission denied".into()]);
+        assert!(msg.contains("权限不足"), "{msg}");
+        assert!(msg.contains("异常退出"), "{msg}");
+    }
+
+    #[test]
+    fn install_failure_message_falls_back_to_network_guidance() {
+        // 非权限类失败:网络引导,不含权限措辞
+        let msg = install_failure_message(Some(1), &["npm error code ENOTFOUND".into()]);
+        assert!(msg.contains("退出码 1"), "{msg}");
+        assert!(msg.contains("网络"), "{msg}");
+        assert!(!msg.contains("权限不足"), "{msg}");
+
+        // 无 stderr 输出也要给出可读错误
+        let msg = install_failure_message(Some(1), &[]);
+        assert!(msg.contains("退出码 1"), "{msg}");
+        assert!(msg.contains("网络"), "{msg}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn npm_cache_arg_with_spaces_survives_cmd_exe() {
+        // 生产路径:离线安装要把含空格的 --cache 路径经 cmd.exe /c 原样传给 npm.cmd。
+        // npm config get 不回源网络,验证 Rust 自动加引号的参数不被 cmd 拆坏。
+        let cache = "C:/spaced cache dir/npm-cache";
+        let out = Command::new("cmd.exe")
+            .args(["/c", "npm.cmd", "config", "get", "cache", "--cache", cache])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "npm 执行失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("spaced cache dir"),
+            "含空格 cache 路径被 cmd 拆坏: {stdout}"
+        );
     }
 }
