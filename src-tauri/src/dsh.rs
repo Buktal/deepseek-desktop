@@ -7,14 +7,19 @@
 //! 生产日志:本模块不直接 eprintln,统一走 `log` crate 宏(logging::init 落盘到
 //! `<app_data_dir>/logs/app.log`,panic 经 hook 同落盘)。
 //!
+//! 安装策略(用户拍板):dsh 装到 **npm 全局**——「有则用,无则装」:
+//! - 全局已有 dsh(任意可用版本)直接用,不重装、不比较版本、不强制升级
+//! - 完全没有 → `npm install -g @deepseek-ai/dsh@latest`(bundle 离线缓存兜底待 #6 产物接入)
+//! - 升级是独立的用户确认流程,boot 不阻塞在版本上
+//!
 //! 调研要点(见 docs/research):
 //! - `dsh web` 默认 127.0.0.1:3080,支持 `--port 0`(OS 自动分配,避免端口冲突)
 //! - 就绪信号 = stdout 打印 `dsh web: http://127.0.0.1:<port>`(源码注释明确是 readiness signal)
-//! - 无 install 子命令,"安装" = npm 下载 @deepseek-ai/dsh
+//! - 全局 bin:`dsh.cmd` 是 shim,真身 `{prefix}/node_modules/@deepseek-ai/dsh/lib/bin.js`,spawn node 绝对路径
+//! - prefix 必须运行时解析(`npm root -g`),nvm 等环境不是 %APPDATA%\npm
 //! - dsh 不会自动打开系统浏览器(源码确认)
 
 use std::collections::VecDeque;
-use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -29,8 +34,6 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
-/// dsh 锁定版本。npm 包为 developer preview(官方警告有破坏性变更),锁版本防止意外升级。
-pub const DSH_VERSION: &str = "0.1.0-rc.6";
 /// dsh 要求的 Node 版本(仓库根 package.json engines):^22.19 || >=24
 const NODE_REQ: &str = "Node.js ^22.19 或 >=24";
 /// dsh 源码注释明确:"This URL line is a readiness signal" —— stdout 打印即服务就绪
@@ -139,15 +142,6 @@ impl DshManager {
             child: Arc::new(Mutex::new(None)),
             install_pid: Arc::new(Mutex::new(None)),
         }
-    }
-
-    /// 自管安装目录:%APPDATA%\app.deepseek-desktop\dsh-runtime
-    fn runtime_dir(&self) -> Result<PathBuf, String> {
-        self.app
-            .path()
-            .app_data_dir()
-            .map(|d| d.join("dsh-runtime"))
-            .map_err(|e| format!("无法定位应用数据目录: {e}"))
     }
 
     fn phase(&self) -> Phase {
@@ -335,14 +329,17 @@ pub fn kill_child(manager: &DshManager) {
     }
 }
 
-/// 当前 dsh 子进程的退出码(若已退出且句柄可查)。None = 仍在运行/句柄丢失。
+/// 当前 dsh 子进程的退出码。None = 仍在运行/句柄丢失。
+/// try_wait 出错(句柄异常/已被他处收割)按已退出处理:立即报「进程提前退出」进错误页,
+/// 不干等 180s 超时(半残安装 + 秒崩场景 5s 内到错误页)。
 fn child_exit_code(manager: &DshManager) -> Option<i32> {
-    manager
-        .child
-        .lock()
-        .ok()
-        .and_then(|mut g| g.as_mut().and_then(|c| c.try_wait().ok().flatten()))
-        .map(|s| s.code().unwrap_or(-1))
+    let mut guard = manager.child.lock().ok()?;
+    let child = guard.as_mut()?;
+    match child.try_wait() {
+        Ok(Some(s)) => Some(s.code().unwrap_or(-1)),
+        Ok(None) => None,
+        Err(_) => Some(-1),
+    }
 }
 
 // ── 工具函数 ───────────────────────────────────────────────────────
@@ -419,38 +416,72 @@ fn check_node() -> Result<String, String> {
     Ok(ver)
 }
 
-/// 确保运行时目录存在并写入锁版本的 package.json
-fn ensure_runtime(dir: &Path) -> Result<(), String> {
-    fs::create_dir_all(dir).map_err(|e| format!("无法创建运行目录 {}: {e}", dir.display()))?;
-    let pkg = dir.join("package.json");
-    if !pkg.exists() {
-        let content = format!(
-            "{{\n  \"name\": \"deepseek-desktop-dsh-runtime\",\n  \"private\": true,\n  \"version\": \"0.1.0\",\n  \"dependencies\": {{\n    \"@deepseek-ai/dsh\": \"{DSH_VERSION}\"\n  }}\n}}\n"
-        );
-        fs::write(&pkg, content).map_err(|e| format!("无法写入 {}: {e}", pkg.display()))?;
-    }
-    Ok(())
-}
+/// 全局 node_modules 路径,运行时动态解析(`npm root -g`)。
+/// 不可写死 %APPDATA%\npm:nvm 等环境 prefix 不同(本机实测 nvm 下为 E:\Nvm\nodejs)。
+/// 带超时:`npm root -g` 也会拉起 node,npm/node 被挂起时不得让 boot 卡死在检查阶段。
+const NPM_ROOT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 已安装的 dsh 版本(读 node_modules 里的 package.json)
-fn installed_version(dir: &Path) -> Option<String> {
-    let p = dir.join("node_modules/@deepseek-ai/dsh/package.json");
-    let content = fs::read_to_string(p).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
-    v.get("version").and_then(|v| v.as_str()).map(String::from)
-}
-
-/// npm 安装 dsh(锁定版本),stdout/stderr 逐行转发为日志事件。
-/// Windows 上 CreateProcess 不能直接执行 .cmd/.bat(npm 是 .cmd shim),须经 cmd.exe /c 包装。
-/// 带 NPM_INSTALL_TIMEOUT 超时;超时按进程树杀并报可读错误。
-fn npm_install(manager: &DshManager, dir: &Path) -> Result<(), String> {
+fn global_node_modules() -> Result<PathBuf, String> {
     let mut cmd = Command::new(if cfg!(windows) { "cmd.exe" } else { "npm" });
     if cfg!(windows) {
         cmd.args(["/c", "npm.cmd"]);
     }
     no_window(&mut cmd)
-        .current_dir(dir)
-        .args(["install", "--no-audit", "--no-fund", "--no-progress"])
+        .args(["root", "-g"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|_| "无法执行 npm,请确认 npm 可用".to_string())?;
+    let out = match wait_with_timeout(&mut child, NPM_ROOT_TIMEOUT) {
+        Ok(out) => out,
+        Err(ChildWaitError::Timeout(_)) => {
+            kill_pid_tree(child.id());
+            let _ = child.wait();
+            return Err(format!(
+                "npm root -g 超时({}s 无响应),无法定位全局 dsh。请检查 npm 是否正常",
+                NPM_ROOT_TIMEOUT.as_secs()
+            ));
+        }
+        Err(ChildWaitError::Io(e)) => return Err(format!("npm root -g 失败: {e}")),
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let detail = if stderr.is_empty() { String::new() } else { format!("({stderr})") };
+        return Err(format!(
+            "获取 npm 全局目录失败(退出码 {}){detail}",
+            out.status.code().unwrap_or(-1)
+        ));
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        return Err("npm 全局目录为空".into());
+    }
+    Ok(PathBuf::from(path))
+}
+
+/// 全局 dsh bin.js 路径 + 完整性校验(纯函数,可测试)。
+/// 校验 bin.js 存在而非仅版本号——半残安装(版本号在、文件缺)不得视为「已安装」,
+/// 否则坏掉的安装会被「有则用」跳过,永远修不好(2026-08-14 实测事故)。
+fn dsh_bin_path(global_node_modules: &Path) -> Option<PathBuf> {
+    let bin = global_node_modules.join("@deepseek-ai/dsh/lib/bin.js");
+    bin.exists().then_some(bin)
+}
+
+fn global_dsh_bin() -> Option<PathBuf> {
+    dsh_bin_path(&global_node_modules().ok()?)
+}
+
+/// npm 全局安装 dsh(跟随 latest),stdout/stderr 逐行转发为日志事件。
+/// Windows 上 CreateProcess 不能直接执行 .cmd/.bat(npm 是 .cmd shim),须经 cmd.exe /c 包装。
+/// 带 NPM_INSTALL_TIMEOUT 超时;超时按进程树杀并报可读错误。
+fn npm_install_global(manager: &DshManager) -> Result<(), String> {
+    let mut cmd = Command::new(if cfg!(windows) { "cmd.exe" } else { "npm" });
+    if cfg!(windows) {
+        cmd.args(["/c", "npm.cmd"]);
+    }
+    no_window(&mut cmd)
+        .args(["install", "-g", "@deepseek-ai/dsh@latest", "--no-audit", "--no-fund", "--no-progress"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("无法启动 npm 安装: {e}"))?;
@@ -616,43 +647,31 @@ fn boot_pipeline(manager: &DshManager) {
         return;
     }
 
-    // 2. 运行时目录
-    let runtime = match manager.runtime_dir() {
-        Ok(r) => r,
-        Err(e) => {
-            manager.set_error(e);
-            return;
+    // 2. 全局 dsh 检测(完整性校验:bin.js 存在,不只版本号)
+    //    「有则用」:全局已有 dsh(任意可用版本)直接用,不重装不强制升级
+    let bin = match global_dsh_bin() {
+        Some(b) => b,
+        None => {
+            log::info!("[dsh] boot: global dsh not found, installing…");
+            manager.set_phase(Phase::Installing, None);
+            if let Err(e) = npm_install_global(manager) {
+                manager.set_error(e);
+                return;
+            }
+            // 安装后完整性复检:装完仍然不可用视为失败
+            match global_dsh_bin() {
+                Some(b) => b,
+                None => {
+                    manager.set_error("dsh 安装后校验失败(可执行文件缺失)".into());
+                    return;
+                }
+            }
         }
     };
-    if let Err(e) = ensure_runtime(&runtime) {
-        manager.set_error(e);
-        return;
-    }
 
-    // 3. 安装(快速路径:已装且版本匹配则跳过)
-    if installed_version(&runtime).as_deref() != Some(DSH_VERSION) {
-        log::info!("[dsh] boot: installing ({} → {})", runtime.display(), DSH_VERSION);
-        manager.set_phase(Phase::Installing, None);
-        if let Err(e) = npm_install(manager, &runtime) {
-            manager.set_error(e);
-            return;
-        }
-        if installed_version(&runtime).as_deref() != Some(DSH_VERSION) {
-            manager.set_error("dsh 安装后版本校验失败".into());
-            return;
-        }
-    } else {
-        log::info!("[dsh] boot: already installed, skip install");
-    }
-
-    // 4. 启动 dsh web
+    // 3. 启动 dsh web
     log::info!("[dsh] boot: starting dsh web…");
     manager.set_phase(Phase::Starting, None);
-    let bin = runtime.join("node_modules/@deepseek-ai/dsh/lib/bin.js");
-    if !bin.exists() {
-        manager.set_error(format!("dsh 可执行文件缺失: {}", bin.display()));
-        return;
-    }
     let rx = match spawn_dsh(manager, &bin) {
         Ok(rx) => rx,
         Err(e) => {
@@ -661,7 +680,7 @@ fn boot_pipeline(manager: &DshManager) {
         }
     };
 
-    // 5. 等待就绪信号
+    // 4. 等待就绪信号
     let (port, rx) = match wait_ready(manager, rx) {
         Ok(p) => p,
         Err(e) => {
@@ -881,6 +900,33 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2), "超时检测过慢");
         kill_pid_tree(child.id());
         let _ = child.wait();
+    }
+
+    #[test]
+    fn dsh_bin_path_requires_bin_js_not_just_version() {
+        // 半残安装(版本号在、bin.js 缺)不得视为「已安装」——否则被「有则用」跳过,
+        // 坏掉的安装永远修不好(2026-08-14 实测事故)
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-boot-test-{}",
+            std::process::id()
+        ));
+        let dsh_dir = dir.join("@deepseek-ai/dsh");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dsh_dir.join("lib")).unwrap();
+
+        // 只有 package.json(无 bin.js)→ 视为未安装
+        std::fs::write(dsh_dir.join("package.json"), r#"{"version":"0.1.0-rc.6"}"#).unwrap();
+        assert_eq!(dsh_bin_path(&dir), None, "版本号存在但 bin.js 缺失必须判为未安装");
+
+        // 补上 bin.js → 视为已安装
+        std::fs::write(dsh_dir.join("lib/bin.js"), "// placeholder").unwrap();
+        assert_eq!(
+            dsh_bin_path(&dir),
+            Some(dsh_dir.join("lib/bin.js")),
+            "bin.js 存在即视为已安装(不比较版本)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]
