@@ -3,6 +3,7 @@
 //! 组装:dsh 生命周期管理 + 托盘 + 关闭三选对话框 + 退出收敛(杀子进程)+ 生产日志。
 
 mod dsh;
+mod locales;
 mod logging;
 mod tray;
 
@@ -63,6 +64,8 @@ fn setup_close_handler(app: &tauri::AppHandle, manager: dsh::DshManager) {
         return;
     };
     let app = app.clone();
+    // 关闭对话框文案跟随系统语言(启动时检测一次,与托盘同源)
+    let t = locales::shell_texts(locales::detect_lang());
     // receiver 与闭包捕获使用不同绑定,避免 move/借用冲突
     let handler_win = win.clone();
     win.on_window_event(move |event| {
@@ -80,23 +83,23 @@ fn setup_close_handler(app: &tauri::AppHandle, manager: dsh::DshManager) {
             let app = app.clone();
             let manager = manager.clone();
             app.dialog()
-                .message("退出 DeepSeek Desktop?")
+                .message(t.close_message)
                 .title("DeepSeek Desktop")
                 .kind(MessageDialogKind::Warning)
                 .buttons(MessageDialogButtons::YesNoCancelCustom(
-                    "退出应用".into(),
-                    "最小化到托盘".into(),
-                    "取消".into(),
+                    t.close_quit.into(),
+                    t.close_minimize.into(),
+                    t.close_cancel.into(),
                 ))
                 .show_with_result(move |res| {
                     dsh::reset_dialog_flag();
                     match res {
-                        MessageDialogResult::Custom(s) if s == "退出应用" => {
+                        MessageDialogResult::Custom(s) if s == t.close_quit => {
                             dsh::set_quitting();
                             dsh::kill_child(&manager);
                             app.exit(0);
                         }
-                        MessageDialogResult::Custom(s) if s == "最小化到托盘" => {
+                        MessageDialogResult::Custom(s) if s == t.close_minimize => {
                             let _ = win.hide();
                         }
                         _ => {} // 取消:保持现状

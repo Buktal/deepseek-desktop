@@ -7,11 +7,13 @@ use tauri::menu::{MenuBuilder, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 
-use crate::dsh;
+use crate::{dsh, locales};
 
 pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let toggle = MenuItem::with_id(app, "toggle", "显示/隐藏窗口", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    // 托盘文案跟随系统语言(启动时检测一次;无语言设置页,启动检测即终局)
+    let t = locales::shell_texts(locales::detect_lang());
+    let toggle = MenuItem::with_id(app, "toggle", t.tray_toggle, true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", t.tray_quit, true, None::<&str>)?;
     let menu = MenuBuilder::new(app)
         .item(&toggle)
         .separator()

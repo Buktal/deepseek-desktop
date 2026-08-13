@@ -8,7 +8,8 @@ export default function App() {
   const { phase, error, logs, retry, quit } = useBoot()
 
   if (phase === "error") {
-    return <ErrorScreen message={error ?? "未知错误"} logs={logs} retry={retry} quit={quit} />
+    // error 是结构化失败原因,ErrorScreen 渲染时翻译(兜底 errors.unknown 在彼处)
+    return <ErrorScreen error={error} logs={logs} retry={retry} quit={quit} />
   }
   // idle(快照未到)/checking/installing/starting/ready 均由 BootScreen 呈现对应文案
   return <BootScreen phase={phase} />

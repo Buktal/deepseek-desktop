@@ -46,8 +46,10 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
-/// dsh 要求的 Node 版本(仓库根 package.json engines):^22.19 || >=24
-const NODE_REQ: &str = "Node.js ^22.19 或 >=24";
+/// dsh 要求的 Node 版本(仓库根 package.json engines):^22.19 || >=24。
+/// 作为 NodeVersionUnmet 的结构化数据传给前端(版本规格是技术串,语言中立,
+/// 保持英文形态以免 zh/en 两处维护同一规格)。
+const NODE_REQ: &str = "Node.js ^22.19 or >=24";
 /// dsh 源码注释明确:"This URL line is a readiness signal" —— stdout 打印即服务就绪
 const READY_PREFIX: &str = "dsh web: http://";
 /// 启动就绪等待上限。
@@ -117,7 +119,7 @@ pub struct LogLine {
 pub struct BootStateView {
     pub phase: Phase,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<BootError>,
 }
 
 /// `boot` 命令返回的状态快照:含最近日志(挂载/重试一调两用)
@@ -126,13 +128,75 @@ pub struct BootStateView {
 pub struct BootStateSnapshot {
     pub phase: Phase,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<BootError>,
     pub logs: Vec<LogLine>,
+}
+
+/// 结构化失败原因(kind + data,serde tag/content 序列化为
+/// `{"kind":"NodeCheckTimeout","data":{"seconds":10}}`,unit 变体无 data 字段)。
+/// 前端经 toStructuredError 归约、渲染时按 `errors.<kind>` 键翻译
+/// (见 src/lib/error.ts 与 src/locales/*.json)——错误串不在此处拼装,
+/// 数据只携带运行时事实(超时秒数/退出码/版本/stderr 原文),文案模板在 locale JSON。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "data", rename_all = "PascalCase", rename_all_fields = "camelCase")]
+pub enum BootError {
+    /// 未检测到 Node.js
+    NodeMissing,
+    /// `node --version` 检查超时
+    NodeCheckTimeout { seconds: u64 },
+    /// `node --version` 进程 IO 失败
+    NodeCheckFailed { detail: String },
+    /// `node --version` 非零退出
+    NodeVersionCheckFailed { exit_code: i32, detail: String },
+    /// 无法解析 node 版本号
+    NodeVersionParseFailed { version: String },
+    /// 版本不满足 ^22.19 || >=24
+    NodeVersionUnmet { current: String, required: String },
+    /// 无法执行 npm(未安装/不可用)
+    NpmRootSpawnFailed,
+    /// `npm root -g` 超时
+    NpmRootTimeout { seconds: u64 },
+    /// `npm root -g` 进程 IO 失败
+    NpmRootIoFailed { detail: String },
+    /// `npm root -g` 非零退出
+    NpmRootExitFailed { exit_code: i32, detail: String },
+    /// `npm root -g` 输出为空
+    NpmRootEmpty,
+    /// 无法启动 npm 安装进程
+    NpmSpawnFailed { detail: String },
+    /// 安装失败:权限类(EPERM/EACCES),带退出码
+    InstallFailedPermission { exit_code: i32, stderr_tail: String },
+    /// 安装失败:权限类,无退出码(异常退出)
+    InstallFailedPermissionAbnormal { stderr_tail: String },
+    /// 安装失败:非权限类(网络等),带退出码
+    InstallFailedNetwork { exit_code: i32, stderr_tail: String },
+    /// 安装失败:非权限类,无退出码(异常退出)
+    InstallFailedNetworkAbnormal { stderr_tail: String },
+    /// 安装超时
+    InstallTimeout { seconds: u64 },
+    /// 安装进程 IO 异常
+    NpmInstallIoFailed { detail: String },
+    /// 安装后完整性复检失败
+    InstallVerifyFailed,
+    /// 无法启动 dsh 进程
+    DshSpawnFailed { detail: String },
+    /// 就绪行已打印但端口未监听
+    ReadyPortUnavailable { port: u16 },
+    /// 进程提前退出,已知退出码
+    DshExitedEarly { exit_code: i32 },
+    /// 进程提前退出,无退出码(句柄缺失等)
+    DshExitedEarlyNoCode,
+    /// 启动超时(未收到就绪信号)
+    DshStartTimeout { seconds: u64 },
+    /// 无法导航窗口到 dsh 页面
+    NavigateFailed,
+    /// 流水线内部 panic 等未知内部错误
+    Internal { message: String },
 }
 
 struct BootState {
     phase: Phase,
-    error: Option<String>,
+    error: Option<BootError>,
     logs: VecDeque<LogLine>,
 }
 
@@ -186,7 +250,7 @@ impl DshManager {
 
     /// 阶段迁移:更新状态并推送 `boot-state` 事件(仅阶段,不含日志)。
     /// emit_to("main"):只投递主窗口 webview,不广播给其它窗口。
-    fn set_phase(&self, phase: Phase, error: Option<String>) {
+    fn set_phase(&self, phase: Phase, error: Option<BootError>) {
         if let Ok(mut s) = self.state.lock() {
             // 新一次 boot 的语义边界:进入 Checking 时清空上一轮的日志缓冲
             if phase == Phase::Checking {
@@ -196,7 +260,7 @@ impl DshManager {
             s.error = error.clone();
         }
         match &error {
-            Some(e) => log::error!("[dsh] phase → {phase:?}: {e}"),
+            Some(e) => log::error!("[dsh] phase → {phase:?}: {e:?}"),
             None => log::info!("[dsh] phase → {phase:?}"),
         }
         let _ = self
@@ -204,8 +268,8 @@ impl DshManager {
             .emit_to("main", "boot-state", BootStateView { phase, error });
     }
 
-    fn set_error(&self, msg: String) {
-        self.set_phase(Phase::Error, Some(msg));
+    fn set_error(&self, error: BootError) {
+        self.set_phase(Phase::Error, Some(error));
     }
 
     /// 追加日志行(剥 ANSI、去尾空行),仅入环形缓冲供异常时附上下文。
@@ -385,42 +449,49 @@ fn strip_ansi(s: &str) -> String {
 }
 
 /// 校验 node 版本是否满足 dsh 要求(^22.19 || >=24)。纯函数,可测试。
-fn check_node_version(ver: &str) -> Result<(), String> {
+/// 失败返回结构化 BootError(版本数据),文案模板在 locale JSON。
+fn check_node_version(ver: &str) -> Result<(), BootError> {
     let v = ver.trim().trim_start_matches('v');
     let mut parts = v.split('.');
     let major: u32 = parts
         .next()
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| format!("无法解析 Node 版本: {ver}"))?;
+        .ok_or(BootError::NodeVersionParseFailed {
+            version: ver.to_string(),
+        })?;
     let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let ok = (major == 22 && minor >= 19) || major >= 24;
     if !ok {
-        return Err(format!("Node 版本不满足要求:当前 {ver},需要 {NODE_REQ}"));
+        return Err(BootError::NodeVersionUnmet {
+            current: ver.to_string(),
+            required: NODE_REQ.to_string(),
+        });
     }
     Ok(())
 }
 
 /// 检查 node 是否可用且满足版本要求。`node --version` 带超时:
 /// node 被 shim/杀软/网络盘挂起时同步 output() 会永久阻塞,超时后杀进程并报可读错误。
-fn check_node() -> Result<String, String> {
+fn check_node() -> Result<String, BootError> {
     let mut binding = Command::new("node");
     let mut child = no_window(&mut binding)
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|_| "未检测到 Node.js,请先安装 Node.js 22 LTS 或 24 后重试".to_string())?;
+        .map_err(|_| BootError::NodeMissing)?;
     let out = match wait_with_timeout(&mut child, CHECK_NODE_TIMEOUT) {
         Ok(out) => out,
         Err(ChildWaitError::Timeout(_)) => {
             kill_pid_tree(child.id());
             let _ = child.wait();
-            return Err(format!(
-                "Node.js 检查超时({}s 无响应):`node --version` 未返回。可能是 node 安装异常或被杀软拦截,请检查后重试",
-                CHECK_NODE_TIMEOUT.as_secs()
-            ));
+            return Err(BootError::NodeCheckTimeout {
+                seconds: CHECK_NODE_TIMEOUT.as_secs(),
+            });
         }
-        Err(ChildWaitError::Io(e)) => return Err(format!("Node.js 检查失败: {e}")),
+        Err(ChildWaitError::Io(e)) => {
+            return Err(BootError::NodeCheckFailed { detail: e });
+        }
     };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -429,10 +500,10 @@ fn check_node() -> Result<String, String> {
         } else {
             format!("({stderr})")
         };
-        return Err(format!(
-            "Node.js 检查失败:`node --version` 退出码 {}{detail}",
-            out.status.code().unwrap_or(-1)
-        ));
+        return Err(BootError::NodeVersionCheckFailed {
+            exit_code: out.status.code().unwrap_or(-1),
+            detail,
+        });
     }
     let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
     check_node_version(&ver)?;
@@ -444,7 +515,7 @@ fn check_node() -> Result<String, String> {
 /// 带超时:`npm root -g` 也会拉起 node,npm/node 被挂起时不得让 boot 卡死在检查阶段。
 const NPM_ROOT_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn global_node_modules() -> Result<PathBuf, String> {
+fn global_node_modules() -> Result<PathBuf, BootError> {
     let mut cmd = Command::new(if cfg!(windows) { "cmd.exe" } else { "npm" });
     if cfg!(windows) {
         cmd.args(["/c", "npm.cmd"]);
@@ -453,20 +524,17 @@ fn global_node_modules() -> Result<PathBuf, String> {
         .args(["root", "-g"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|_| "无法执行 npm,请确认 npm 可用".to_string())?;
+    let mut child = cmd.spawn().map_err(|_| BootError::NpmRootSpawnFailed)?;
     let out = match wait_with_timeout(&mut child, NPM_ROOT_TIMEOUT) {
         Ok(out) => out,
         Err(ChildWaitError::Timeout(_)) => {
             kill_pid_tree(child.id());
             let _ = child.wait();
-            return Err(format!(
-                "npm root -g 超时({}s 无响应),无法定位全局 dsh。请检查 npm 是否正常",
-                NPM_ROOT_TIMEOUT.as_secs()
-            ));
+            return Err(BootError::NpmRootTimeout {
+                seconds: NPM_ROOT_TIMEOUT.as_secs(),
+            });
         }
-        Err(ChildWaitError::Io(e)) => return Err(format!("npm root -g 失败: {e}")),
+        Err(ChildWaitError::Io(e)) => return Err(BootError::NpmRootIoFailed { detail: e }),
     };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -475,14 +543,14 @@ fn global_node_modules() -> Result<PathBuf, String> {
         } else {
             format!("({stderr})")
         };
-        return Err(format!(
-            "获取 npm 全局目录失败(退出码 {}){detail}",
-            out.status.code().unwrap_or(-1)
-        ));
+        return Err(BootError::NpmRootExitFailed {
+            exit_code: out.status.code().unwrap_or(-1),
+            detail,
+        });
     }
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if path.is_empty() {
-        return Err("npm 全局目录为空".into());
+        return Err(BootError::NpmRootEmpty);
     }
     Ok(PathBuf::from(path))
 }
@@ -531,26 +599,33 @@ fn npm_install_args(offline_cache: Option<&Path>) -> Vec<String> {
     args
 }
 
-/// 安装失败的可读错误信息(纯函数,可测试)。
+/// 安装失败的结构化错误(纯函数,可测试)。
 /// stderr_tail 是安装期间 stderr 的最后几行:EPERM/EACCES/权限类错误给出
 /// 可操作引导(管理员重试 / nvm 用户目录安装 / 手动命令),其余给网络引导。
+/// 引导措辞是文案模板,归 locale JSON(errors.InstallFailedPermission/Network);
+/// 本函数只产出结构化判别(kind 区分 权限×有无退出码),数据带退出码与 stderr 原文。
 /// 结论写进正文:调研实测(#2)确认 npm 失败会保留旧版,失败重试即自愈。
-fn install_failure_message(exit_code: Option<i32>, stderr_tail: &[String]) -> String {
-    let code = exit_code
-        .map(|c| format!("退出码 {c}"))
-        .unwrap_or_else(|| "异常退出".to_string());
-    let is_permission = stderr_tail.iter().any(|l| {
-        let l = l.to_ascii_lowercase();
-        l.contains("eperm")
-            || l.contains("eacces")
-            || l.contains("permission denied")
-            || l.contains("lack permission")
-    });
-    let guidance = if is_permission {
-        "可能是 npm 全局目录权限不足:请以管理员身份重试,或改用 nvm 把 Node.js 装到用户目录(从源头避免权限问题);也可手动执行 npm install -g @deepseek-ai/dsh 后点重试"
-    } else {
-        "请检查网络后点重试,或手动执行 npm install -g @deepseek-ai/dsh 排查"
-    };
+fn install_failure_error(exit_code: Option<i32>, stderr_tail: &[String]) -> BootError {
+    // 权限判定用原始行(截断可能切掉行尾的权限标记);文案引导随后按 kind 进 locale JSON
+    let is_permission = stderr_tail_has_permission(stderr_tail);
+    let stderr_tail = format_stderr_tail(stderr_tail);
+    match (is_permission, exit_code) {
+        (true, Some(code)) => BootError::InstallFailedPermission {
+            exit_code: code,
+            stderr_tail,
+        },
+        (true, None) => BootError::InstallFailedPermissionAbnormal { stderr_tail },
+        (false, Some(code)) => BootError::InstallFailedNetwork {
+            exit_code: code,
+            stderr_tail,
+        },
+        (false, None) => BootError::InstallFailedNetworkAbnormal { stderr_tail },
+    }
+}
+
+/// 从 stderr 尾部提取最多 2 行、每行截断到 120 字符,用 "; " 连接;
+/// 非空时以 "; " 收尾作模板间分隔符。纯函数,可测试。
+fn format_stderr_tail(stderr_tail: &[String]) -> String {
     let mut detail = String::new();
     for l in stderr_tail
         .iter()
@@ -564,20 +639,27 @@ fn install_failure_message(exit_code: Option<i32>, stderr_tail: &[String]) -> St
         } else {
             detail.push_str(l);
         }
-        detail.push(';');
+        detail.push_str("; ");
     }
-    if detail.is_empty() {
-        format!("dsh 安装失败({code})。{guidance}。")
-    } else {
-        format!("dsh 安装失败({code})。npm 提示:{detail}{guidance}。")
-    }
+    detail
+}
+
+/// 判定 stderr 尾部是否权限类错误(EPERM/EACCES/…)。纯函数,可测试。
+fn stderr_tail_has_permission(stderr_tail: &[String]) -> bool {
+    stderr_tail.iter().any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.contains("eperm")
+            || l.contains("eacces")
+            || l.contains("permission denied")
+            || l.contains("lack permission")
+    })
 }
 
 /// npm 全局安装 dsh(跟随 latest),stdout/stderr 逐行转发为日志事件。
 /// Windows 上 CreateProcess 不能直接执行 .cmd/.bat(npm 是 .cmd shim),须经 cmd.exe /c 包装。
 /// 带 NPM_INSTALL_TIMEOUT 超时;超时按进程树杀并报可读错误。
 /// 安装包内置离线缓存存在时优先走离线安装(见 bundle_cache_dir)。
-fn npm_install_global(manager: &DshManager) -> Result<(), String> {
+fn npm_install_global(manager: &DshManager) -> Result<(), BootError> {
     let cache_dir = manager
         .app
         .path()
@@ -598,7 +680,9 @@ fn npm_install_global(manager: &DshManager) -> Result<(), String> {
         .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("无法启动 npm 安装: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| BootError::NpmSpawnFailed { detail: e.to_string() })?;
     // 登记安装中进程,退出收敛时一并杀(quit_app/托盘退出)
     manager.set_install_pid(child.id());
 
@@ -642,7 +726,7 @@ fn npm_install_global(manager: &DshManager) -> Result<(), String> {
             if out.status.success() {
                 Ok(())
             } else {
-                Err(install_failure_message(out.status.code(), &tail))
+                Err(install_failure_error(out.status.code(), &tail))
             }
         }
         Err(ChildWaitError::Timeout(_)) => {
@@ -651,17 +735,19 @@ fn npm_install_global(manager: &DshManager) -> Result<(), String> {
             // 杀进程后管道 EOF,join 防读线程泄漏
             let _ = out_thread.join();
             let _ = err_thread.join();
-            Err(format!(
-                "dsh 安装超时({}s 内未完成)。请检查网络后点击重试",
-                NPM_INSTALL_TIMEOUT.as_secs()
-            ))
+            Err(BootError::InstallTimeout {
+                seconds: NPM_INSTALL_TIMEOUT.as_secs(),
+            })
         }
-        Err(ChildWaitError::Io(e)) => Err(format!("npm 安装进程异常: {e}")),
+        Err(ChildWaitError::Io(e)) => Err(BootError::NpmInstallIoFailed { detail: e }),
     }
 }
 
 /// 启动 `node <bin.js> web --port 0`,返回 stdout/stderr 合流后的行接收端
-fn spawn_dsh(manager: &DshManager, bin: &Path) -> Result<Receiver<(String, String)>, String> {
+fn spawn_dsh(
+    manager: &DshManager,
+    bin: &Path,
+) -> Result<Receiver<(String, String)>, BootError> {
     let mut binding = Command::new("node");
     let cmd = no_window(&mut binding)
         .arg(bin)
@@ -669,7 +755,9 @@ fn spawn_dsh(manager: &DshManager, bin: &Path) -> Result<Receiver<(String, Strin
         .env("DSH_TELEMETRY_DISABLED", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("无法启动 dsh: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| BootError::DshSpawnFailed { detail: e.to_string() })?;
 
     let (tx, rx) = mpsc::channel::<(String, String)>();
     let stdout = child.stdout.take().expect("piped stdout");
@@ -736,7 +824,7 @@ fn tcp_wait(port: u16) -> bool {
 fn wait_ready(
     manager: &DshManager,
     rx: Receiver<(String, String)>,
-) -> Result<(u16, Receiver<(String, String)>), String> {
+) -> Result<(u16, Receiver<(String, String)>), BootError> {
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
@@ -746,27 +834,26 @@ fn wait_ready(
                     if tcp_wait(port) {
                         return Ok((port, rx));
                     }
-                    return Err(format!("dsh 已打印就绪地址但端口 {port} 未监听"));
+                    return Err(BootError::ReadyPortUnavailable { port });
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
                 // 子进程是否已退出(锁作用域内完成判断,避免守卫借用逃逸)
                 if let Some(code) = child_exit_code(manager) {
-                    return Err(format!("dsh 启动失败(进程提前退出,退出码 {code})"));
+                    return Err(BootError::DshExitedEarly { exit_code: code });
                 }
                 if Instant::now() >= deadline {
-                    return Err(format!(
-                        "dsh 启动超时({}s 内未收到就绪信号)",
-                        START_TIMEOUT.as_secs()
-                    ));
+                    return Err(BootError::DshStartTimeout {
+                        seconds: START_TIMEOUT.as_secs(),
+                    });
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
                 // 输出流关闭 = 读线程结束 = 子进程已退出(或句柄被继承导致异常断流)
-                let code = child_exit_code(manager)
-                    .map(|c| format!(",退出码 {c}"))
-                    .unwrap_or_default();
-                return Err(format!("dsh 启动失败(进程提前退出{code})"));
+                return match child_exit_code(manager) {
+                    Some(code) => Err(BootError::DshExitedEarly { exit_code: code }),
+                    None => Err(BootError::DshExitedEarlyNoCode),
+                };
             }
         }
     }
@@ -798,7 +885,7 @@ fn boot_pipeline(manager: &DshManager) {
             match global_dsh_bin() {
                 Some(b) => b,
                 None => {
-                    manager.set_error("dsh 安装后校验失败(可执行文件缺失)".into());
+                    manager.set_error(BootError::InstallVerifyFailed);
                     return;
                 }
             }
@@ -837,7 +924,7 @@ fn boot_pipeline(manager: &DshManager) {
                 // 导航失败:dsh 仍在运行,先杀子进程再进错误态(否则重试会再起一个 dsh)
                 log::error!("[dsh] navigate 失败: {e}");
                 kill_child(manager);
-                manager.set_error("无法打开 dsh 页面,请重试".into());
+                manager.set_error(BootError::NavigateFailed);
                 return;
             }
         }
@@ -870,10 +957,12 @@ fn spawn_reaper(manager: DshManager, rx: Receiver<(String, String)>) {
                 is_quitting()
             );
             if !ok && !is_quitting() {
+                // 原生对话框文案跟随系统语言(与托盘/关闭对话框同源,见 locales.rs)
+                let texts = crate::locales::shell_texts(crate::locales::detect_lang());
                 let _ = manager
                     .app
                     .dialog()
-                    .message("dsh 进程意外退出,请重新启动应用")
+                    .message(texts.dsh_crashed)
                     .title("DeepSeek Desktop")
                     .kind(MessageDialogKind::Warning)
                     .show(|_| {});
@@ -918,7 +1007,7 @@ pub fn boot_start(manager: &DshManager) {
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "boot 流水线内部错误".into());
             log::error!("[dsh] boot 流水线 panic: {msg}");
-            m.set_error(format!("内部错误:{msg}"));
+            m.set_error(BootError::Internal { message: msg });
         }
     });
 }
@@ -998,10 +1087,26 @@ mod tests {
 
     #[test]
     fn check_node_version_rejects_others() {
-        assert!(check_node_version("v22.18.0").is_err()); // 22 系但 < 19
-        assert!(check_node_version("v23.0.0").is_err()); // 23 不在 ^22.19 || >=24 内
-        assert!(check_node_version("v20.10.0").is_err());
-        assert!(check_node_version("not-a-version").is_err());
+        // 22 系但 < 19 → 版本不满足(带当前版本与要求,供 locale 模板插值)
+        assert!(matches!(
+            check_node_version("v22.18.0"),
+            Err(BootError::NodeVersionUnmet { current, required })
+                if current == "v22.18.0" && required == NODE_REQ
+        ));
+        // 23 不在 ^22.19 || >=24 内
+        assert!(matches!(
+            check_node_version("v23.0.0"),
+            Err(BootError::NodeVersionUnmet { .. })
+        ));
+        assert!(matches!(
+            check_node_version("v20.10.0"),
+            Err(BootError::NodeVersionUnmet { .. })
+        ));
+        // 不可解析的版本号 → 解析失败
+        assert!(matches!(
+            check_node_version("not-a-version"),
+            Err(BootError::NodeVersionParseFailed { .. })
+        ));
     }
 
     #[test]
@@ -1155,37 +1260,84 @@ mod tests {
     }
 
     #[test]
-    fn install_failure_message_guides_on_permission_error() {
+    fn install_failure_error_guides_on_permission_error() {
         // 权限失败(npm 实测报错形态:EPERM + "you lack permissions to access it")
         let tail = vec![
             "npm error code EPERM".to_string(),
             "npm error The operation was rejected by your operating system.".to_string(),
             "npm error you lack permissions to access it".to_string(),
         ];
-        let msg = install_failure_message(Some(243), &tail);
-        assert!(msg.contains("退出码 243"), "{msg}");
-        assert!(msg.contains("权限不足"), "{msg}");
-        assert!(msg.contains("管理员"), "{msg}");
-        assert!(msg.contains("npm install -g @deepseek-ai/dsh"), "{msg}");
+        assert_eq!(
+            install_failure_error(Some(243), &tail),
+            BootError::InstallFailedPermission {
+                exit_code: 243,
+                stderr_tail:
+                    "npm error code EPERM; npm error The operation was rejected by your operating system.; "
+                        .to_string(),
+            }
+        );
 
-        // EACCES 同理
-        let msg = install_failure_message(None, &["npm error EACCES: permission denied".into()]);
-        assert!(msg.contains("权限不足"), "{msg}");
-        assert!(msg.contains("异常退出"), "{msg}");
+        // EACCES 同理,无退出码 → Abnormal 变体
+        assert_eq!(
+            install_failure_error(None, &["npm error EACCES: permission denied".into()]),
+            BootError::InstallFailedPermissionAbnormal {
+                stderr_tail: "npm error EACCES: permission denied; ".to_string(),
+            }
+        );
     }
 
     #[test]
-    fn install_failure_message_falls_back_to_network_guidance() {
-        // 非权限类失败:网络引导,不含权限措辞
-        let msg = install_failure_message(Some(1), &["npm error code ENOTFOUND".into()]);
-        assert!(msg.contains("退出码 1"), "{msg}");
-        assert!(msg.contains("网络"), "{msg}");
-        assert!(!msg.contains("权限不足"), "{msg}");
+    fn install_failure_error_falls_back_to_network_variant() {
+        // 非权限类失败 → Network 变体(网络引导文案模板在 locale JSON)
+        assert_eq!(
+            install_failure_error(Some(1), &["npm error code ENOTFOUND".into()]),
+            BootError::InstallFailedNetwork {
+                exit_code: 1,
+                stderr_tail: "npm error code ENOTFOUND; ".to_string(),
+            }
+        );
 
-        // 无 stderr 输出也要给出可读错误
-        let msg = install_failure_message(Some(1), &[]);
-        assert!(msg.contains("退出码 1"), "{msg}");
-        assert!(msg.contains("网络"), "{msg}");
+        // 无 stderr 输出:stderr_tail 为空串,模板可干净衔接引导语
+        assert_eq!(
+            install_failure_error(Some(1), &[]),
+            BootError::InstallFailedNetwork {
+                exit_code: 1,
+                stderr_tail: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn format_stderr_tail_truncates_long_lines() {
+        // 生产路径:每行截断到 120 字符 + 省略号,最多 2 行,'; ' 连接
+        let out = format_stderr_tail(&["x".repeat(200), "second".to_string()]);
+        assert!(out.starts_with(&"x".repeat(120)), "{out}");
+        assert!(out.contains('…'));
+        assert!(out.ends_with("second; "));
+    }
+
+    #[test]
+    fn format_stderr_tail_skips_blank_lines() {
+        assert_eq!(format_stderr_tail(&[]), "");
+        assert_eq!(format_stderr_tail(&["   ".to_string(), "ok".to_string()]), "ok; ");
+    }
+
+    #[test]
+    fn boot_error_serializes_as_kind_and_data() {
+        // 前端 toStructuredError 依赖的线上契约:tag/content 判别式,
+        // 字段 camelCase;unit 变体无 data 字段
+        assert_eq!(
+            serde_json::to_value(BootError::NodeCheckTimeout { seconds: 10 }).unwrap(),
+            serde_json::json!({ "kind": "NodeCheckTimeout", "data": { "seconds": 10 } })
+        );
+        assert_eq!(
+            serde_json::to_value(BootError::DshExitedEarly { exit_code: 1 }).unwrap(),
+            serde_json::json!({ "kind": "DshExitedEarly", "data": { "exitCode": 1 } })
+        );
+        assert_eq!(
+            serde_json::to_value(BootError::NodeMissing).unwrap(),
+            serde_json::json!({ "kind": "NodeMissing" })
+        );
     }
 
     #[cfg(windows)]
