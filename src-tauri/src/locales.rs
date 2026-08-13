@@ -31,6 +31,11 @@ pub fn detect_lang() -> Lang {
 /// 原生界面文案表。&'static str 让 setup 阶段构建的托盘/对话框闭包无需持有 String。
 pub struct ShellTexts {
     pub tray_toggle: &'static str,
+    pub tray_theme: &'static str,
+    pub tray_theme_light: &'static str,
+    pub tray_theme_dark: &'static str,
+    pub tray_theme_system: &'static str,
+    pub tray_check_update: &'static str,
     pub tray_quit: &'static str,
     pub close_message: &'static str,
     pub close_quit: &'static str,
@@ -43,8 +48,14 @@ pub fn shell_texts(lang: Lang) -> ShellTexts {
     match lang {
         Lang::Zh => ShellTexts {
             tray_toggle: "显示/隐藏窗口",
+            tray_theme: "主题",
+            tray_theme_light: "亮色",
+            tray_theme_dark: "暗色",
+            tray_theme_system: "跟随系统",
+            tray_check_update: "检查更新",
             tray_quit: "退出",
-            close_message: "退出 DeepSeek Desktop?",
+            // "关闭"而非"退出":对话框同时提供"最小化到托盘",问题只问窗口去向
+            close_message: "关闭 DeepSeek Desktop?",
             close_quit: "退出应用",
             close_minimize: "最小化到托盘",
             close_cancel: "取消",
@@ -52,8 +63,15 @@ pub fn shell_texts(lang: Lang) -> ShellTexts {
         },
         Lang::En => ShellTexts {
             tray_toggle: "Show/Hide window",
+            tray_theme: "Theme",
+            tray_theme_light: "Light",
+            tray_theme_dark: "Dark",
+            tray_theme_system: "System",
+            tray_check_update: "Check for Updates",
             tray_quit: "Quit",
-            close_message: "Quit DeepSeek Desktop?",
+            // "Close" instead of "Quit": the dialog also offers "Minimize to tray",
+            // so the question is about the window, not the process
+            close_message: "Close DeepSeek Desktop?",
             close_quit: "Quit app",
             close_minimize: "Minimize to tray",
             close_cancel: "Cancel",

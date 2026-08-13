@@ -15,9 +15,11 @@ use tauri_plugin_dialog::{
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        // 单实例:防止双实例并发初始化 ~/.dsh profile
+        // 单实例:防止双实例并发初始化 ~/.dsh profile。第二个实例唤起主窗口:
+        // unminimize 必须——最小化中的窗口只 show() 不会取消最小化(与 CC-Switch 同款处理)
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
                 let _ = win.show();
                 let _ = win.set_focus();
             }
@@ -59,6 +61,9 @@ pub fn run() {
 
 /// 窗口 CloseRequested → 原生三选对话框。
 /// 注意:CloseRequested 在 webview 与 window 层可能各触发一次,用 DIALOG_SHOWN 守卫防重复弹。
+/// 按钮顺序定稿(#9):[最小化到托盘, 退出应用, 取消]。rfd(Windows)用 TaskDialog 且
+/// 不设默认按钮,默认按钮即第一个——把"最小化到托盘"放首位,Enter 只收起窗口、
+/// 不退出应用(原顺序首按钮是"退出应用",回车直接杀进程,是误触隐患)。
 fn setup_close_handler(app: &tauri::AppHandle, manager: dsh::DshManager) {
     let Some(win) = app.get_webview_window("main") else {
         return;
@@ -85,10 +90,11 @@ fn setup_close_handler(app: &tauri::AppHandle, manager: dsh::DshManager) {
             app.dialog()
                 .message(t.close_message)
                 .title("DeepSeek Desktop")
-                .kind(MessageDialogKind::Warning)
+                // Info:关闭确认不是错误/警告,图标用中性信息样式
+                .kind(MessageDialogKind::Info)
                 .buttons(MessageDialogButtons::YesNoCancelCustom(
-                    t.close_quit.into(),
                     t.close_minimize.into(),
+                    t.close_quit.into(),
                     t.close_cancel.into(),
                 ))
                 .show_with_result(move |res| {
