@@ -27,13 +27,14 @@ dist-ssr
 /.tauri/
 /src-tauri/target/
 
-# Local research & prototype docs
+# Local
+.claude/
+.agents/
 docs/prototype
 docs/research
 
+# Vite cache
+.vite/
+
 # Yarn runtime state
 .yarn/
-
-# Local agent tooling (shadcn skill copies)
-.claude/
-.agents/
