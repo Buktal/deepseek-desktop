@@ -7,7 +7,9 @@ mod logging;
 mod tray;
 
 use tauri::{Manager, WindowEvent};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
+use tauri_plugin_dialog::{
+    DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
+};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -41,11 +43,7 @@ pub fn run() {
             dsh::boot_start(&manager);
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            dsh::boot,
-            dsh::get_boot_state,
-            dsh::quit_app
-        ])
+        .invoke_handler(tauri::generate_handler![dsh::boot, dsh::quit_app])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {

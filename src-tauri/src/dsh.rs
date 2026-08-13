@@ -2,7 +2,17 @@
 //!
 //! 生命周期:checking(环境检查)→ installing(npm 安装)→ starting(启动 dsh web)
 //! → ready(服务就绪,窗口导航到 dsh Web UI)。
-//! 状态迁移经 `boot-state` 事件推给前端;日志不推流,只入环形缓冲(异常时附在错误页)。
+//! 状态迁移经 `boot-state` 事件推给前端(只 emit 到 `main` 窗口);日志不推流,
+//! 只入环形缓冲(异常时附在错误页)。
+//!
+//! IPC 命令面(最小化,2 个):
+//! - `boot`(触发/重试流水线 + 返回含日志的当前状态快照;挂载时一调两用)
+//! - `quit_app`(程序化退出:杀子进程 + exit)
+//!
+//! 安全语义(tauri 2.11.5 源码确认):
+//! - 窗口 navigate 到 http://127.0.0.1:<port> 后,该页面是 remote origin:
+//!   ACL 按 capability(local-only)拒绝其调用任何命令/监听事件/使用窗口 API;
+//!   Tauri 的 app CSP 只注入资产协议提供的本地页面,dsh 页面的 CSP 归 dsh 服务器自身。
 //!
 //! 生产日志:本模块不直接 eprintln,统一走 `log` crate 宏(logging::init 落盘到
 //! `<app_data_dir>/logs/app.log`,panic 经 hook 同落盘)。
@@ -110,7 +120,7 @@ pub struct BootStateView {
     pub error: Option<String>,
 }
 
-/// get_boot_state 快照:含最近日志(仅挂载时拉取一次)
+/// `boot` 命令返回的状态快照:含最近日志(挂载/重试一调两用)
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootStateSnapshot {
@@ -151,15 +161,7 @@ impl DshManager {
     }
 
     fn phase(&self) -> Phase {
-        self.state
-            .lock()
-            .map(|s| s.phase)
-            .unwrap_or(Phase::Error)
-    }
-
-    fn view(&self) -> BootStateView {
-        let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        BootStateView { phase: s.phase, error: s.error.clone() }
+        self.state.lock().map(|s| s.phase).unwrap_or(Phase::Error)
     }
 
     fn snapshot(&self) -> BootStateSnapshot {
@@ -175,10 +177,15 @@ impl DshManager {
             .into_iter()
             .rev()
             .collect();
-        BootStateSnapshot { phase: s.phase, error: s.error.clone(), logs }
+        BootStateSnapshot {
+            phase: s.phase,
+            error: s.error.clone(),
+            logs,
+        }
     }
 
-    /// 阶段迁移:更新状态并推送 `boot-state` 事件(仅阶段,不含日志)
+    /// 阶段迁移:更新状态并推送 `boot-state` 事件(仅阶段,不含日志)。
+    /// emit_to("main"):只投递主窗口 webview,不广播给其它窗口。
     fn set_phase(&self, phase: Phase, error: Option<String>) {
         if let Ok(mut s) = self.state.lock() {
             // 新一次 boot 的语义边界:进入 Checking 时清空上一轮的日志缓冲
@@ -192,7 +199,9 @@ impl DshManager {
             Some(e) => log::error!("[dsh] phase → {phase:?}: {e}"),
             None => log::info!("[dsh] phase → {phase:?}"),
         }
-        let _ = self.app.emit("boot-state", BootStateView { phase, error });
+        let _ = self
+            .app
+            .emit_to("main", "boot-state", BootStateView { phase, error });
     }
 
     fn set_error(&self, msg: String) {
@@ -213,7 +222,10 @@ impl DshManager {
             .state
             .lock()
             .map(|mut s| {
-                s.logs.push_back(LogLine { stream: stream.into(), line: trimmed.to_string() });
+                s.logs.push_back(LogLine {
+                    stream: stream.into(),
+                    line: trimmed.to_string(),
+                });
                 while s.logs.len() > LOG_CAP {
                     s.logs.pop_front();
                 }
@@ -262,10 +274,7 @@ enum ChildWaitError {
     Io(String),
 }
 
-fn wait_with_timeout(
-    child: &mut Child,
-    timeout: Duration,
-) -> Result<Output, ChildWaitError> {
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<Output, ChildWaitError> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -280,7 +289,11 @@ fn wait_with_timeout(
                 if let Some(mut se) = child.stderr.take() {
                     let _ = se.read_to_end(&mut stderr);
                 }
-                return Ok(Output { status, stdout, stderr });
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -411,7 +424,11 @@ fn check_node() -> Result<String, String> {
     };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let detail = if stderr.is_empty() { String::new() } else { format!("({stderr})") };
+        let detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!("({stderr})")
+        };
         return Err(format!(
             "Node.js 检查失败:`node --version` 退出码 {}{detail}",
             out.status.code().unwrap_or(-1)
@@ -453,7 +470,11 @@ fn global_node_modules() -> Result<PathBuf, String> {
     };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let detail = if stderr.is_empty() { String::new() } else { format!("({stderr})") };
+        let detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!("({stderr})")
+        };
         return Err(format!(
             "获取 npm 全局目录失败(退出码 {}){detail}",
             out.status.code().unwrap_or(-1)
@@ -502,7 +523,11 @@ fn npm_install_args(offline_cache: Option<&Path>) -> Vec<String> {
         args.push(dir.to_string_lossy().into_owned());
     }
     args.push("@deepseek-ai/dsh@latest".into());
-    args.extend(["--no-audit".into(), "--no-fund".into(), "--no-progress".into()]);
+    args.extend([
+        "--no-audit".into(),
+        "--no-fund".into(),
+        "--no-progress".into(),
+    ]);
     args
 }
 
@@ -527,7 +552,12 @@ fn install_failure_message(exit_code: Option<i32>, stderr_tail: &[String]) -> St
         "请检查网络后点重试,或手动执行 npm install -g @deepseek-ai/dsh 排查"
     };
     let mut detail = String::new();
-    for l in stderr_tail.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).take(2) {
+    for l in stderr_tail
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .take(2)
+    {
         if l.chars().count() > 120 {
             detail.push_str(&l.chars().take(120).collect::<String>());
             detail.push('…');
@@ -605,7 +635,10 @@ fn npm_install_global(manager: &DshManager) -> Result<(), String> {
             // 进程已退出 → 管道 EOF → 读线程自然结束,join 确保 stderr 尾部收全
             let _ = out_thread.join();
             let _ = err_thread.join();
-            let tail: Vec<String> = stderr_tail.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let tail: Vec<String> = stderr_tail
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
             if out.status.success() {
                 Ok(())
             } else {
@@ -671,7 +704,10 @@ fn parse_ready_line(line: &str) -> Option<u16> {
     let idx = clean.find(READY_PREFIX)?;
     let rest = &clean[idx + READY_PREFIX.len()..];
     let port_part = rest.rsplit(':').next()?.trim();
-    let digits: String = port_part.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = port_part
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     if digits.is_empty() {
         return None;
     }
@@ -829,7 +865,10 @@ fn spawn_reaper(manager: DshManager, rx: Receiver<(String, String)>) {
         if let Some(mut c) = child {
             let status = c.wait();
             let ok = status.map(|s| s.success()).unwrap_or(false);
-            log::info!("[dsh] reaper: dsh 子进程退出, ok={ok}, quitting={}", is_quitting());
+            log::info!(
+                "[dsh] reaper: dsh 子进程退出, ok={ok}, quitting={}",
+                is_quitting()
+            );
             if !ok && !is_quitting() {
                 let _ = manager
                     .app
@@ -845,12 +884,14 @@ fn spawn_reaper(manager: DshManager, rx: Receiver<(String, String)>) {
 
 // ── Tauri commands ─────────────────────────────────────────────────
 
-/// 启动(或重试)boot 流水线。phase 守卫:非 Idle/Error 时 no-op(防 StrictMode 双 invoke)。
+/// 触发(或重试)boot 流水线,并返回含最近日志的状态快照。
+/// 挂载/重试一调两用:触发 + 拉快照,命令面从 3 收窄到 2(boot/quit_app)。
+/// phase 守卫:非 Idle/Error 时 no-op(防 StrictMode 双 invoke),快照仍正常返回。
 /// async + Result:不占用 IPC/主线程(tauri 2 要求含引用输入的 async command 返回 Result)。
 #[tauri::command]
-pub async fn boot(state: tauri::State<'_, DshManager>) -> Result<BootStateView, String> {
+pub async fn boot(state: tauri::State<'_, DshManager>) -> Result<BootStateSnapshot, String> {
     boot_start(state.inner());
-    Ok(state.inner().view())
+    Ok(state.inner().snapshot())
 }
 
 /// 在独立线程启动流水线;Idle(首启)/Error(重试)时才生效,其余阶段 no-op。
@@ -882,14 +923,6 @@ pub fn boot_start(manager: &DshManager) {
     });
 }
 
-/// 当前状态快照(前端挂载/重载时拉取,含最近日志)
-#[tauri::command]
-pub async fn get_boot_state(
-    state: tauri::State<'_, DshManager>,
-) -> Result<BootStateSnapshot, String> {
-    Ok(state.inner().snapshot())
-}
-
 /// 退出应用:杀子进程 + exit(0)。程序化退出先置 QUITTING 标志放行 CloseRequested。
 #[tauri::command]
 pub async fn quit_app(
@@ -910,12 +943,24 @@ mod tests {
 
     #[test]
     fn parse_ready_line_extracts_port() {
-        assert_eq!(parse_ready_line("dsh web: http://127.0.0.1:3080"), Some(3080));
+        assert_eq!(
+            parse_ready_line("dsh web: http://127.0.0.1:3080"),
+            Some(3080)
+        );
         // 尾随斜杠 / 空白
-        assert_eq!(parse_ready_line("dsh web: http://127.0.0.1:3080/"), Some(3080));
-        assert_eq!(parse_ready_line("dsh web: http://127.0.0.1:3080   "), Some(3080));
+        assert_eq!(
+            parse_ready_line("dsh web: http://127.0.0.1:3080/"),
+            Some(3080)
+        );
+        assert_eq!(
+            parse_ready_line("dsh web: http://127.0.0.1:3080   "),
+            Some(3080)
+        );
         // 尾随路径/查询串:取数字前缀
-        assert_eq!(parse_ready_line("dsh web: http://127.0.0.1:3080/?x=1"), Some(3080));
+        assert_eq!(
+            parse_ready_line("dsh web: http://127.0.0.1:3080/?x=1"),
+            Some(3080)
+        );
     }
 
     #[test]
@@ -978,7 +1023,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn wait_with_timeout_collects_output_of_quick_command() {
-        let mut child = Command::new("cmd").args(["/c", "echo ok"]).stdout(Stdio::piped()).spawn().unwrap();
+        let mut child = Command::new("cmd")
+            .args(["/c", "echo ok"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
         let out = wait_with_timeout(&mut child, Duration::from_secs(5)).unwrap();
         assert!(out.status.success());
         assert!(String::from_utf8_lossy(&out.stdout).contains("ok"));
@@ -996,7 +1045,10 @@ mod tests {
             .unwrap();
         let started = Instant::now();
         let r = wait_with_timeout(&mut child, Duration::from_millis(200));
-        assert!(matches!(r, Err(ChildWaitError::Timeout(_))), "期望 Timeout,实际 {r:?}");
+        assert!(
+            matches!(r, Err(ChildWaitError::Timeout(_))),
+            "期望 Timeout,实际 {r:?}"
+        );
         assert!(started.elapsed() < Duration::from_secs(2), "超时检测过慢");
         kill_pid_tree(child.id());
         let _ = child.wait();
@@ -1006,17 +1058,18 @@ mod tests {
     fn dsh_bin_path_requires_bin_js_not_just_version() {
         // 半残安装(版本号在、bin.js 缺)不得视为「已安装」——否则被「有则用」跳过,
         // 坏掉的安装永远修不好(2026-08-14 实测事故)
-        let dir = std::env::temp_dir().join(format!(
-            "dsh-boot-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("dsh-boot-test-{}", std::process::id()));
         let dsh_dir = dir.join("@deepseek-ai/dsh");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dsh_dir.join("lib")).unwrap();
 
         // 只有 package.json(无 bin.js)→ 视为未安装
         std::fs::write(dsh_dir.join("package.json"), r#"{"version":"0.1.0-rc.6"}"#).unwrap();
-        assert_eq!(dsh_bin_path(&dir), None, "版本号存在但 bin.js 缺失必须判为未安装");
+        assert_eq!(
+            dsh_bin_path(&dir),
+            None,
+            "版本号存在但 bin.js 缺失必须判为未安装"
+        );
 
         // 补上 bin.js → 视为已安装
         std::fs::write(dsh_dir.join("lib/bin.js"), "// placeholder").unwrap();
@@ -1039,7 +1092,11 @@ mod tests {
             .stderr(Stdio::piped())
             .output()
             .unwrap();
-        assert!(out.status.success(), "npm.cmd 经 cmd.exe 启动失败: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "npm.cmd 经 cmd.exe 启动失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert!(!String::from_utf8_lossy(&out.stdout).trim().is_empty());
     }
 
