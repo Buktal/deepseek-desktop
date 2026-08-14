@@ -20,6 +20,7 @@ import { CircleArrowUp, Loader2, RotateCw } from "lucide-react"
 import { useTranslation } from "react-i18next"
 
 import { InstallProgress } from "@/components/install/InstallProgress"
+import { FullScreenCard } from "@/components/shell/FullScreenCard"
 import { ProgressRail } from "@/components/shell/ProgressRail"
 import { Button } from "@/components/ui/button"
 import { localizeStructuredError, type StructuredError } from "@/lib/error"
@@ -57,81 +58,79 @@ export function UpgradeScreen({
       : null
 
   return (
-    <main className="flex h-screen w-screen items-center justify-center bg-background p-10 text-foreground">
-      <div className="flex w-full max-w-md flex-col items-center gap-5 rounded-2xl border border-border bg-card p-10 text-center shadow-sm">
-        {status === "available" && (
-          <>
-            <CircleArrowUp className="size-9 text-primary" />
-            <h1 className="text-lg font-medium">{t("upgrade.available.title")}</h1>
-            <p className="text-sm text-muted-foreground">
-              {t("upgrade.available.hint", { current: currentVersion, version })}
-            </p>
-            {/* 中断影响明示(#3 §4):确认按钮即授权点,按下即杀 dsh,不二次确认 */}
-            <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
-              {t("upgrade.available.impact")}
-            </p>
-            <div className="flex items-center gap-3">
-              <Button size="lg" onClick={onConfirm}>
-                <CircleArrowUp />
-                {t("upgrade.now")}
-              </Button>
-              <Button variant="ghost" size="lg" onClick={onDismiss}>
-                {t("upgrade.later")}
-              </Button>
-            </div>
-          </>
-        )}
+    <FullScreenCard>
+      {status === "available" && (
+        <>
+          <CircleArrowUp className="size-9 text-primary" />
+          <h1 className="text-lg font-medium">{t("upgrade.available.title")}</h1>
+          <p className="text-sm text-muted-foreground">
+            {t("upgrade.available.hint", { current: currentVersion, version })}
+          </p>
+          {/* 中断影响明示(#3 §4):确认按钮即授权点,按下即杀 dsh,不二次确认 */}
+          <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
+            {t("upgrade.available.impact")}
+          </p>
+          <div className="flex items-center gap-3">
+            <Button size="lg" onClick={onConfirm}>
+              <CircleArrowUp />
+              {t("upgrade.now")}
+            </Button>
+            <Button variant="ghost" size="lg" onClick={onDismiss}>
+              {t("upgrade.later")}
+            </Button>
+          </div>
+        </>
+      )}
 
-        {status === "active" && title && (
-          <>
-            <Loader2 className="size-9 animate-spin text-primary" />
-            <h1 className="text-lg font-medium">{title}</h1>
-            {installing ? (
-              <p className="text-sm text-muted-foreground">{t("upgrade.installing.hint")}</p>
-            ) : null}
-            {/* 安装中:确定进度(与 boot 共用 InstallProgress,#7);其余阶段不确定进度 */}
-            {phase === "installing" && progress !== null ? (
-              <InstallProgress progress={progress} stage={stage} i18nPrefix="upgrade" />
-            ) : (
-              <ProgressRail value={null} />
-            )}
-          </>
-        )}
-
-        {status === "ready" && (
-          <>
-            <Loader2 className="size-9 animate-spin text-primary" />
-            {/* 瞬态:Rust 随即导航回 dsh 页(新端口 URL);复用 boot 的过渡文案 */}
-            <h1 className="text-lg font-medium">{t("boot.ready.title")}</h1>
+      {status === "active" && title && (
+        <>
+          <Loader2 className="size-9 animate-spin text-primary" />
+          <h1 className="text-lg font-medium">{title}</h1>
+          {installing ? (
+            <p className="text-sm text-muted-foreground">{t("upgrade.installing.hint")}</p>
+          ) : null}
+          {/* 安装中:确定进度(与 boot 共用 InstallProgress,#7);其余阶段不确定进度 */}
+          {phase === "installing" && progress !== null ? (
+            <InstallProgress progress={progress} stage={stage} i18nPrefix="upgrade" />
+          ) : (
             <ProgressRail value={null} />
-          </>
-        )}
+          )}
+        </>
+      )}
 
-        {status === "failed" && (
-          <>
-            <CircleArrowUp className="size-9 text-destructive" />
-            <h1 className="text-lg font-medium">{t("upgrade.failed.title")}</h1>
-            {error ? (
-              <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
-                {localizeStructuredError(error, t) || t("errors.unknown")}
-              </p>
-            ) : null}
-            {/* 失败语义(#3 §3):旧版保留(npm 语义)+ 恢复服务([返回 dsh] 先起旧版再导航) */}
+      {status === "ready" && (
+        <>
+          <Loader2 className="size-9 animate-spin text-primary" />
+          {/* 瞬态:Rust 随即导航回 dsh 页(新端口 URL);复用 boot 的过渡文案 */}
+          <h1 className="text-lg font-medium">{t("boot.ready.title")}</h1>
+          <ProgressRail value={null} />
+        </>
+      )}
+
+      {status === "failed" && (
+        <>
+          <CircleArrowUp className="size-9 text-destructive" />
+          <h1 className="text-lg font-medium">{t("upgrade.failed.title")}</h1>
+          {error ? (
             <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
-              {t("upgrade.failed.keepOld")}
+              {localizeStructuredError(error, t) || t("errors.unknown")}
             </p>
-            <div className="flex items-center gap-3">
-              <Button size="lg" onClick={onConfirm}>
-                <RotateCw />
-                {t("common.retry")}
-              </Button>
-              <Button variant="ghost" size="lg" onClick={onDismiss}>
-                {t("upgrade.failed.back")}
-              </Button>
-            </div>
-          </>
-        )}
-      </div>
-    </main>
+          ) : null}
+          {/* 失败语义(#3 §3):旧版保留(npm 语义)+ 恢复服务([返回 dsh] 先起旧版再导航) */}
+          <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
+            {t("upgrade.failed.keepOld")}
+          </p>
+          <div className="flex items-center gap-3">
+            <Button size="lg" onClick={onConfirm}>
+              <RotateCw />
+              {t("common.retry")}
+            </Button>
+            <Button variant="ghost" size="lg" onClick={onDismiss}>
+              {t("upgrade.failed.back")}
+            </Button>
+          </div>
+        </>
+      )}
+    </FullScreenCard>
   )
 }

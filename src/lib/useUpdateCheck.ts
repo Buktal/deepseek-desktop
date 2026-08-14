@@ -4,19 +4,20 @@
 // O_CC_One 的前端常驻 update-check hook(启动探测 + 6h 轮询)不适用——检查/下载/
 // 安装全部在 Rust 侧(update.rs:启动探测 + 6h 轮询 + 托盘手动入口),
 // 本 hook 只是本地页上的镜像视图:挂载时拉 `update_state` 快照 + 监听
-// `update-state` 事件(与 useBoot 同款「先注册监听,再拉快照,后到者覆盖」竞态语义),
-// 动作全部走命令(update_apply / update_restart / update_dismiss / opener 打开
-// GitHub Releases)。StrictMode 双挂载无害:监听注册/清理成对,快照拉取幂等。
+// `update-state` 事件(同步骨架走 useRustStateSync,先注册监听再拉快照,
+// 后到者覆盖),动作全部走命令(update_apply / update_restart / update_dismiss /
+// opener 打开 GitHub Releases)。StrictMode 双挂载无害:监听注册/清理成对,
+// 快照拉取幂等。
 //
 // 错误跨边界保持结构化形态({kind,data}),卡片渲染时才经 localizeStructuredError
 // 翻译(语言切换可重译,见 src/lib/error.ts 与 #12)。
 
 import { invoke } from "@tauri-apps/api/core"
-import { listen, type UnlistenFn } from "@tauri-apps/api/event"
 import { openUrl } from "@tauri-apps/plugin-opener"
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useState } from "react"
 
-import { toStructuredError, type StructuredError } from "@/lib/error"
+import { toStructuredError, type RustErrorPayload, type StructuredError } from "@/lib/error"
+import { useRustStateSync } from "@/lib/useRustStateSync"
 
 export type UpdateStatus =
   | "idle" // 无更新 / 检测失败(静默)
@@ -26,12 +27,6 @@ export type UpdateStatus =
   | "ready" // 已安装,等待重启
   | "failed" // 下载/安装失败 → 降级 GitHub 手动下载
 
-/** Rust 侧 UpdateError 的序列化形态(serde tag/content,与 BootError 同形态) */
-export interface UpdateErrorPayload {
-  kind: string
-  data?: Record<string, unknown>
-}
-
 /** Rust 侧 UpdateStateView 的序列化形态(内部 tag status,字段 camelCase) */
 export interface UpdateStateView {
   status: UpdateStatus
@@ -40,7 +35,7 @@ export interface UpdateStateView {
   notes?: string | null
   downloadedBytes?: number
   totalBytes?: number
-  error?: UpdateErrorPayload | null
+  error?: RustErrorPayload | null
 }
 
 /** GitHub Releases 手动下载入口(失败降级,照搬 O_CC_One 的 RELEASES_URL) */
@@ -48,7 +43,7 @@ export const RELEASES_URL = "https://github.com/Buktal/deepseek-desktop/releases
 
 /**
  * 升级状态是否为「需要展示升级卡片」的活跃态。
- * App 挂载时用它决定先渲染 UpgradeCard 还是走 boot 分发(#3 §5)。
+ * App 挂载时用它决定先渲染 UpdateCard 还是走 boot 分发(#3 §5)。
  * 纯函数,可测。
  */
 export function isActiveUpdateStatus(status: UpdateStatus | undefined): boolean {
@@ -87,32 +82,13 @@ export function useUpdateCheck() {
     setError(toStructuredError(view.error ?? null))
   }, [])
 
-  useEffect(() => {
-    let mounted = true
-    const unlisteners: UnlistenFn[] = []
-
-    void (async () => {
-      try {
-        // 先注册监听,再拉快照:增量事件一个不丢
-        const un = await listen<UpdateStateView>("update-state", (e) => {
-          if (mounted) applyView(e.payload)
-        })
-        unlisteners.push(un)
-        if (mounted) {
-          const snap = await invoke<UpdateStateView>("update_state")
-          if (mounted) applyView(snap)
-        }
-      } catch (e) {
-        // 监听/快照失败:保持 idle,升级卡片不出现(升级是增强,不是硬依赖)
-        console.warn("[update] 升级状态同步失败,保持 idle", e)
-      }
-    })()
-
-    return () => {
-      mounted = false
-      unlisteners.forEach((u) => u())
-    }
-  }, [applyView])
+  useRustStateSync({
+    event: "update-state",
+    snapshot: () => invoke<UpdateStateView>("update_state"),
+    apply: applyView,
+    // 监听/快照失败:保持 idle,升级卡片不出现(升级是增强,不是硬依赖)
+    onError: (e) => console.warn("[update] 升级状态同步失败,保持 idle", e),
+  })
 
   // 卡片动作:全部走 Rust 命令(检查/下载/安装/重启都在 Rust 侧,见 update.rs)
   const applyUpdate = useCallback(() => {

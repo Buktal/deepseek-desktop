@@ -1,5 +1,5 @@
 // 升级状态纯函数测试:App 路由守卫与下载百分比(App 挂载 → 升级卡片的分发条件,
-// 生产路径即 App.tsx / UpgradeCard.tsx 的渲染路径)
+// 生产路径即 App.tsx / UpdateCard.tsx 的渲染路径)
 import { describe, expect, it } from "vitest"
 
 import {

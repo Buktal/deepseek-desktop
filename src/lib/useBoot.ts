@@ -1,22 +1,25 @@
-// boot 流水线前端接线:监听事件 + 触发/重试(触发命令同时返回状态快照,一调两用)
+// boot 流水线前端接线:监听事件 + 触发/重试(触发命令同时返回状态快照,一调两用)。
+// 同步骨架(先注册监听、再拉快照、后到者覆盖)走共享的 useRustStateSync;
+// 本 hook 只负责 boot 特有的部分:applyView 字段映射、错误转结构化形态(fatal)、
+// 耗时锚点插值、quit/retry。
 import { invoke } from "@tauri-apps/api/core"
-import { listen, type UnlistenFn } from "@tauri-apps/api/event"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
-import { rawErrorMessage, toStructuredError, type StructuredError } from "@/lib/error"
+import { interpolateElapsed } from "@/lib/elapsed"
+import {
+  rawErrorMessage,
+  toStructuredError,
+  type RustErrorPayload,
+  type StructuredError,
+} from "@/lib/error"
+import { useRustStateSync } from "@/lib/useRustStateSync"
 
 export type Phase = "idle" | "checking" | "installing" | "starting" | "ready" | "error"
-
-/** Rust 侧 BootError 的序列化形态(serde tag/content,unit 变体无 data 字段) */
-export interface BootErrorPayload {
-  kind: string
-  data?: Record<string, unknown>
-}
 
 /** Rust 侧 boot-state 事件/命令返回的线上契约(serde camelCase,缺省字段为 None) */
 export interface BootStateView {
   phase: Phase
-  error?: BootErrorPayload | null
+  error?: RustErrorPayload | null
   /** 安装模拟进度 0-100,仅 installing 携带;100 = npm 进程退出校准(Rust 侧语义) */
   progress?: number | null
   /** 安装子阶段键后缀("fetching"|"reifying"|"finishing") */
@@ -47,8 +50,8 @@ export function useBoot() {
   const [progress, setProgress] = useState<number | null>(null)
   const [stage, setStage] = useState<string | null>(null)
   // 耗时显示:elapsedSecs 存最近事件携带的秒数,elapsedAnchor 记下该事件到达的
-  // 本地时刻;渲染时按 Date.now() 插值(每秒 tick 触发重渲染),显示不漂移——
-  // 起点是 Rust 真实流水线启动时刻,挂载晚于启动也不丢已过时间
+  // 本地时刻;渲染时按 Date.now() 插值(interpolateElapsed,每秒 tick 触发重渲染),
+  // 显示不漂移——起点是 Rust 真实流水线启动时刻,挂载晚于启动也不丢已过时间
   const [elapsedSecs, setElapsedSecs] = useState<number | null>(null)
   const elapsedAnchor = useRef<{ baseSecs: number; atMs: number } | null>(null)
   const [elapsedTick, setElapsedTick] = useState(0)
@@ -57,26 +60,32 @@ export function useBoot() {
   // ready 事件到达后 Rust 即将导航去 dsh 页,不得中途切升级卡片。
   const [mountSnapshotReady, setMountSnapshotReady] = useState(false)
 
-  /** 应用一份状态视图(事件或快照):阶段/错误/进度/耗时统一入口 */
-  const applyView = useCallback((v: BootStateView) => {
-    if (v.phase === "checking") {
+  /** 应用一份状态视图(事件或快照):阶段/错误/进度/耗时统一入口。
+   *  logs 与 mountSnapshotReady 只有快照携带(事件载荷是快照子集,经
+   *  source 区分)。 */
+  const applyView = useCallback((view: BootStateSnapshot, source: "event" | "snapshot") => {
+    if (view.phase === "checking") {
       setLogs([]) // 全新一次 boot 的语义边界(Rust 侧同步清空缓冲)
     }
-    setPhase(v.phase)
-    setError(toStructuredError(v.error ?? null))
+    setPhase(view.phase)
+    setError(toStructuredError(view.error ?? null))
     // 进度/阶段仅 installing 携带;离开 installing 清空(升级卡片等其他界面不残留)
-    if (v.phase === "installing") {
-      setProgress(v.progress ?? null)
-      setStage(v.stage ?? null)
+    if (view.phase === "installing") {
+      setProgress(view.progress ?? null)
+      setStage(view.stage ?? null)
     } else {
       setProgress(null)
       setStage(null)
     }
     // node 检测结果仅 checking 携带;其余阶段事件不带字段 → 清空
-    setNodeVersion(v.nodeVersion ?? null)
-    if (v.elapsedSecs != null) {
-      setElapsedSecs(v.elapsedSecs)
-      elapsedAnchor.current = { baseSecs: v.elapsedSecs, atMs: Date.now() }
+    setNodeVersion(view.nodeVersion ?? null)
+    if (view.elapsedSecs != null) {
+      setElapsedSecs(view.elapsedSecs)
+      elapsedAnchor.current = { baseSecs: view.elapsedSecs, atMs: Date.now() }
+    }
+    if (source === "snapshot") {
+      setLogs(view.logs)
+      if (view.phase === "ready") setMountSnapshotReady(true)
     }
   }, [])
 
@@ -85,52 +94,22 @@ export function useBoot() {
     setError(e)
   }, [])
 
-  // 触发/重试流水线,并应用命令返回的状态快照(含最近日志)。
+  // 同步骨架走共享核心:先注册监听再触发(增量事件一个不丢);
+  // 快照与事件来自同一状态,后到者覆盖,无竞态。
+  // 触发/重试:invoke("boot") 触发流水线并返回状态快照(含最近日志);
   // Rust 侧 phase + BOOTING 守卫去重,StrictMode 双 invoke 无害。
-  const trigger = useCallback(() => {
-    void invoke<BootStateSnapshot>("boot")
-      .then((snap) => {
-        applyView(snap)
-        setLogs(snap.logs)
-        if (snap.phase === "ready") setMountSnapshotReady(true)
-      })
-      .catch((e) =>
-        // 命令拒绝(IPC/命令面异常):detail 透传原始串,框架文案渲染时翻译
-        fail({ kind: "app", type: "BootRequestFailed", data: { detail: rawErrorMessage(e) } }),
-      )
-  }, [applyView, fail])
-
-  useEffect(() => {
-    let mounted = true
-    const unlisteners: UnlistenFn[] = []
-
-    void (async () => {
-      try {
-        // 先注册监听,再触发:增量事件一个不丢;
-        // 快照与事件来自同一状态,后到者覆盖,无竞态
-        const un1 = await listen<BootStateView>("boot-state", (e) => {
-          applyView(e.payload)
-        })
-        unlisteners.push(un1)
-
-        // 触发流水线 + 拉初始快照(挂载时流水线可能已在运行,事件已错过,以快照为准)
-        if (mounted) trigger()
-      } catch (e) {
-        // listen 注册失败
-        if (mounted)
-          fail({
-            kind: "app",
-            type: "BootListenFailed",
-            data: { detail: rawErrorMessage(e) },
-          })
-      }
-    })()
-
-    return () => {
-      mounted = false
-      unlisteners.forEach((u) => u())
-    }
-  }, [applyView, fail, trigger])
+  const { refresh } = useRustStateSync({
+    event: "boot-state",
+    snapshot: () => invoke<BootStateSnapshot>("boot"),
+    apply: applyView,
+    onError: (e, source) =>
+      // 命令拒绝(IPC/命令面异常):detail 透传原始串,框架文案渲染时翻译
+      fail({
+        kind: "app",
+        type: source === "listen" ? "BootListenFailed" : "BootRequestFailed",
+        data: { detail: rawErrorMessage(e) },
+      }),
+  })
 
   // 耗时显示时钟:boot 阶段(含 ready 过渡)有秒数后每秒重渲染一次,渲染时
   // 按锚点插值(无 setTimeout 漂移);错误/待机页不显示耗时,停表免无谓的
@@ -145,10 +124,10 @@ export function useBoot() {
     if (elapsedSecs === null) return null
     const a = elapsedAnchor.current
     if (!a) return elapsedSecs
-    return a.baseSecs + Math.floor((Date.now() - a.atMs) / 1000)
+    return interpolateElapsed(a.baseSecs, a.atMs, Date.now())
   }, [elapsedSecs, elapsedTick])
 
-  const retry = useCallback(() => trigger(), [trigger])
+  const retry = refresh
   const quit = useCallback(() => {
     invoke("quit_app").catch(() => {})
   }, [])

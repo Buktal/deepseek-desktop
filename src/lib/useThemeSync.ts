@@ -4,10 +4,12 @@
 // (payload "light"|"dark")单向下发;跟随系统时 OS 主题变化由 Rust 监听并实时重推。
 // 初始化全在 effect 内:模块顶层不触碰 window/document(守卫同 useBoot,
 // vitest 纯 node 环境可安全 import)。
-// 竞态语义与 boot-state 一致:先注册监听再拉快照,两者同源,后到者覆盖。
+// 同步骨架(先注册监听再拉快照,两者同源,后到者覆盖)走 useRustStateSync;
+// 生效主题守卫(isResolvedTheme)在 apply 处统一做:事件与快照同一条校验路径。
 import { invoke } from "@tauri-apps/api/core"
-import { listen, type UnlistenFn } from "@tauri-apps/api/event"
 import { useEffect, useState } from "react"
+
+import { useRustStateSync } from "@/lib/useRustStateSync"
 
 export type ResolvedTheme = "light" | "dark"
 
@@ -20,31 +22,15 @@ export function useThemeSync(): void {
   // 默认亮色:快照到达前 boot 页按亮色渲染(IPC 毫秒级,首帧后即正确主题)
   const [isDark, setIsDark] = useState(false)
 
-  useEffect(() => {
-    let mounted = true
-    const unlisteners: UnlistenFn[] = []
-
-    void (async () => {
-      try {
-        const un = await listen<unknown>("theme-changed", (e) => {
-          if (mounted && isResolvedTheme(e.payload)) setIsDark(e.payload === "dark")
-        })
-        unlisteners.push(un)
-        if (mounted) {
-          const snap = await invoke<ResolvedTheme>("theme_state")
-          if (mounted && isResolvedTheme(snap)) setIsDark(snap === "dark")
-        }
-      } catch (e) {
-        // 监听/快照失败:保持默认亮色,不阻塞启动页(主题是增强,不是硬依赖)
-        console.warn("[theme] 主题同步失败,保持亮色", e)
-      }
-    })()
-
-    return () => {
-      mounted = false
-      unlisteners.forEach((u) => u())
-    }
-  }, [])
+  useRustStateSync({
+    event: "theme-changed",
+    snapshot: () => invoke<ResolvedTheme>("theme_state"),
+    apply: (view) => {
+      if (isResolvedTheme(view)) setIsDark(view === "dark")
+    },
+    // 监听/快照失败:保持默认亮色,不阻塞启动页(主题是增强,不是硬依赖)
+    onError: (e) => console.warn("[theme] 主题同步失败,保持亮色", e),
+  })
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", isDark)

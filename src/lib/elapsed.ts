@@ -13,3 +13,10 @@ export function formatElapsed(secs: number): ElapsedParts {
   const s = Number.isFinite(secs) ? Math.max(0, Math.floor(secs)) : 0
   return { minutes: Math.floor(s / 60), seconds: s % 60 }
 }
+
+/** 按锚点插值当前秒数(useBoot 的耗时显示):锚点(baseSecs, atMs)来自最近
+ *  一次事件携带的秒数与本地到达时刻,渲染时按 nowMs 插值——起点是 Rust 真实
+ *  流水线启动时刻,挂载晚于启动也不丢已过时间,每秒 tick 重渲染不漂移。 */
+export function interpolateElapsed(baseSecs: number, atMs: number, nowMs: number): number {
+  return baseSecs + Math.floor((nowMs - atMs) / 1000)
+}

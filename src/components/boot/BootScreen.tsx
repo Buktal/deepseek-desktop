@@ -14,8 +14,10 @@ import { InstallProgress } from "@/components/install/InstallProgress"
 import { ProgressRail } from "@/components/shell/ProgressRail"
 import { formatElapsed } from "@/lib/elapsed"
 import { cn } from "@/lib/utils"
+import type { Phase } from "@/lib/useBoot"
 
-export type BootPhase = "idle" | "checking" | "installing" | "starting" | "ready"
+/** BootScreen 接收的阶段:Phase 去掉 error(错误分发在 App 完成,此处只多不少)。 */
+export type BootPhase = Exclude<Phase, "error">
 
 export function BootScreen({
   phase,

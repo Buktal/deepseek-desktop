@@ -2,18 +2,19 @@
 //
 // 架构与 useUpdateCheck 同款(#9 约束):检查/流水线全在 Rust 侧(upgrade.rs:
 // 启动探测 + 6h 轮询 + 托盘手动入口),本 hook 只是本地页上的镜像视图——
-// 挂载时拉 `upgrade_state` 快照 + 监听 `upgrade-state` 事件(先注册监听,
-// 再拉快照,后到者覆盖,同 useBoot 竞态语义),动作走命令(upgrade_confirm /
-// upgrade_dismiss)。StrictMode 双挂载无害:监听注册/清理成对,快照拉取幂等。
+// 挂载时拉 `upgrade_state` 快照 + 监听 `upgrade-state` 事件(同步骨架走
+// useRustStateSync,先注册监听再拉快照,后到者覆盖),动作走命令
+// (upgrade_confirm / upgrade_dismiss)。StrictMode 双挂载无害:监听注册/清理
+// 成对,快照拉取幂等。
 //
 // 错误跨边界保持结构化形态({kind,data}),卡片渲染时才经 localizeStructuredError
 // 翻译(语言切换可重译,见 src/lib/error.ts 与 #12)。
 
 import { invoke } from "@tauri-apps/api/core"
-import { listen, type UnlistenFn } from "@tauri-apps/api/event"
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useState } from "react"
 
-import { toStructuredError, type StructuredError } from "@/lib/error"
+import { toStructuredError, type RustErrorPayload, type StructuredError } from "@/lib/error"
+import { useRustStateSync } from "@/lib/useRustStateSync"
 
 export type DshUpgradeStatus =
   | "idle" // 无待升级(初始 / 无新版 / 升级成功消费完毕)
@@ -24,12 +25,6 @@ export type DshUpgradeStatus =
 
 export type DshUpgradePhase = "killing" | "installing" | "verifying" | "starting"
 
-/** Rust 侧 UpgradeError 的序列化形态(serde tag/content,与 BootError 同形态) */
-export interface DshUpgradeErrorPayload {
-  kind: string
-  data?: Record<string, unknown>
-}
-
 /** Rust 侧 UpgradeStateView 的序列化形态(内部 tag status,字段 camelCase) */
 export interface DshUpgradeStateView {
   status: DshUpgradeStatus
@@ -38,7 +33,7 @@ export interface DshUpgradeStateView {
   phase?: DshUpgradePhase | null
   progress?: number | null
   stage?: string | null
-  error?: DshUpgradeErrorPayload | null
+  error?: RustErrorPayload | null
 }
 
 /**
@@ -71,32 +66,13 @@ export function useDshUpgrade() {
     setStage(view.stage ?? null)
   }, [])
 
-  useEffect(() => {
-    let mounted = true
-    const unlisteners: UnlistenFn[] = []
-
-    void (async () => {
-      try {
-        // 先注册监听,再拉快照:增量事件一个不丢
-        const un = await listen<DshUpgradeStateView>("upgrade-state", (e) => {
-          if (mounted) applyView(e.payload)
-        })
-        unlisteners.push(un)
-        if (mounted) {
-          const snap = await invoke<DshUpgradeStateView>("upgrade_state")
-          if (mounted) applyView(snap)
-        }
-      } catch (e) {
-        // 监听/快照失败:保持 idle,升级卡片不出现(升级是增强,不是硬依赖)
-        console.warn("[upgrade] dsh 升级状态同步失败,保持 idle", e)
-      }
-    })()
-
-    return () => {
-      mounted = false
-      unlisteners.forEach((u) => u())
-    }
-  }, [applyView])
+  useRustStateSync({
+    event: "upgrade-state",
+    snapshot: () => invoke<DshUpgradeStateView>("upgrade_state"),
+    apply: applyView,
+    // 监听/快照失败:保持 idle,升级卡片不出现(升级是增强,不是硬依赖)
+    onError: (e) => console.warn("[upgrade] dsh 升级状态同步失败,保持 idle", e),
+  })
 
   // 卡片动作:全部走 Rust 命令(检测/流水线/恢复服务都在 Rust 侧,见 upgrade.rs)
   const confirm = useCallback(() => {

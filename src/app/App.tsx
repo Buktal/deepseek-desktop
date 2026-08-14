@@ -6,7 +6,7 @@
 // 升级卡优先级(#17):dsh 升级卡(upgrade.*) → 应用升级卡(update.*) → boot 分发。
 import { BootScreen } from "@/components/boot/BootScreen"
 import { ErrorScreen } from "@/components/boot/ErrorScreen"
-import { UpgradeCard } from "@/components/update/UpgradeCard"
+import { UpdateCard } from "@/components/update/UpdateCard"
 import { UpgradeScreen } from "@/components/upgrade/UpgradeScreen"
 import { useBoot } from "@/lib/useBoot"
 import { useBootExit } from "@/lib/useBootExit"
@@ -59,7 +59,7 @@ export default function App() {
 
   if (mountSnapshotReady && isActiveUpdateStatus(update.status)) {
     return (
-      <UpgradeCard
+      <UpdateCard
         status={update.status}
         version={update.version}
         currentVersion={update.currentVersion}

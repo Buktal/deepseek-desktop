@@ -16,11 +16,17 @@ export type StructuredError =
   | { kind: "app"; type: string; data?: Record<string, unknown> }
   | { kind: "raw"; message: string }
 
-/** Rust `BootError` 的结构化守卫(`{ kind: string, data?: object }`,
- *  unit 变体无 data 字段——serde tag/content 序列化形态)。
- *  注意 `kind` 只匹配 Rust 判别式(Rust kind 恒为 PascalCase,如 NodeMissing);
- *  `"app"` 是 StructuredError 自己的形态标记,不在此列。 */
-function isBootError(e: unknown): e is { kind: string; data?: Record<string, unknown> } {
+/** Rust 侧错误判别式的序列化形态(serde tag/content;unit 变体无 data 字段)。
+ *  Boot / dsh 升级 / 应用更新的错误载荷共用此形态(原先三处各持一份同名接口)。 */
+export interface RustErrorPayload {
+  kind: string
+  data?: Record<string, unknown>
+}
+
+/** Rust 错误判别式守卫。注意 `kind` 只匹配 Rust 判别式(Rust kind 恒为
+ *  PascalCase,如 NodeMissing);`"app"` 是 StructuredError 自己的形态标记,
+ *  不在此列。 */
+function isBootError(e: unknown): e is RustErrorPayload {
   if (typeof e !== "object" || e === null) return false
   const rec = e as Record<string, unknown>
   if (rec.kind === "app") return false // 已归约形态,见 isStructuredApp
