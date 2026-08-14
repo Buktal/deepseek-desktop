@@ -5,9 +5,12 @@
 
 mod autostart;
 mod dsh;
+mod error;
 mod locales;
 mod logging;
 mod navigation;
+mod npm;
+mod proc;
 mod theme;
 mod tray;
 mod update;

@@ -15,10 +15,16 @@
 //!   逻辑(navigate_to_shell 等)的导航目标,必须放行
 //! - 当前 dsh 服务自身地址(scheme/host/port 与 DshManager 记录的 dsh URL
 //!   一致,host 归一:localhost 等价 127.0.0.1;端口运行时动态解析,#3/#17)
+//!
 //! 其余 URL(外部链接)不放行,经 tauri-plugin-opener 交系统浏览器。
 //!
 //! 与 #11 的衔接:CSP/ACL 收的是「渲染与 IPC 面」,本模块收「导航面」;
 //! 不重复、不冲突(外部页面进不来 webview,自然碰不到 IPC/事件面)。
+//!
+//! 导航执行也收敛在本模块(单一事实来源):`navigate_main_window`(显示 + 聚焦 +
+//! 取消最小化后导航,原 dsh.rs)——boot 就绪导航 / 升级链就绪导航 / 「稍后/返回」
+//! 导航共用;`navigate_to_shell`(导航回外壳本地页,原 update.rs)——托盘动态
+//! 菜单项与升级对话框共用。
 
 use tauri::webview::NewWindowResponse;
 use tauri::{AppHandle, Manager, Url, WebviewWindowBuilder};
@@ -29,7 +35,7 @@ use crate::dsh;
 /// 用 `cfg!(dev)`(tauri CLI 的 DEP_TAURI_DEV,tauri-build 源码确认)而非
 /// `debug_assertions`——devUrl 只在 `tauri dev` 下被 tauri 实际使用,
 /// `cargo build` debug 直接运行时加载的是 tauri.localhost(生产路径)。
-/// 单一事实来源:`update::navigate_to_shell` 与导航拦截判定共用。
+/// 单一事实来源:`navigate_to_shell` 与导航拦截判定共用。
 pub fn shell_page_url(app: &AppHandle) -> String {
     if cfg!(dev) {
         app.config()
@@ -41,6 +47,39 @@ pub fn shell_page_url(app: &AppHandle) -> String {
     } else {
         "http://tauri.localhost".into()
     }
+}
+
+/// 导航窗口到指定 URL(显示 + 聚焦 + 取消最小化),返回是否成功。
+/// 单一事实来源:boot 就绪导航 / 升级链就绪导航 / 「稍后/返回」导航共用。
+pub(crate) fn navigate_main_window(app: &AppHandle, url: &str) -> bool {
+    let Some(win) = app.get_webview_window("main") else {
+        return false;
+    };
+    let _ = win.unminimize();
+    let _ = win.show();
+    let _ = win.set_focus();
+    match Url::parse(url) {
+        Ok(u) => match win.navigate(u) {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!("[navigation] 导航失败 {url}: {e}");
+                false
+            }
+        },
+        Err(e) => {
+            log::error!("[navigation] URL 解析失败 {url}: {e}");
+            false
+        }
+    }
+}
+
+/// 导航窗口回外壳本地页(dev 为 devUrl,prod 为 `http://tauri.localhost`;
+/// #3 §5 的导航函数)。托盘动态菜单项与手动检查对话框「升级」共用。
+/// URL 单一事实来源在 shell_page_url(#15 导航拦截判定同源共用)。
+pub(crate) fn navigate_to_shell(app: &AppHandle) {
+    let url = shell_page_url(app);
+    log::info!("[navigation] 导航回外壳本地页: {url}");
+    navigate_main_window(app, &url);
 }
 
 /// 纯函数:候选导航 URL 是否允许在 webview 内加载(返回 false = 调用方应交

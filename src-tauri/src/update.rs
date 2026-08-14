@@ -34,6 +34,7 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
+use crate::error::UpdateError;
 use crate::{dsh, locales, tray};
 
 /// 6h 轮询间隔(#1 定稿:启动 + 定时 6h + 托盘手动,两层升级共用)。
@@ -75,15 +76,6 @@ pub enum UpdateStateView {
     Ready,
     /// 下载/安装失败 → 降级 GitHub 手动下载
     Failed { error: UpdateError },
-}
-
-/// 升级失败的结构化原因(kind + data,serde tag/content,与 BootError 同形态)。
-/// 文案模板在 locale JSON 的 `errors.<kind>` 键,数据只携带运行时事实。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", content = "data", rename_all = "PascalCase", rename_all_fields = "camelCase")]
-pub enum UpdateError {
-    /// 下载/安装失败(网络、签名校验、NSIS 执行等),detail 为插件原始错误串
-    DownloadFailed { detail: String },
 }
 
 /// 状态机事件。由 update.rs 各动作(检查/下载/安装)产生,经 `apply_event` 归约。
@@ -361,25 +353,8 @@ impl UpdateManager {
             log::warn!("[update] 无 dsh URL 可返回,留在升级页");
             return;
         };
-        navigate_webview(&self.app, &url);
+        crate::navigation::navigate_main_window(&self.app, &url);
     }
-}
-
-// ── 窗口导航 ───────────────────────────────────────────────────────
-
-/// 导航窗口到指定 URL(显示 + 聚焦 + 取消最小化)。
-/// 单一事实来源在 dsh::navigate_main_window(boot / 升级链 / 本模块共用)。
-fn navigate_webview(app: &AppHandle, url: &str) {
-    let _ = dsh::navigate_main_window(app, url);
-}
-
-/// 导航窗口回外壳本地页(dev 为 devUrl,prod 为 `http://tauri.localhost`;
-/// #3 §5 的导航函数)。托盘动态菜单项与手动检查对话框「升级」共用。
-/// URL 单一事实来源在 navigation::shell_page_url(#15 导航拦截判定同源共用)。
-pub fn navigate_to_shell(app: &AppHandle) {
-    let url = crate::navigation::shell_page_url(app);
-    log::info!("[update] 导航回外壳本地页: {url}");
-    navigate_webview(app, &url);
 }
 
 // ── 原生对话框(托盘手动检查的直接回答,#3 §1)────────────────────────
@@ -413,7 +388,7 @@ pub(crate) fn show_update_found_dialog(app: &AppHandle, version: &str, current: 
                     log::info!("[update] 对话框[升级] → 导航升级卡片 + 自动开始下载");
                     let updater = app.state::<UpdateManager>().inner().clone();
                     let dsh = app.state::<dsh::DshManager>().inner().clone();
-                    navigate_to_shell(&app);
+                    crate::navigation::navigate_to_shell(&app);
                     updater.apply_now(&dsh);
                 }
             }
@@ -576,16 +551,6 @@ mod tests {
             let s = apply_event(&s, UpdateEvent::CheckStarted);
             assert_eq!(s, UpdateStateView::Checking);
         }
-    }
-
-    #[test]
-    fn update_error_serializes_as_kind_and_data() {
-        // 前端 toStructuredError 依赖的线上契约:tag/content 判别式,
-        // 字段 camelCase;与 BootError 同形态(见 dsh.rs)
-        assert_eq!(
-            serde_json::to_value(UpdateError::DownloadFailed { detail: "boom".into() }).unwrap(),
-            serde_json::json!({ "kind": "DownloadFailed", "data": { "detail": "boom" } })
-        );
     }
 
     #[test]

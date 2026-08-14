@@ -12,8 +12,8 @@
 //! 见 latest_is_newer 注释)。
 //!
 //! 提示(#3 §1):自动检测发现新版 → 托盘徽标变体 + 动态菜单项「升级 dsh 到 vX」
-//! + tooltip,不弹窗打断;手动检查 → 原生对话框直接回答([升级] → 导航升级卡片
-//! 并自动开始流水线,#3:确认即授权,不二次确认)。
+//! (tooltip 同步),不弹窗打断;手动检查 → 原生对话框直接回答([升级] → 导航
+//! 升级卡片并自动开始流水线,#3:确认即授权,不二次确认)。
 //!
 //! 流水线(#3 §2 定稿,独立于 boot 状态机;底层工具全部复用 dsh.rs,
 //! 禁止复制实现):
@@ -29,7 +29,7 @@
 //! [返回 dsh] 经 upgrade_dismiss:Rust 侧检查 dsh 是否在运行,未运行则起当前
 //! 全局安装(失败时旧版保留/新版已装好,都是「当前全局版本」)→ 就绪 → 导航,
 //! 不能「只关卡片」。错误结构化:升级特有 kind(UpgradeKillFailed /
-//! UpgradeVerifyFailed)独立枚举,安装/启动类直接以 BootError 形态传播,
+//! UpgradeVerifyFailed)独立枚举,安装/启动类直接以 DshError 形态传播,
 //! 前端统一按 kind 翻译(errors.<kind> 键,零额外机制)。
 
 use std::cmp::Ordering;
@@ -42,7 +42,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
 
-use crate::{dsh, locales, tray, update};
+use crate::error::{DshError, UpgradeError, UpgradeErrorKind};
+use crate::{dsh, locales, navigation, npm, tray, update};
 
 /// registry abbreviated packument(install-v1 Accept 头,23KB,#2 调研实测)。
 const REGISTRY_URL: &str = "https://registry.npmjs.org/@deepseek-ai/dsh";
@@ -201,34 +202,13 @@ pub enum UpgradeStateView {
         #[serde(skip_serializing_if = "Option::is_none")]
         progress: Option<u8>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        stage: Option<dsh::InstallStage>,
+        stage: Option<npm::InstallStage>,
     },
     /// 升级成功(瞬态:Rust 随即导航回 dsh 页)
     Ready,
     /// 升级失败(旧版保留 + 恢复服务;#3 §3)。
     /// version = 目标 pin(重试继续用同一版本,install 幂等且缓存命中快)
     Failed { version: String, error: UpgradeError },
-}
-
-/// 升级特有错误(kind 与 boot 不重名;#3 §3)。文案模板在 locale JSON
-/// 的 `errors.<kind>` 键,数据只携带运行时事实。
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", content = "data", rename_all = "PascalCase", rename_all_fields = "camelCase")]
-pub(crate) enum UpgradeErrorKind {
-    /// 无法停止当前 dsh 服务(杀后超时仍存活)
-    UpgradeKillFailed { detail: String },
-    /// 升级后版本校验失败(全局 version ≠ pin 或 bin.js 缺失)
-    UpgradeVerifyFailed,
-}
-
-/// 升级失败的结构化原因:升级特有错误 + 与 boot 共用的安装/启动类错误直接以
-/// BootError 形态透传(复用流水线函数返回类型,前端统一按 errors.<kind> 翻译,
-/// 零额外机制,#3 §3)。untagged 序列化为单一 {kind,data} 形态。
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(untagged)]
-pub enum UpgradeError {
-    Kind(UpgradeErrorKind),
-    Boot(dsh::BootError),
 }
 
 /// 状态机事件。由检查/流水线各动作产生,经 `apply_event` 归约。
@@ -244,10 +224,10 @@ pub(crate) enum UpgradeEvent {
     PhaseChanged {
         phase: UpgradePhase,
         progress: Option<u8>,
-        stage: Option<dsh::InstallStage>,
+        stage: Option<npm::InstallStage>,
     },
     /// 安装进度(模拟推进;100 只能由 npm 进程退出校准)
-    Progress { progress: u8, stage: dsh::InstallStage },
+    Progress { progress: u8, stage: npm::InstallStage },
     /// 流水线成功(→ Ready)
     Succeeded,
     /// 流水线失败(→ Failed{version, error})
@@ -429,7 +409,7 @@ impl UpgradeManager {
                 dsh::set_upgrade_active(false);
                 up.reduce(UpgradeEvent::Failed {
                     version: pin,
-                    error: UpgradeError::Boot(dsh::BootError::Internal { message: msg }),
+                    error: UpgradeError::Dsh(DshError::Internal { message: msg }),
                 });
             }
         });
@@ -443,14 +423,14 @@ impl UpgradeManager {
         if dsh::dsh_is_running(dsh) {
             if let Some(url) = dsh::dsh_url(dsh) {
                 log::info!("[upgrade] 返回 dsh(dsh 仍在运行)→ {url}");
-                let _ = dsh::navigate_main_window(&self.app, &url);
+                let _ = navigation::navigate_main_window(&self.app, &url);
             }
             return;
         }
         let app = self.app.clone();
         let dsh = dsh.clone();
         thread::spawn(move || {
-            let Some(bin) = dsh::global_dsh_bin() else {
+            let Some(bin) = npm::global_dsh_bin() else {
                 log::error!("[upgrade] 返回 dsh:全局 dsh 不可用(可先重试升级),留在升级页");
                 return;
             };
@@ -469,11 +449,11 @@ impl UpgradeManager {
                     return;
                 }
             };
-            let url = format!("http://127.0.0.1:{port}");
+            let url = dsh::dsh_url_for_port(port);
             dsh.record_dsh_url(url.clone());
             dsh::spawn_reaper(dsh.clone(), rx);
             log::info!("[upgrade] 返回 dsh:服务已恢复 → {url}");
-            let _ = dsh::navigate_main_window(&app, &url);
+            let _ = navigation::navigate_main_window(&app, &url);
         });
     }
 }
@@ -484,7 +464,7 @@ impl UpgradeManager {
 /// 版本比较 → 更新托盘徽标/菜单 + 归约状态。任何异常静默按无新版(#2)。
 /// 返回结果供手动路径做对话框决策。
 async fn run_check(app: &AppHandle) -> CheckResult {
-    let installed = dsh::global_dsh_version();
+    let installed = npm::global_dsh_version();
     let Some(latest) = fetch_latest_version().await else {
         // 检查失败:保持托盘/状态现状(徽标不因一次网络抖动消失)
         log::warn!("[upgrade] 检查失败(静默,按无新版)");
@@ -624,7 +604,7 @@ fn show_found_dialog(app: &AppHandle, version: &str, current: &str) {
                     log::info!("[upgrade] 对话框[升级] → 导航升级卡片 + 自动开始流水线");
                     let up = app.state::<UpgradeManager>().inner().clone();
                     let dsh = app.state::<dsh::DshManager>().inner().clone();
-                    update::navigate_to_shell(&app);
+                    navigation::navigate_to_shell(&app);
                     up.confirm_start(&dsh);
                 }
             }
@@ -673,29 +653,29 @@ fn upgrade_pipeline(up: &UpgradeManager, dsh: &dsh::DshManager, pin: &str) {
     up.reduce(UpgradeEvent::PhaseChanged {
         phase: UpgradePhase::Installing,
         progress: Some(0),
-        stage: Some(dsh::InstallStage::Fetching),
+        stage: Some(npm::InstallStage::Fetching),
     });
-    let ticker = dsh::ProgressTicker::start({
+    let ticker = npm::ProgressTicker::start({
         let up = up.clone();
         move |stage, pct| up.reduce(UpgradeEvent::Progress { progress: pct, stage })
     });
     let result = dsh::npm_install_global(dsh, &format!("@{pin}"));
     ticker.stop_and_join();
     if let Err(e) = result {
-        // 安装失败:npm 语义保留旧版(#2 实测);错误以 BootError 形态传播
+        // 安装失败:npm 语义保留旧版(#2 实测);错误以 DshError 形态传播
         // (与 boot 同一 npm 机制同一错误语义,前端统一按 kind 翻译,#3 §3)
         log::error!("[upgrade] 安装失败: {e:?}");
         dsh::set_upgrade_active(false);
         up.reduce(UpgradeEvent::Failed {
             version: pin.to_string(),
-            error: UpgradeError::Boot(e),
+            error: UpgradeError::Dsh(e),
         });
         return;
     }
     up.reduce(UpgradeEvent::PhaseChanged {
         phase: UpgradePhase::Installing,
         progress: Some(100),
-        stage: Some(dsh::InstallStage::Finishing),
+        stage: Some(npm::InstallStage::Finishing),
     });
 
     // 3. verify:全局 package.json version == pin 且 bin.js 完整
@@ -704,8 +684,8 @@ fn upgrade_pipeline(up: &UpgradeManager, dsh: &dsh::DshManager, pin: &str) {
         progress: None,
         stage: None,
     });
-    let verified = dsh::global_dsh_version().is_some_and(|v| version_eq(&v, pin))
-        && dsh::global_dsh_bin().is_some();
+    let verified = npm::global_dsh_version().is_some_and(|v| version_eq(&v, pin))
+        && npm::global_dsh_bin().is_some();
     if !verified {
         log::error!("[upgrade] 版本校验失败:目标 {pin}");
         dsh::set_upgrade_active(false);
@@ -722,7 +702,7 @@ fn upgrade_pipeline(up: &UpgradeManager, dsh: &dsh::DshManager, pin: &str) {
         progress: None,
         stage: None,
     });
-    let bin = match dsh::global_dsh_bin() {
+    let bin = match npm::global_dsh_bin() {
         Some(b) => b,
         None => {
             // 校验步骤已保证存在,此处仅防御
@@ -740,7 +720,7 @@ fn upgrade_pipeline(up: &UpgradeManager, dsh: &dsh::DshManager, pin: &str) {
             dsh::set_upgrade_active(false);
             up.reduce(UpgradeEvent::Failed {
                 version: pin.to_string(),
-                error: UpgradeError::Boot(e),
+                error: UpgradeError::Dsh(e),
             });
             return;
         }
@@ -752,7 +732,7 @@ fn upgrade_pipeline(up: &UpgradeManager, dsh: &dsh::DshManager, pin: &str) {
             dsh::set_upgrade_active(false);
             up.reduce(UpgradeEvent::Failed {
                 version: pin.to_string(),
-                error: UpgradeError::Boot(e),
+                error: UpgradeError::Dsh(e),
             });
             return;
         }
@@ -760,7 +740,7 @@ fn upgrade_pipeline(up: &UpgradeManager, dsh: &dsh::DshManager, pin: &str) {
 
     // 5. ready:记录 URL → 清升级抑制标志(旧 dsh 的 reaper 在杀后早已过判定点,
     //    此时清除安全,#3 §2)→ 导航窗口回 dsh 页(新端口 URL)
-    let url = format!("http://127.0.0.1:{port}");
+    let url = dsh::dsh_url_for_port(port);
     dsh.record_dsh_url(url.clone());
     dsh::spawn_reaper(dsh.clone(), rx);
     dsh::set_upgrade_active(false);
@@ -768,14 +748,14 @@ fn upgrade_pipeline(up: &UpgradeManager, dsh: &dsh::DshManager, pin: &str) {
     // 升级成功:清托盘徽标/菜单项(已是最新;下一次检查也会确认并清除,但
     // 不等 6h——用户此刻看到的「升级 dsh 到 vX」必须是新状态)
     tray::set_dsh_update(&up.app, None);
-    if dsh::navigate_main_window(&up.app, &url) {
+    if navigation::navigate_main_window(&up.app, &url) {
         log::info!("[upgrade] 升级完成 → {url}");
         up.reduce(UpgradeEvent::Reset);
     } else {
         // 导航失败:dsh 服务在跑,不杀(返回 dsh 可再导航);错误留卡上可见
         up.reduce(UpgradeEvent::Failed {
             version: pin.to_string(),
-            error: UpgradeError::Boot(dsh::BootError::NavigateFailed),
+            error: UpgradeError::Dsh(DshError::NavigateFailed),
         });
     }
 }
@@ -935,18 +915,18 @@ mod tests {
         s = apply_event(&s, UpgradeEvent::PhaseChanged {
             phase: UpgradePhase::Installing,
             progress: Some(0),
-            stage: Some(dsh::InstallStage::Fetching),
+            stage: Some(npm::InstallStage::Fetching),
         });
         s = apply_event(&s, UpgradeEvent::Progress {
             progress: 62,
-            stage: dsh::InstallStage::Reifying,
+            stage: npm::InstallStage::Reifying,
         });
         assert_eq!(
             s,
             UpgradeStateView::Active {
                 phase: UpgradePhase::Installing,
                 progress: Some(62),
-                stage: Some(dsh::InstallStage::Reifying)
+                stage: Some(npm::InstallStage::Reifying)
             }
         );
         s = apply_event(&s, UpgradeEvent::PhaseChanged {
@@ -995,7 +975,7 @@ mod tests {
         assert_eq!(
             apply_event(&s, UpgradeEvent::Progress {
                 progress: 50,
-                stage: dsh::InstallStage::Fetching,
+                stage: npm::InstallStage::Fetching,
             }),
             s
         );
@@ -1040,31 +1020,6 @@ mod tests {
         }
     }
 
-    // ── 序列化契约 ─────────────────────────────────────────────────
-
-    #[test]
-    fn upgrade_error_serializes_as_kind_and_data() {
-        // 前端 toStructuredError 依赖的线上契约:tag/content 判别式,
-        // 字段 camelCase;unit 变体无 data 字段(与 BootError 同形态)
-        assert_eq!(
-            serde_json::to_value(UpgradeError::Kind(UpgradeErrorKind::UpgradeKillFailed {
-                detail: "3s 内未退出".into()
-            }))
-            .unwrap(),
-            serde_json::json!({ "kind": "UpgradeKillFailed", "data": { "detail": "3s 内未退出" } })
-        );
-        assert_eq!(
-            serde_json::to_value(UpgradeError::Kind(UpgradeErrorKind::UpgradeVerifyFailed)).unwrap(),
-            serde_json::json!({ "kind": "UpgradeVerifyFailed" })
-        );
-        // Boot 形态透传:untagged 序列化与 BootError 自身一致,前端零额外机制
-        assert_eq!(
-            serde_json::to_value(UpgradeError::Boot(dsh::BootError::DshStartTimeout { seconds: 180 }))
-                .unwrap(),
-            serde_json::json!({ "kind": "DshStartTimeout", "data": { "seconds": 180 } })
-        );
-    }
-
     #[test]
     fn upgrade_state_view_serializes_with_status_tag() {
         // upgrade-state 事件 / upgrade_state 命令的线上契约:内部 tag status,
@@ -1085,7 +1040,7 @@ mod tests {
             serde_json::to_value(UpgradeStateView::Active {
                 phase: UpgradePhase::Installing,
                 progress: Some(62),
-                stage: Some(dsh::InstallStage::Reifying),
+                stage: Some(npm::InstallStage::Reifying),
             })
             .unwrap(),
             serde_json::json!({
@@ -1112,7 +1067,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(UpgradeStateView::Failed {
                 version: "0.1.0-rc.6".into(),
-                error: UpgradeError::Boot(dsh::BootError::DshExitedEarly { exit_code: 1 }),
+                error: UpgradeError::Dsh(DshError::DshExitedEarly { exit_code: 1 }),
             })
             .unwrap(),
             serde_json::json!({
