@@ -7,6 +7,18 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-14
+
+### Changed
+
+- **前端全量视觉审核**(#20):boot 启动页改「启动仪表」横排布局——左侧圆环仪表(刻度环 + 活动弧)、右侧阶段读数,进度轨与耗时读数对齐读数列下;升级/更新流程改收容卡片(bg-card + border),与 boot 开放画布区分;三处复制的滑动进度条归并为 ProgressRail 单组件,硬编码 indigo-500 全部收敛到 primary token(单一事实来源);暗色对比修复(emerald-600 / red-500 加 dark 变体);Node 引导页按钮层级(下载 primary / 重试 outline / 退出 ghost);reduced-motion 下停用圆环自转与滑动指示(阶段文本仍在)。
+- **src 架构改进**(#21):四份手写「先注册监听、再拉快照、后到者覆盖」effect(useBoot / useDshUpgrade / useUpdateCheck / useThemeSync)归并为 rustStateSync 纯核心 + useRustStateSync hook 适配器,顺序不变量落进代码与单测;错误载荷接口归并为 RustErrorPayload;BootPhase 阶段联合类型单一来源;新增 interpolateElapsed / summarizeReleaseNotes 纯函数(单测覆盖生产路径);UpdateCard(原 UpgradeCard,消除与 UpgradeScreen 歧义)与 UpgradeScreen 共用 FullScreenCard 收容外壳;DownloadingBody 去掉 t prop 反模式,failed 态补 errors.unknown 兜底。
+- **src-tauri/src 架构改进**(#22):模块拆分——dsh.rs 2013→1187 行,拆出 error.rs(结构化错误体系,DshError 原 BootError 归位改名)/ npm.rs(node 检测 + npm 全局安装域)/ proc.rs(子进程工具),导航执行归位 navigation.rs;单一事实来源——dsh URL 拼接 ×3 处 → dsh_url_for_port,npm 命令构造 ×2 处 → npm_command,非零退出 stderr detail 拼接 ×2 处 → exit_failure_detail;过时注释修正(IPC 命令面 2→3 个、boot_pipeline 步骤编号跳号);测试 70→72 全绿,cargo check / clippy 0 警告。
+
+### Fixed
+
+- **孤儿进程修复**(#22):子进程 ChildWaitError::Io 路径此前不杀子进程——node 检测 / npm root / 安装句柄异常时残留孤儿进程,且安装路径 install_pid 已清除、退出收敛也杀不到;抽 proc::kill_and_reap 统一 Timeout / Io 语义 + join 读线程。
+
 ## [0.2.0] - 2026-08-14
 
 ### Added
@@ -36,5 +48,6 @@
 - **界面 i18n**:zh / en 双语,跟随系统语言(中文系统默认中文)。
 - **CI 发布流水线**:打 tag 自动构建、签名并发布 Release(含 latest.json 更新清单)。
 
+[0.3.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v0.1.0
