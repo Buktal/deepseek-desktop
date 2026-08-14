@@ -65,19 +65,53 @@ impl ShellTexts {
         }
     }
 
-    /// 手动检查无新版:对话框正文。
-    pub fn update_up_to_date_message(&self, current: &str) -> String {
-        match self.lang {
-            Lang::Zh => format!("DeepSeek Desktop 已是最新版本(v{current})"),
-            Lang::En => format!("DeepSeek Desktop is up to date (v{current})"),
+    /// 手动检查无新版:对话框正文(合并报告两层升级——dsh 版本已知时一并说明,#17)。
+    pub fn update_up_to_date_message(&self, app_version: &str, dsh_version: Option<&str>) -> String {
+        match (self.lang, dsh_version) {
+            (Lang::Zh, Some(dsh)) => {
+                format!("应用与 dsh 均已是最新版本(v{app_version} / v{dsh})")
+            }
+            (Lang::En, Some(dsh)) => {
+                format!("The app and dsh are both up to date (v{app_version} / v{dsh})")
+            }
+            (Lang::Zh, None) => format!("DeepSeek Desktop 已是最新版本(v{app_version})"),
+            (Lang::En, None) => format!("DeepSeek Desktop is up to date (v{app_version})"),
         }
     }
 
-    /// 托盘动态菜单项文案:「升级到 vX」(发现新版时插入菜单,#3 §1)。
+    /// 手动检查发现 dsh 新版:对话框正文(含中断影响明示,#3 §4)。
+    pub fn upgrade_found_message(&self, version: &str, current: &str) -> String {
+        match self.lang {
+            Lang::Zh => format!(
+                "发现 dsh 新版本 v{version}(当前 v{current})。升级将重启 dsh 服务,当前页面会话会中断;数据保存在本机,不受影响"
+            ),
+            Lang::En => format!(
+                "New dsh version v{version} available (current v{current}). Upgrading restarts the dsh service and interrupts this page session. Your data stays on this machine"
+            ),
+        }
+    }
+
+    /// 手动检查失败:对话框正文。
+    pub fn check_update_failed_message(&self) -> &'static str {
+        match self.lang {
+            Lang::Zh => "检查更新失败,请稍后重试",
+            Lang::En => "Update check failed, please try again later",
+        }
+    }
+
+    /// 托盘动态菜单项文案:「升级到 vX」(应用自身升级,发现新版时插入菜单,#3 §1)。
     pub fn tray_upgrade_label(&self, version: &str) -> String {
         match self.lang {
             Lang::Zh => format!("升级到 v{version}"),
             Lang::En => format!("Upgrade to v{version}"),
+        }
+    }
+
+    /// 托盘动态菜单项文案:「升级 dsh 到 vX」(dsh 升级,发现新版时插入菜单,#3 §1)。
+    pub fn tray_upgrade_dsh_label(&self, version: &str) -> String {
+        match self.lang {
+            Lang::Zh => format!("升级 dsh 到 v{version}"),
+            Lang::En => format!("Upgrade dsh to v{version}"),
         }
     }
 
@@ -86,6 +120,14 @@ impl ShellTexts {
         match self.lang {
             Lang::Zh => format!("发现新版本 v{version}"),
             Lang::En => format!("New version v{version} available"),
+        }
+    }
+
+    /// 托盘 tooltip:发现 dsh 新版时的提示。
+    pub fn tray_tooltip_dsh_available(&self, version: &str) -> String {
+        match self.lang {
+            Lang::Zh => format!("发现 dsh 新版本 v{version}"),
+            Lang::En => format!("New dsh version v{version} available"),
         }
     }
 }

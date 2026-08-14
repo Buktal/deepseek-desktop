@@ -10,6 +10,7 @@ mod logging;
 mod theme;
 mod tray;
 mod update;
+mod upgrade;
 
 use tauri::{LogicalSize, Manager, PhysicalSize, WindowEvent};
 use tauri_plugin_dialog::{
@@ -82,6 +83,12 @@ pub fn run() {
             app.manage(updater.clone());
             updater.start_resident_checks();
 
+            // dsh 升级管理器 + 常驻检查(启动探测 + 6h 轮询,与应用升级共用
+            // 触发时机;托盘手动入口组合编排在 tray::on_check_update,#17)
+            let dsh_upgrade = upgrade::UpgradeManager::new(app.handle().clone());
+            app.manage(dsh_upgrade.clone());
+            dsh_upgrade.start_resident_checks();
+
             // 托盘
             tray::setup_tray(app.handle())?;
 
@@ -99,7 +106,10 @@ pub fn run() {
             update::update_state,
             update::update_apply,
             update::update_restart,
-            update::update_dismiss
+            update::update_dismiss,
+            upgrade::upgrade_state,
+            upgrade::upgrade_confirm,
+            upgrade::upgrade_dismiss
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

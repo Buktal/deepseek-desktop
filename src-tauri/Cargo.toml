@@ -29,3 +29,8 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-window-state = "2"
 tauri-plugin-autostart = "2"
+# registry 直查(#2 调研:3-5s 超时静默失败,比较 dist-tags.latest)。
+# feature 集与 tauri-plugin-updater 已编译的 reqwest 对齐(rustls-no-provider + json),
+# 不引入新的编译单元;TLS provider 由 upgrade.rs 启动时安装(rustls ring,插件同款)。
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
+rustls = { version = "0.23", features = ["ring"] }

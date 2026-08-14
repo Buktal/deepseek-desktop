@@ -27,30 +27,37 @@
 //!   注意:事件只到 boot UI(dsh 页是 remote origin,ACL 拒绝,见 dsh.rs 安全语义),
 //!   与红线一致——dsh 页面不碰主题。
 //! - 检查更新(#3 事件契约变更):原占位「推 `tray-check-update` 事件给前端」被取代——
-//!   检查逻辑全在 Rust 侧(update.rs),托盘点击直接调用 update 模块,前端不再监听;
-//!   事件 emit 移除(不留死契约)。
-//! - 升级通知形态(#3 §1,与 dsh 升级共用同一 Rust 侧机制):自动检测发现新版 →
-//!   徽标图标变体 + 动态菜单项「升级到 vX」+ tooltip,不弹窗打断;点击动态菜单项
-//!   → 显示窗口(若隐藏)→ 导航回本地升级页(update::navigate_to_shell)。
+//!   检查逻辑全在 Rust 侧(update.rs / upgrade.rs),托盘点击直接调用检查模块,
+//!   前端不再监听;事件 emit 移除(不留死契约)。
+//! - 升级通知形态(#3 §1,两层升级共用同一 Rust 侧机制):自动检测发现新版 →
+//!   徽标图标变体 + 动态菜单项(app「升级到 vX」/ dsh「升级 dsh 到 vX」)+ tooltip,
+//!   不弹窗打断;点击动态菜单项 → 显示窗口(若隐藏)→ 导航回本地升级页
+//!   (update::navigate_to_shell,App 挂载时按优先级分发两张卡)。
+//! - 手动检查入口(#17 组合编排 on_check_update):dsh 层先答(dsh 新版 → dsh
+//!   对话框;检查失败 → 失败对话框),应用层兜底(应用新版 → 应用对话框;无新版
+//!   → 合并「已是最新」对话框附 dsh 版本);dsh 升级流水线在途时 no-op(#3 边界)。
 //! - 左键单击托盘图标:窗口可见且已聚焦时隐藏,否则显示并聚焦——纯 toggle 的陷阱是
 //!   窗口被其它窗口挡住时,用户本想"唤出"结果却把窗口藏了。
 //! - 退出:先杀 dsh 子进程再 exit(所有退出路径最终经 RunEvent::ExitRequested 再杀一次,
 //!   kill_child 幂等,无副作用)。
 
 use std::sync::Mutex;
+use std::thread;
 
 use tauri::menu::{CheckMenuItem, Menu, MenuBuilder, MenuItem, SubmenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, Wry};
 
-use crate::{autostart, dsh, locales, theme, update};
+use crate::{autostart, dsh, locales, theme, update, upgrade};
 use crate::theme::ThemeChoice;
 
-/// 托盘图标句柄(发现新版时换徽标变体 / 恢复,见 notify_update_available)。
+/// 托盘图标句柄(发现新版时换徽标变体 / 恢复,见 set_app_update/set_dsh_update)。
 static TRAY: Mutex<Option<TrayIcon<Wry>>> = Mutex::new(None);
-/// 当前「升级到 vX」菜单项标签(Some = 发现新版,菜单重建时插入动态项;
-/// 单一事实源,notify_update_available/notify_clear_update 维护)。
-static UPGRADE_LABEL: Mutex<Option<String>> = Mutex::new(None);
+/// 升级通知槽位(单一事实源,set_app_update/set_dsh_update 维护):
+/// 存「待升级版本」(非标签文案——语言在 build_menu 时才判定),
+/// 任一非空 → 徽标图标变体;动态菜单项按优先级插入(先 dsh 后应用)。
+static APP_UPDATE_VERSION: Mutex<Option<String>> = Mutex::new(None);
+static DSH_UPDATE_VERSION: Mutex<Option<String>> = Mutex::new(None);
 
 /// 菜单事件 id → 主题选择。纯函数,可测;未知 id 返回 None。
 /// 主题状态与映射的单一事实源在 theme.rs(ThemeChoice::menu_id ↔ from_payload)。
@@ -63,9 +70,15 @@ fn theme_choice_from_id(id: &str) -> Option<ThemeChoice> {
     }
 }
 
-/// 构建托盘菜单(可复用:发现新版时重建并插入动态「升级到 vX」项)。
-/// upgrade_label = Some(版本标签)时在「检查更新」上方插入 id="upgrade-available" 项。
-fn build_menu(app: &AppHandle, upgrade_label: Option<String>) -> tauri::Result<Menu<Wry>> {
+/// 构建托盘菜单(可复用:发现新版时重建并插入动态升级项)。
+/// app_version / dsh_version = 待升级版本(槽位,语言在此判定拼标签):
+/// - dsh 新版 → id="upgrade-dsh"「升级 dsh 到 vX」(优先级高,排最前)
+/// - 应用新版 → id="upgrade-available"「升级到 vX」
+fn build_menu(
+    app: &AppHandle,
+    app_version: Option<&str>,
+    dsh_version: Option<&str>,
+) -> tauri::Result<Menu<Wry>> {
     let t = locales::shell_texts(locales::detect_lang());
     let toggle = MenuItem::with_id(app, "toggle", t.tray_toggle, true, None::<&str>)?;
 
@@ -118,8 +131,19 @@ fn build_menu(app: &AppHandle, upgrade_label: Option<String>) -> tauri::Result<M
         .item(&theme)
         .item(&autostart_item)
         .separator();
-    if let Some(label) = upgrade_label {
-        let upgrade = MenuItem::with_id(app, "upgrade-available", label, true, None::<&str>)?;
+    // 动态升级项:先 dsh 后应用(任一存在即插入对应项,不存在则不占位)
+    if let Some(v) = dsh_version {
+        let upgrade = MenuItem::with_id(
+            app,
+            "upgrade-dsh",
+            t.tray_upgrade_dsh_label(v),
+            true,
+            None::<&str>,
+        )?;
+        builder = builder.item(&upgrade);
+    }
+    if let Some(v) = app_version {
+        let upgrade = MenuItem::with_id(app, "upgrade-available", t.tray_upgrade_label(v), true, None::<&str>)?;
         builder = builder.item(&upgrade);
     }
     let check_update =
@@ -132,47 +156,61 @@ fn build_menu(app: &AppHandle, upgrade_label: Option<String>) -> tauri::Result<M
         .build()
 }
 
-/// 按当前状态重建菜单(UPGRADE_LABEL + 主题内存),应用到托盘。
+/// 按当前状态重建菜单与徽标(槽位 + 主题内存),应用到托盘。
 /// 主题点击后也要重建:Windows 勾选菜单项不会自动互斥,重建让三个勾选
 /// 回到内存事实源(theme.rs),避免视觉漂移。
 fn refresh_menu(app: &AppHandle) {
-    let label = UPGRADE_LABEL
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone();
-    let menu = build_menu(app, label);
+    let (app_version, dsh_version) = update_slots();
+    let menu = build_menu(app, app_version.as_deref(), dsh_version.as_deref());
     if let Some(tray) = TRAY.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
         let _ = tray.set_menu(menu.ok());
     }
-}
-
-/// 发现新版:换徽标图标变体 + 重建菜单(动态「升级到 vX」项)+ tooltip 提示。
-/// 由 update.rs 检查结果调用(#3 §1 通知形态)。
-pub fn notify_update_available(app: &AppHandle, version: &str) {
+    // 徽标 + tooltip:任一槽位非空即徽标变体;tooltip 优先 dsh(主产品)
     let t = locales::shell_texts(locales::detect_lang());
-    let label = t.tray_upgrade_label(version);
-    if let Ok(mut g) = UPGRADE_LABEL.lock() {
-        *g = Some(label.clone());
-    }
-    refresh_menu(app);
+    let badge = app_version.is_some() || dsh_version.is_some();
+    let tooltip = match dsh_version.as_deref() {
+        Some(v) => t.tray_tooltip_dsh_available(v),
+        None => app_version
+            .as_deref()
+            .map(|v| t.tray_tooltip_available(v))
+            .unwrap_or_else(|| "DeepSeek Desktop".to_string()),
+    };
     if let Some(tray) = TRAY.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-        let _ = tray.set_icon(Some(badge_icon()));
-        let _ = tray.set_tooltip(Some(t.tray_tooltip_available(version)));
+        let _ = tray.set_icon(Some(if badge { badge_icon() } else { normal_icon() }));
+        let _ = tray.set_tooltip(Some(tooltip));
     }
-    log::info!("[tray] 发现新版 → 徽标 + 菜单项「{label}」");
 }
 
-/// 无新版/检查失败:恢复普通图标与菜单(动态项移除)。
-pub fn notify_clear_update(app: &AppHandle) {
-    if let Ok(mut g) = UPGRADE_LABEL.lock() {
-        *g = None;
+fn update_slots() -> (Option<String>, Option<String>) {
+    let app_version = APP_UPDATE_VERSION
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let dsh_version = DSH_UPDATE_VERSION
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    (app_version, dsh_version)
+}
+
+/// 设置应用自身升级通知槽位(Some = 发现新版,None = 清除;由 update.rs 调用)。
+/// 徽标/菜单/tooltip 在 refresh_menu 统一呈现(#3 §1 通知形态)。
+pub fn set_app_update(app: &AppHandle, version: Option<&str>) {
+    if let Ok(mut g) = APP_UPDATE_VERSION.lock() {
+        *g = version.map(String::from);
     }
+    log::info!("[tray] 应用升级槽位 → {version:?}");
     refresh_menu(app);
-    if let Some(tray) = TRAY.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-        let _ = tray.set_icon(Some(normal_icon()));
-        let _ = tray.set_tooltip(Some("DeepSeek Desktop".to_string()));
+}
+
+/// 设置 dsh 升级通知槽位(Some = 发现新版,None = 清除;由 upgrade.rs 调用)。
+/// 徽标/菜单/tooltip 在 refresh_menu 统一呈现(#3 §1 通知形态)。
+pub fn set_dsh_update(app: &AppHandle, version: Option<&str>) {
+    if let Ok(mut g) = DSH_UPDATE_VERSION.lock() {
+        *g = version.map(String::from);
     }
-    log::info!("[tray] 恢复普通托盘图标");
+    log::info!("[tray] dsh 升级槽位 → {version:?}");
+    refresh_menu(app);
 }
 
 fn normal_icon() -> tauri::image::Image<'static> {
@@ -185,7 +223,7 @@ fn badge_icon() -> tauri::image::Image<'static> {
 }
 
 pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let menu = build_menu(app, None)?;
+    let menu = build_menu(app, None, None)?;
     let tray = TrayIconBuilder::with_id("main-tray")
         .icon(normal_icon())
         .menu(&menu)
@@ -201,18 +239,17 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 }
             }
             autostart::MENU_ID => on_autostart_toggled(app),
-            "upgrade-available" => {
-                // 被动通知入口(#3 §1):显示窗口(若隐藏)→ 导航回本地升级页
+            "upgrade-dsh" | "upgrade-available" => {
+                // 被动通知入口(#3 §1,两层共用):显示窗口(若隐藏)→ 导航回
+                // 本地升级页;App 挂载时按优先级分发卡片(dsh 卡 → 应用卡)
                 log::info!("[tray] 菜单[升级] → 导航升级卡片");
                 update::navigate_to_shell(app);
             }
             "check-update" => {
-                // #3 事件契约变更:检查逻辑全在 Rust 侧,托盘点击直接触发
-                // 手动检查(检查结束弹原生对话框直接回答),不再推前端事件
+                // #3 事件契约变更 + #17 组合编排:检查逻辑全在 Rust 侧,
+                // 两层升级共用托盘手动入口,直接回答(见 on_check_update)
                 log::info!("[tray] 检查更新(手动)");
-                if let Some(m) = app.try_state::<update::UpdateManager>() {
-                    m.inner().check_now(true);
-                }
+                on_check_update(app);
             }
             "quit" => {
                 dsh::set_quitting();
@@ -258,6 +295,49 @@ fn on_autostart_toggled(app: &AppHandle) {
     log::info!("[tray] 切换开机自启 → {next}");
     let _ = autostart::set(app, next);
     refresh_menu(app);
+}
+
+/// 托盘「检查更新」手动入口的组合编排(#3 §1「直接回答」+ #17 两层共用触发):
+///
+/// 1. dsh 升级流水线在途 → no-op(#3 边界:UPGRADING 守卫,菜单点击仍可看进度);
+/// 2. dsh 层先答(`upgrade::manual_check`):dsh 新版 → dsh 对话框 [升级][稍后]
+///    (boot 未就绪时只亮徽标);检查失败 → 「检查更新失败,请稍后重试」;
+///    已用对话框回答 → 结束,不再弹应用层对话框(避免叠加);
+/// 3. 应用层兜底(`update::check_now` 结果回调):应用新版 → 应用对话框;
+///    无新版 → 合并「已是最新」对话框(附 dsh 版本,一次回答两层);
+///    应用检查失败 → 沿用现状静默。
+fn on_check_update(app: &AppHandle) {
+    let app = app.clone();
+    thread::spawn(move || {
+        if let Some(up) = app.try_state::<upgrade::UpgradeManager>() {
+            if up.inner().is_pipeline_running() {
+                log::info!("[tray] dsh 升级流水线在途,手动检查 no-op(#3 边界)");
+                return;
+            }
+        }
+        // 1. dsh 层(同步检查,3-5s 超时;回答过即结束)
+        let dsh_outcome = upgrade::manual_check(&app);
+        if dsh_outcome.answered {
+            return;
+        }
+        // 2. 应用层(异步,结果经回调做对话框决策)
+        if let Some(m) = app.try_state::<update::UpdateManager>() {
+            let app2 = app.clone();
+            let dsh_version = dsh_outcome.installed_version;
+            m.inner().check_now(true, Some(Box::new(move |r| match r {
+                update::ManualCheckResult::Found { version, current_version } => {
+                    update::show_update_found_dialog(&app2, &version, &current_version);
+                }
+                update::ManualCheckResult::None => {
+                    update::show_up_to_date_dialog(&app2, dsh_version.as_deref());
+                }
+                update::ManualCheckResult::Failed => {
+                    // 应用侧检查失败沿用现状:静默(等下一次触发)
+                    log::warn!("[tray] 应用更新检查失败(静默)");
+                }
+            })));
+        }
+    });
 }
 
 /// 显示/隐藏窗口。行为:窗口可见且已聚焦时隐藏,否则显示并聚焦。

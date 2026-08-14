@@ -74,6 +74,12 @@ static QUITTING: AtomicBool = AtomicBool::new(false);
 static DIALOG_SHOWN: AtomicBool = AtomicBool::new(false);
 /// 流水线运行中标志:防 StrictMode 双 invoke / setup 与前端同时触发导致双流水线竞态
 static BOOTING: AtomicBool = AtomicBool::new(false);
+/// dsh 升级链主动杀旧 dsh 时的抑制标志(#3 §2):独立于 set_quitting——
+/// 升级不退出应用、不要求放行 CloseRequested(关闭三选对话框整个会话保持有效),
+/// 只是不让 reaper 把「升级主动杀的旧 dsh」误判为「意外退出」弹窗。
+/// 杀旧进程前置位、新 dsh 就绪(或升级失败收敛)后清除;清除时机安全:
+/// 旧进程的 reaper 在进程退出(杀后即刻)时早已过判定点。
+static UPGRADE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// 应用已进入程序化退出流程(放行 CloseRequested,不再弹对话框)
 pub fn set_quitting() {
@@ -81,6 +87,13 @@ pub fn set_quitting() {
 }
 pub fn is_quitting() -> bool {
     QUITTING.load(Ordering::SeqCst)
+}
+/// 置位/清除升级抑制标志(upgrade.rs 流水线调用;#3 §2,独立于 set_quitting)。
+pub fn set_upgrade_active(v: bool) {
+    UPGRADE_ACTIVE.store(v, Ordering::SeqCst);
+}
+pub fn upgrade_active() -> bool {
+    UPGRADE_ACTIVE.load(Ordering::SeqCst)
 }
 /// 关闭对话框防双触发(CloseRequested 在 webview 与 window 层各触发一次)
 pub fn try_show_dialog() -> bool {
@@ -292,14 +305,15 @@ impl DshManager {
         }
     }
 
-    /// 记录当前 dsh 页 URL(boot 就绪时调用;升级卡片「稍后」导航目标)。
-    fn record_dsh_url(&self, url: String) {
+    /// 记录当前 dsh 页 URL(boot / 升级链就绪时调用;「稍后/返回」导航目标,#3 §7)。
+    pub(crate) fn record_dsh_url(&self, url: String) {
         if let Ok(mut g) = self.dsh_url.lock() {
             *g = Some(url);
         }
     }
 
-    fn phase(&self) -> Phase {
+    /// 当前 boot 流水线阶段(升级链确认守卫用:boot 未就绪不升级,#3 §2)。
+    pub(crate) fn phase(&self) -> Phase {
         self.state.lock().map(|s| s.phase).unwrap_or(Phase::Error)
     }
 
@@ -438,28 +452,11 @@ impl DshManager {
             });
     }
 
-    /// 启动安装模拟进度线程:每 500ms 按真实流逝时间推进一次(install_progress_at),
-    /// 百分比变化才 emit(安装期事件量 ≈ 200 发/分钟,量级与现有阶段事件一致)。
-    /// 线程只做视觉呈现,与 npm 进程的真实成功/失败/超时判定完全无关。
-    /// 返回 JoinHandle:调用方停表(内部 stop 标志)后必须 join 才能继续——
-    /// 保证线程在途事件先于终态事件(100% 校准 / 错误)送达,事件流确定性收尾
-    /// (否则旧进度事件可能晚于错误事件到达,把前端从错误页拉回 installing 卡死)。
-    fn start_install_progress(&self) -> JoinHandle<()> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let s = stop.clone();
+    /// 启动安装模拟进度线程(纯视觉,与 npm 进程真实成败判定完全无关):
+    /// 事件经 boot-state 推送;停表用 ProgressTicker::stop_and_join(见其文档)。
+    fn start_install_progress(&self) -> ProgressTicker {
         let m = self.clone();
-        let started = Instant::now();
-        thread::spawn(move || {
-            let mut last_pct: Option<u8> = None;
-            while !s.load(Ordering::SeqCst) {
-                let (stage, pct) = install_progress_at(started.elapsed().as_secs_f64());
-                if last_pct != Some(pct) {
-                    last_pct = Some(pct);
-                    m.emit_install_progress(stage, pct);
-                }
-                thread::sleep(Duration::from_millis(500));
-            }
-        })
+        ProgressTicker::start(move |stage, pct| m.emit_install_progress(stage, pct))
     }
 
     /// Windows 任务栏图标进度(tauri `set_progress_bar`,仅 Windows 生效;
@@ -627,17 +624,104 @@ pub fn dsh_url(manager: &DshManager) -> Option<String> {
         .and_then(|g| g.clone())
 }
 
-/// 杀掉 dsh 子进程(进程树)与安装中的 npm 进程,幂等。
-pub fn kill_child(manager: &DshManager) {
-    if let Some(mut child) = manager.take_child() {
-        log::info!("[dsh] kill dsh 子进程 pid={}", child.id());
-        kill_pid_tree(child.id());
-        let _ = child.wait();
+/// 导航主窗口到 URL(显示 + 聚焦 + 取消最小化),返回是否成功。
+/// boot 就绪导航 / 升级链就绪导航 / 「稍后/返回」导航共用(单一事实来源);
+/// update.rs 的 navigate_webview 亦委托本函数。
+pub(crate) fn navigate_main_window(app: &tauri::AppHandle, url: &str) -> bool {
+    let Some(win) = app.get_webview_window("main") else {
+        return false;
+    };
+    let _ = win.unminimize();
+    let _ = win.show();
+    let _ = win.set_focus();
+    match tauri::Url::parse(url) {
+        Ok(u) => match win.navigate(u) {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!("[dsh] 导航失败 {url}: {e}");
+                false
+            }
+        },
+        Err(e) => {
+            log::error!("[dsh] URL 解析失败 {url}: {e}");
+            false
+        }
     }
+}
+
+/// 杀掉 dsh 子进程(进程树)与安装中的 npm 进程,幂等。
+/// wait 有界(任务失败/被杀时 wait 会挂死,退出路径不能无上限等待):
+/// 超时再补杀一次,仍不退出只记日志(升级链用 kill_child_confirm 感知结果)。
+pub fn kill_child(manager: &DshManager) {
+    let _ = kill_child_inner(manager);
+}
+
+/// 杀掉 dsh 子进程并确认其已退出(升级链 killing 阶段,#3 §2)。
+/// 返回 false = 杀后仍在运行(升级报 UpgradeKillFailed;进程句柄放回 manager,
+/// 后续重试/退出收敛还能再杀)。没有 dsh 在跑(句柄已空)按成功处理——
+/// 升级的目标状态「dsh 不在运行」已达成。不杀 npm 安装进程:升级时无 boot
+/// 安装在途,install_pid 归退出收敛路径统一处理。
+pub fn kill_child_confirm(manager: &DshManager) -> bool {
+    match kill_child_inner(manager) {
+        ConfirmResult::Killed | ConfirmResult::AlreadyGone => true,
+        ConfirmResult::StillRunning => false,
+    }
+}
+
+enum ConfirmResult {
+    Killed,
+    AlreadyGone,
+    StillRunning,
+}
+
+fn kill_child_inner(manager: &DshManager) -> ConfirmResult {
+    let Some(mut child) = manager.take_child() else {
+        // 安装中的 npm 进程仍按退出收敛语义杀(幂等)
+        if let Some(pid) = manager.take_install_pid() {
+            log::info!("[dsh] kill npm 安装进程 pid={pid}");
+            kill_pid_tree(pid);
+        }
+        return ConfirmResult::AlreadyGone;
+    };
+    log::info!("[dsh] kill dsh 子进程 pid={}", child.id());
+    for _ in 0..2 {
+        kill_pid_tree(child.id());
+        match wait_with_timeout(&mut child, KILL_CONFIRM_TIMEOUT) {
+            Ok(_) => {
+                if let Some(pid) = manager.take_install_pid() {
+                    log::info!("[dsh] kill npm 安装进程 pid={pid}");
+                    kill_pid_tree(pid);
+                }
+                return ConfirmResult::Killed;
+            }
+            Err(_) => continue, // 补杀一次
+        }
+    }
+    log::error!("[dsh] dsh 子进程 pid={} 杀后仍未退出", child.id());
+    // 进程仍活着:句柄放回 manager,后续重试 / 退出收敛还能再杀
+    manager.set_child(child);
     if let Some(pid) = manager.take_install_pid() {
         log::info!("[dsh] kill npm 安装进程 pid={pid}");
         kill_pid_tree(pid);
     }
+    ConfirmResult::StillRunning
+}
+
+/// 杀后确认等待上限(taskkill /T /F 后一般毫秒级退出;3s 未退视为杀失败)。
+/// 秒数值另导出:升级链的 UpgradeKillFailed 错误 detail 携带同一事实。
+pub const KILL_CONFIRM_TIMEOUT_SECS: u64 = 3;
+const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(KILL_CONFIRM_TIMEOUT_SECS);
+
+/// dsh 服务是否在运行(升级卡「稍后/返回」的恢复判断):句柄在且进程未退出。
+/// try_wait 出错(句柄异常/已被他处收割)按未运行处理。
+pub fn dsh_is_running(manager: &DshManager) -> bool {
+    let Ok(mut guard) = manager.child.lock() else {
+        return false;
+    };
+    let Some(child) = guard.as_mut() else {
+        return false;
+    };
+    matches!(child.try_wait(), Ok(None))
 }
 
 /// 当前 dsh 子进程的退出码。None = 仍在运行/句柄丢失。
@@ -793,8 +877,21 @@ fn dsh_bin_path(global_node_modules: &Path) -> Option<PathBuf> {
     bin.exists().then_some(bin)
 }
 
-fn global_dsh_bin() -> Option<PathBuf> {
+/// 全局 dsh bin.js 路径(含完整性校验;升级链启动/恢复服务复用)。
+pub(crate) fn global_dsh_bin() -> Option<PathBuf> {
     dsh_bin_path(&global_node_modules().ok()?)
+}
+
+/// 全局 dsh 已装版本:读 `{prefix}/node_modules/@deepseek-ai/dsh/package.json` 的
+/// version 字段(#2 调研:比 npm ls -g 更轻,不受全局树损坏影响)。
+/// 未安装 / 读取或解析失败 → None(检测按「无当前版本」处理,不报错)。
+pub fn global_dsh_version() -> Option<String> {
+    let pkg = global_node_modules()
+        .ok()?
+        .join("@deepseek-ai/dsh/package.json");
+    let text = std::fs::read_to_string(pkg).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("version").and_then(|v| v.as_str()).map(String::from)
 }
 
 /// 安装包内置离线缓存目录(若存在)。
@@ -839,17 +936,66 @@ pub(crate) fn install_progress_at(elapsed_secs: f64) -> (InstallStage, u8) {
     (stage, pct.round().clamp(0.0, 99.0) as u8)
 }
 
+/// 安装模拟进度线程(boot 安装与 dsh 升级链共用,#7/#17 单一事实来源):
+/// 每 500ms 按真实流逝时间推进一次(install_progress_at),百分比变化才回调
+/// (安装期事件量 ≈ 200 发/分钟,量级与阶段事件一致);事件去向由调用方决定
+/// (boot → boot-state,升级 → upgrade-state)。
+///
+/// 生命周期契约:调用方必须先 stop_and_join() 再发终态事件(100% 校准 / 错误)
+/// ——保证线程在途事件先于终态事件送达,事件流确定性收尾(否则旧进度事件可能
+/// 晚于错误事件到达,把前端从错误页拉回 installing 卡死)。stop 置位后线程
+/// 最多 500ms 内退出,join 等待不可感知。
+///
+/// 注意:stop 句柄必须由本结构持有、随实例走——早期实现把 stop 造在线程内部
+/// 导致无人能置位,安装路径下 join() 永久挂起(boot 的「全局无 dsh 时安装」
+/// 路径从未实机跑过而未暴露,本次升级链落地排查发现并修复)。
+pub(crate) struct ProgressTicker {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+impl ProgressTicker {
+    /// 启动进度线程:时间驱动推进(install_progress_at),百分比变化才回调。
+    pub(crate) fn start<F>(on_progress: F) -> Self
+    where
+        F: Fn(InstallStage, u8) + Send + 'static,
+    {
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        let handle = thread::spawn(move || {
+            let started = Instant::now();
+            let mut last_pct: Option<u8> = None;
+            while !s.load(Ordering::SeqCst) {
+                let (stage, pct) = install_progress_at(started.elapsed().as_secs_f64());
+                if last_pct != Some(pct) {
+                    last_pct = Some(pct);
+                    on_progress(stage, pct);
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+        });
+        Self { stop, handle }
+    }
+
+    /// 停表并 join(调用方发终态事件前必须调用,见结构文档)。
+    pub(crate) fn stop_and_join(self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.handle.join();
+    }
+}
+
 /// npm 全局安装参数组装(纯函数,可测试)。
+/// `version_spec`:目标版本规格(boot 传 "@latest",升级链传 "@<pin>",#3 §7)。
 /// 离线缓存目录存在时加 `--prefer-offline --cache <目录>`:
 /// 缓存命中走本地秒级完成,缺失自动回退网络(用户拍板语义)。
-fn npm_install_args(offline_cache: Option<&Path>) -> Vec<String> {
+fn npm_install_args(offline_cache: Option<&Path>, version_spec: &str) -> Vec<String> {
     let mut args = vec!["install".to_string(), "-g".to_string()];
     if let Some(dir) = offline_cache {
         args.push("--prefer-offline".into());
         args.push("--cache".into());
         args.push(dir.to_string_lossy().into_owned());
     }
-    args.push("@deepseek-ai/dsh@latest".into());
+    args.push(format!("@deepseek-ai/dsh{version_spec}"));
     args.extend([
         "--no-audit".into(),
         "--no-fund".into(),
@@ -914,11 +1060,12 @@ fn stderr_tail_has_permission(stderr_tail: &[String]) -> bool {
     })
 }
 
-/// npm 全局安装 dsh(跟随 latest),stdout/stderr 逐行转发为日志事件。
+/// npm 全局安装 dsh(boot 传 "@latest" 跟随 latest;dsh 升级链传 "@<pin>" 精确版本,#3 §7),
+/// stdout/stderr 逐行转发为日志事件。install_pid 登记:升级期间用户退出时随退出收敛一并杀。
 /// Windows 上 CreateProcess 不能直接执行 .cmd/.bat(npm 是 .cmd shim),须经 cmd.exe /c 包装。
 /// 带 NPM_INSTALL_TIMEOUT 超时;超时按进程树杀并报可读错误。
 /// 安装包内置离线缓存存在时优先走离线安装(见 bundle_cache_dir)。
-fn npm_install_global(manager: &DshManager) -> Result<(), BootError> {
+pub(crate) fn npm_install_global(manager: &DshManager, version_spec: &str) -> Result<(), BootError> {
     let cache_dir = manager
         .app
         .path()
@@ -926,7 +1073,7 @@ fn npm_install_global(manager: &DshManager) -> Result<(), BootError> {
         .ok()
         .as_deref()
         .and_then(bundle_cache_dir);
-    let args = npm_install_args(cache_dir.as_deref());
+    let args = npm_install_args(cache_dir.as_deref(), version_spec);
     if let Some(dir) = &cache_dir {
         log::info!("[dsh] 使用安装包内置离线缓存: {}", dir.display());
     }
@@ -1003,7 +1150,8 @@ fn npm_install_global(manager: &DshManager) -> Result<(), BootError> {
 }
 
 /// 启动 `node <bin.js> web --port 0`,返回 stdout/stderr 合流后的行接收端
-fn spawn_dsh(
+/// (boot 与升级链复用;升级链用同一 bin 路径,升级前后不变,#2 调研)
+pub(crate) fn spawn_dsh(
     manager: &DshManager,
     bin: &Path,
 ) -> Result<Receiver<(String, String)>, BootError> {
@@ -1080,7 +1228,8 @@ fn tcp_wait(port: u16) -> bool {
 
 /// 等待就绪信号行,返回端口与消费中的接收端(供 reaper 继续排空)。
 /// 超时/进程退出/输出流关闭都视为失败,错误信息带退出码便于诊断。
-fn wait_ready(
+/// boot 与升级链复用。
+pub(crate) fn wait_ready(
     manager: &DshManager,
     rx: Receiver<(String, String)>,
 ) -> Result<(u16, Receiver<(String, String)>), BootError> {
@@ -1145,11 +1294,11 @@ fn boot_pipeline(manager: &DshManager) {
             // 锚点 = npm 进程退出:成功 → 校准 100%;失败/超时 → 不校准,
             // 直接进错误页(模拟永不领先于真实结果,不会出现「100% 却失败」)。
             // 停表后 join:线程在途事件先于 100% 校准/错误事件送达(见
-            // start_install_progress 的说明),join 后进度字段不再被线程改写。
+            // ProgressTicker 的说明),join 后进度字段不再被线程改写。
             manager.emit_install_progress(InstallStage::Fetching, 0);
             let progress_thread = manager.start_install_progress();
-            let result = npm_install_global(manager);
-            let _ = progress_thread.join();
+            let result = npm_install_global(manager, "@latest");
+            progress_thread.stop_and_join();
             if let Err(e) = result {
                 manager.set_error(e);
                 return;
@@ -1193,17 +1342,12 @@ fn boot_pipeline(manager: &DshManager) {
     manager.set_phase(Phase::Ready, None);
     let url = format!("http://127.0.0.1:{port}");
     manager.record_dsh_url(url.clone());
-    if let Some(win) = manager.app.get_webview_window("main") {
-        if let Ok(u) = tauri::Url::parse(&url) {
-            log::info!("[dsh] boot: navigate → {url}");
-            if let Err(e) = win.navigate(u) {
-                // 导航失败:dsh 仍在运行,先杀子进程再进错误态(否则重试会再起一个 dsh)
-                log::error!("[dsh] navigate 失败: {e}");
-                kill_child(manager);
-                manager.set_error(BootError::NavigateFailed);
-                return;
-            }
-        }
+    log::info!("[dsh] boot: navigate → {url}");
+    if !navigate_main_window(&manager.app, &url) {
+        // 导航失败:dsh 仍在运行,先杀子进程再进错误态(否则重试会再起一个 dsh)
+        kill_child(manager);
+        manager.set_error(BootError::NavigateFailed);
+        return;
     }
 
     // 7. reaper 线程:持续排空输出流(防 64KB 管道阻塞挂死),进程退出后收割
@@ -1216,7 +1360,7 @@ fn boot_pipeline(manager: &DshManager) {
 /// 竞态防护:只有 phase 仍为 Ready 时才取子进程句柄。若排空期间用户已重试
 /// (phase 进入 Checking),新 boot 的 child 已写入 manager——此时取走会令
 /// 新 boot 的 wait_ready 误判"进程提前退出",故直接放弃收割。
-fn spawn_reaper(manager: DshManager, rx: Receiver<(String, String)>) {
+pub(crate) fn spawn_reaper(manager: DshManager, rx: Receiver<(String, String)>) {
     thread::spawn(move || {
         // 持续排空(丢弃);读线程随子进程退出而结束,tx 全部 drop 后 recv 返回 Err
         while rx.recv().is_ok() {}
@@ -1229,10 +1373,13 @@ fn spawn_reaper(manager: DshManager, rx: Receiver<(String, String)>) {
             let status = c.wait();
             let ok = status.map(|s| s.success()).unwrap_or(false);
             log::info!(
-                "[dsh] reaper: dsh 子进程退出, ok={ok}, quitting={}",
-                is_quitting()
+                "[dsh] reaper: dsh 子进程退出, ok={ok}, quitting={}, upgrade_active={}",
+                is_quitting(),
+                upgrade_active()
             );
-            if !ok && !is_quitting() {
+            // 升级链主动杀旧 dsh 也是非零退出:UPGRADE_ACTIVE 抑制误报弹窗
+            // (独立于 is_quitting——升级不退出应用,关闭三选对话框保持有效,#3 §2)
+            if !ok && !is_quitting() && !upgrade_active() {
                 // 原生对话框文案跟随系统语言(与托盘/关闭对话框同源,见 locales.rs)
                 let texts = crate::locales::shell_texts(crate::locales::detect_lang());
                 let _ = manager
@@ -1501,7 +1648,7 @@ mod tests {
     fn npm_install_args_without_bundle_cache_uses_plain_latest() {
         // 无离线缓存:普通网络安装(生产路径参数必须逐字一致)
         assert_eq!(
-            npm_install_args(None),
+            npm_install_args(None, "@latest"),
             vec![
                 "install",
                 "-g",
@@ -1518,7 +1665,7 @@ mod tests {
         // 有离线缓存:加 --prefer-offline --cache <目录>(缓存命中秒级、缺失回退网络)
         let cache = Path::new("C:/app resources/npm-cache");
         assert_eq!(
-            npm_install_args(Some(cache)),
+            npm_install_args(Some(cache), "@latest"),
             vec![
                 "install",
                 "-g",
@@ -1526,6 +1673,23 @@ mod tests {
                 "--cache",
                 "C:/app resources/npm-cache",
                 "@deepseek-ai/dsh@latest",
+                "--no-audit",
+                "--no-fund",
+                "--no-progress"
+            ]
+        );
+    }
+
+    #[test]
+    fn npm_install_args_pins_version_for_upgrade() {
+        // 升级链传精确 pin(#3 §7):`npm install -g @deepseek-ai/dsh@<pin>`,
+        // 不裸用 @latest;其余参数与 boot 完全一致(同一 npm 机制)
+        assert_eq!(
+            npm_install_args(None, "@0.1.0-rc.6"),
+            vec![
+                "install",
+                "-g",
+                "@deepseek-ai/dsh@0.1.0-rc.6",
                 "--no-audit",
                 "--no-fund",
                 "--no-progress"

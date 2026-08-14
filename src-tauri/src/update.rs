@@ -37,7 +37,8 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 use crate::{dsh, locales, tray};
 
 /// 6h 轮询间隔(#1 定稿:启动 + 定时 6h + 托盘手动,两层升级共用)。
-const POLL_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// upgrade.rs(dsh 升级链)复用同一常量,保证两层触发时机一致(单一事实来源)。
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 // ── 全局守卫(跨线程)────────────────────────────────────────────────
 
@@ -192,18 +193,19 @@ impl UpdateManager {
     /// 常驻检查(setup 调用一次):启动探测 + 6h 轮询。
     /// 探测失败静默(按无新版),不影响启动。
     pub fn start_resident_checks(&self) {
-        self.check_now(false);
+        self.check_now(false, None);
         let m = self.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(POLL_INTERVAL);
-            m.check_now(false);
+            m.check_now(false, None);
         });
     }
 
-    /// 检查更新。manual=true(托盘「检查更新」入口)时检查结束弹原生对话框
-    /// 直接回答(发现新版本 [升级][稍后] / 已是最新版本);自动检测静默。
-    /// 并发保护:CHECKING 防重入;流水线在途时 no-op。
-    pub fn check_now(&self, manual: bool) {
+    /// 检查更新。manual=true(托盘「检查更新」组合入口,#17)时结果经 on_done
+    /// 回调送出(对话框决策在编排方 tray::on_check_update 统一进行,避免两层
+    /// 升级各自弹框叠加);自动检测静默。并发保护:CHECKING 防重入;流水线在途
+    /// 时 no-op(注意:CHECKING 在途时提前返回,on_done 不会被调用)。
+    pub fn check_now(&self, manual: bool, on_done: Option<Box<dyn FnOnce(ManualCheckResult) + Send>>) {
         if self.is_active() {
             log::info!("[update] 升级流水线在途,跳过检查");
             return;
@@ -221,6 +223,11 @@ impl UpdateManager {
                     log::warn!("[update] updater 不可用(静默): {e}");
                     CHECKING.store(false, Ordering::SeqCst);
                     m.reduce(UpdateEvent::CheckNone);
+                    if manual {
+                        if let Some(f) = on_done {
+                            f(ManualCheckResult::Failed);
+                        }
+                    }
                     return;
                 }
             };
@@ -239,24 +246,36 @@ impl UpdateManager {
                         current_version: update.current_version.clone(),
                         notes: update.body.clone(),
                     });
-                    tray::notify_update_available(&m.app, &update.version);
+                    tray::set_app_update(&m.app, Some(&update.version));
                     if manual {
-                        show_found_dialog(&m.app, &update.version, &update.current_version);
+                        if let Some(f) = on_done {
+                            f(ManualCheckResult::Found {
+                                version: update.version,
+                                current_version: update.current_version,
+                            });
+                        }
                     }
                 }
                 Ok(None) => {
                     log::info!("[update] 已是最新版本");
                     m.reduce(UpdateEvent::CheckNone);
-                    tray::notify_clear_update(&m.app);
+                    tray::set_app_update(&m.app, None);
                     if manual {
-                        show_up_to_date_dialog(&m.app);
+                        if let Some(f) = on_done {
+                            f(ManualCheckResult::None);
+                        }
                     }
                 }
                 Err(e) => {
                     // 检测失败静默(#1):不进错误态、不弹窗,等下一次触发
                     log::warn!("[update] 检查失败(静默): {e}");
                     m.reduce(UpdateEvent::CheckNone);
-                    tray::notify_clear_update(&m.app);
+                    tray::set_app_update(&m.app, None);
+                    if manual {
+                        if let Some(f) = on_done {
+                            f(ManualCheckResult::Failed);
+                        }
+                    }
                 }
             }
         });
@@ -349,21 +368,9 @@ impl UpdateManager {
 // ── 窗口导航 ───────────────────────────────────────────────────────
 
 /// 导航窗口到指定 URL(显示 + 聚焦 + 取消最小化)。
+/// 单一事实来源在 dsh::navigate_main_window(boot / 升级链 / 本模块共用)。
 fn navigate_webview(app: &AppHandle, url: &str) {
-    let Some(win) = app.get_webview_window("main") else {
-        return;
-    };
-    let _ = win.unminimize();
-    let _ = win.show();
-    let _ = win.set_focus();
-    match tauri::Url::parse(url) {
-        Ok(u) => {
-            if let Err(e) = win.navigate(u) {
-                log::error!("[update] 导航失败 {url}: {e}");
-            }
-        }
-        Err(e) => log::error!("[update] URL 解析失败 {url}: {e}"),
-    }
+    let _ = dsh::navigate_main_window(app, url);
 }
 
 /// 导航窗口回外壳本地页(生产 Windows 为 `http://tauri.localhost`,dev 为 devUrl;
@@ -385,9 +392,19 @@ pub fn navigate_to_shell(app: &AppHandle) {
 
 // ── 原生对话框(托盘手动检查的直接回答,#3 §1)────────────────────────
 
+/// 手动检查的结果(供组合入口使用:tray::on_check_update 编排两层回答)。
+pub enum ManualCheckResult {
+    Found {
+        version: String,
+        current_version: String,
+    },
+    None,
+    Failed,
+}
+
 /// 手动检查发现新版:原生对话框 [升级][稍后]。
 /// [升级] → 导航升级卡片并自动开始下载(#3:确认即授权,不二次确认)。
-fn show_found_dialog(app: &AppHandle, version: &str, current: &str) {
+pub(crate) fn show_update_found_dialog(app: &AppHandle, version: &str, current: &str) {
     let t = locales::shell_texts(locales::detect_lang());
     let app = app.clone();
     app.dialog()
@@ -411,12 +428,13 @@ fn show_found_dialog(app: &AppHandle, version: &str, current: &str) {
         });
 }
 
-/// 手动检查无新版:原生对话框「已是最新版本」。
-fn show_up_to_date_dialog(app: &AppHandle) {
+/// 手动检查无新版:原生对话框「已是最新版本」(应用版本;dsh 版本已知时
+/// 合并报告——组合入口一次回答两层,#17)。
+pub(crate) fn show_up_to_date_dialog(app: &AppHandle, dsh_version: Option<&str>) {
     let current = app.package_info().version.to_string();
     let t = locales::shell_texts(locales::detect_lang());
     app.dialog()
-        .message(t.update_up_to_date_message(&current))
+        .message(t.update_up_to_date_message(&current, dsh_version))
         .title("DeepSeek Desktop")
         .kind(MessageDialogKind::Info)
         .buttons(MessageDialogButtons::Ok)
