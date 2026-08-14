@@ -1,6 +1,6 @@
-//! 系统托盘(定稿结构,见 #9):显示/隐藏窗口、主题、检查更新、退出。
+//! 系统托盘(定稿结构,见 #9):显示/隐藏窗口、主题、开机自启、检查更新、退出。
 //!
-//! 菜单结构(#9 定稿 + #3 动态项):
+//! 菜单结构(#9 定稿 + #3 动态项 + #14 自启开关):
 //! ```text
 //! 显示/隐藏窗口   id="toggle"
 //! ───────────────
@@ -8,6 +8,7 @@
 //!   亮色         id="theme-light"   (勾选)
 //!   暗色         id="theme-dark"    (勾选)
 //!   跟随系统     id="theme-system"  (勾选,默认)
+//! 开机自启       id="autostart"     (勾选,默认关,#14)
 //! ───────────────
 //! 升级到 vX      id="upgrade-available"(仅发现新版时存在,动态,#3 §1)
 //! 检查更新       id="check-update"
@@ -42,7 +43,7 @@ use tauri::menu::{CheckMenuItem, Menu, MenuBuilder, MenuItem, SubmenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, Wry};
 
-use crate::{dsh, locales, theme, update};
+use crate::{autostart, dsh, locales, theme, update};
 use crate::theme::ThemeChoice;
 
 /// 托盘图标句柄(发现新版时换徽标变体 / 恢复,见 notify_update_available)。
@@ -100,10 +101,22 @@ fn build_menu(app: &AppHandle, upgrade_label: Option<String>) -> tauri::Result<M
         .item(&theme_system)
         .build()?;
 
+    // 开机自启:勾选状态以 autostart::current() 为单一事实来源
+    // (内存由 autostart::init 从 OS 启动项恢复;重建时勾选随内存走)
+    let autostart_item = CheckMenuItem::with_id(
+        app,
+        autostart::MENU_ID,
+        t.tray_autostart,
+        true,
+        autostart::current(),
+        None::<&str>,
+    )?;
+
     let mut builder = MenuBuilder::new(app)
         .item(&toggle)
         .separator()
         .item(&theme)
+        .item(&autostart_item)
         .separator();
     if let Some(label) = upgrade_label {
         let upgrade = MenuItem::with_id(app, "upgrade-available", label, true, None::<&str>)?;
@@ -187,6 +200,7 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                     on_theme_chosen(app, choice);
                 }
             }
+            autostart::MENU_ID => on_autostart_toggled(app),
             "upgrade-available" => {
                 // 被动通知入口(#3 §1):显示窗口(若隐藏)→ 导航回本地升级页
                 log::info!("[tray] 菜单[升级] → 导航升级卡片");
@@ -234,6 +248,16 @@ fn on_theme_chosen(app: &AppHandle, choice: ThemeChoice) {
     refresh_menu(app);
     log::info!("[tray] 主题切换: {choice:?} → 推 tray-theme 事件");
     let _ = app.emit_to("main", "tray-theme", choice.event_payload());
+}
+
+/// 自启菜单点击分发:切换收敛到 autostart::set(唯一写入口,插件失败时内存
+/// 保持 OS 实际状态);重建菜单让勾选回到内存事实源(Windows 勾选项不自动
+/// 切换,与主题同款处理,见 refresh_menu)。
+fn on_autostart_toggled(app: &AppHandle) {
+    let next = !autostart::current();
+    log::info!("[tray] 切换开机自启 → {next}");
+    let _ = autostart::set(app, next);
+    refresh_menu(app);
 }
 
 /// 显示/隐藏窗口。行为:窗口可见且已聚焦时隐藏,否则显示并聚焦。

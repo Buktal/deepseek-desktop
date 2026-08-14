@@ -38,6 +38,7 @@ pub struct ShellTexts {
     pub tray_theme_light: &'static str,
     pub tray_theme_dark: &'static str,
     pub tray_theme_system: &'static str,
+    pub tray_autostart: &'static str,
     pub tray_check_update: &'static str,
     pub tray_quit: &'static str,
     pub close_message: &'static str,
@@ -97,6 +98,7 @@ pub fn shell_texts(lang: Lang) -> ShellTexts {
             tray_theme_light: "亮色",
             tray_theme_dark: "暗色",
             tray_theme_system: "跟随系统",
+            tray_autostart: "开机自启",
             tray_check_update: "检查更新",
             tray_quit: "退出",
             // "关闭"而非"退出":对话框同时提供"最小化到托盘",问题只问窗口去向
@@ -115,6 +117,7 @@ pub fn shell_texts(lang: Lang) -> ShellTexts {
             tray_theme_light: "Light",
             tray_theme_dark: "Dark",
             tray_theme_system: "System",
+            tray_autostart: "Launch at startup",
             tray_check_update: "Check for Updates",
             tray_quit: "Quit",
             // "Close" instead of "Quit": the dialog also offers "Minimize to tray",

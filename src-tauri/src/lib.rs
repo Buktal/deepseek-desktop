@@ -1,7 +1,9 @@
 //! DeepSeek Desktop Tauri backend.
 //!
-//! 组装:dsh 生命周期管理 + 应用自身升级 + 托盘 + 关闭三选对话框 + 退出收敛(杀子进程)+ 生产日志。
+//! 组装:dsh 生命周期管理 + 应用自身升级 + 托盘 + 关闭三选对话框 + 退出收敛(杀子进程)
+//! + 生产日志 + 窗口状态记忆 + 开机自启。
 
+mod autostart;
 mod dsh;
 mod locales;
 mod logging;
@@ -9,7 +11,7 @@ mod theme;
 mod tray;
 mod update;
 
-use tauri::{Manager, WindowEvent};
+use tauri::{LogicalSize, Manager, PhysicalSize, WindowEvent};
 use tauri_plugin_dialog::{
     DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
 };
@@ -32,8 +34,26 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
+        // 窗口状态记忆:大小/位置/最大化跨会话恢复(tauri-plugin-window-state)。
+        // 只持久化 POSITION|SIZE|MAXIMIZED,排除 VISIBLE——窗口从托盘隐藏/
+        // 最小化后退出,重启仍正常显示窗口(CC-Switch 同款 flags)。
+        // 保存时机:RunEvent::Exit 自动落盘(我们的退出路径是正常 app.exit(0),
+        // 不绕过 run loop,无需像 CC-Switch 那样手动 save_window_state)。
+        // 恢复时机:窗口 ready 时自动应用;保存位置不在当前任一显示器内时由 OS
+        // 决定放置(防拔显示器后窗口飞出屏外);SIZE 恢复受窗口最小尺寸约束钳制。
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::POSITION
+                        | tauri_plugin_window_state::StateFlags::SIZE
+                        | tauri_plugin_window_state::StateFlags::MAXIMIZED,
+                )
+                .build(),
+        )
+        // 开机自启(Windows:注册表 Run 键;默认关闭,托盘菜单开关项,#14)
+        .plugin(tauri_plugin_autostart::Builder::new().build())
         .setup(|app| {
-            // 生产日志:落盘到 <app_data_dir>/logs/app.log + stdout,panic 经 hook 同落盘。
+            // 生产日志:落盘到 <temp>/deepseek-desktop/logs/app.log + stdout,panic 经 hook 同落盘。
             // 失败不致命:降级为仅控制台输出,应用照常启动。
             if let Err(e) = logging::init(app.handle()) {
                 eprintln!("[logging] init 失败,日志仅输出到控制台: {e}");
@@ -42,6 +62,16 @@ pub fn run() {
             // 主题:读持久化 → 内存 + 注册 OS 主题变化监听。
             // 须在 setup_tray 之前:托盘勾选状态读 theme::current_choice()
             theme::init(app.handle());
+
+            // 开机自启:直查 OS 启动项状态 → 内存(默认关闭)。
+            // 须在 setup_tray 之前:托盘勾选状态读 autostart::current()
+            autostart::init(app.handle());
+
+            // 窗口恢复后几何钳制:restore 的保存值可能小于 minWidth/minHeight
+            // (插件 set_size 是编程 resize,OS 不强制 min 约束),此处保证实际
+            // 尺寸不小于 config 的最小值。双保险:同步检查 + Resized 监听,
+            // 覆盖插件 restore 在 setup 前后两种完成时序。
+            enforce_min_window_size(app.handle());
 
             // dsh 管理器(Clone 共享内部 Arc 状态)
             let manager = dsh::DshManager::new(app.handle().clone());
@@ -137,4 +167,97 @@ fn setup_close_handler(app: &tauri::AppHandle, manager: dsh::DshManager) {
                 });
         }
     });
+}
+
+/// 窗口恢复后的几何钳制:保证实际尺寸不小于 tauri.conf.json 的 minWidth/minHeight
+/// (最小尺寸的单一事实源是 config,此处只做运行时强制)。
+///
+/// 背景:OS 编程 resize(set_size/MoveWindow)不强制 min 约束——只有用户交互拖动
+/// 受 track size 限制,故窗口状态插件 restore 保存的小尺寸(如旧显示器/DPI 环境
+/// 下保存的值)时需主动钳制,否则窗口可能小于最小尺寸。
+///
+/// 双保险:setup 同步检查(插件 restore 若在 setup 前完成即生效)+ Resized 监听
+/// (restore 在 setup 后完成、以及 DPI 变化等后续路径)。clamp 后 Resized 再触发
+/// 时条件已不满足,无循环。
+fn enforce_min_window_size(app: &tauri::AppHandle) {
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+    let Some(cfg) = app.config().app.windows.iter().find(|w| w.label == "main") else {
+        return;
+    };
+    let min_w = cfg.min_width.unwrap_or(0.0);
+    let min_h = cfg.min_height.unwrap_or(0.0);
+    if min_w <= 0.0 && min_h <= 0.0 {
+        return;
+    }
+    clamp_window(&win, min_w, min_h);
+    let handler_win = win.clone();
+    win.on_window_event(move |event| {
+        if let WindowEvent::Resized(_) = event {
+            clamp_window(&handler_win, min_w, min_h);
+        }
+    });
+}
+
+/// 当前物理尺寸换算逻辑后小于 min 时 set_size 到 min。
+fn clamp_window(win: &tauri::WebviewWindow, min_w: f64, min_h: f64) {
+    let Ok(size) = win.inner_size() else {
+        return;
+    };
+    let scale = win.scale_factor().unwrap_or(1.0);
+    if let Some((w, h)) = clamp_size(size, scale, (min_w, min_h)) {
+        let _ = win.set_size(LogicalSize::new(w, h));
+    }
+}
+
+/// 纯函数:物理尺寸 × 缩放 → 逻辑尺寸,任一维度低于 min 时返回钳制后的逻辑尺寸。
+fn clamp_size(size: PhysicalSize<u32>, scale: f64, min: (f64, f64)) -> Option<(f64, f64)> {
+    let w = size.width as f64 / scale;
+    let h = size.height as f64 / scale;
+    let (cw, ch) = (w.max(min.0), h.max(min.1));
+    (cw != w || ch != h).then_some((cw, ch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_size_noop_within_min() {
+        // 尺寸 ≥ min 时不干预
+        assert_eq!(clamp_size(PhysicalSize::new(1000, 800), 1.0, (840.0, 600.0)), None);
+        assert_eq!(clamp_size(PhysicalSize::new(840, 600), 1.0, (840.0, 600.0)), None);
+    }
+
+    #[test]
+    fn clamp_size_enforces_min() {
+        // 单维度低于 min 只钳该维度,另一维度保持
+        assert_eq!(
+            clamp_size(PhysicalSize::new(500, 300), 1.0, (840.0, 600.0)),
+            Some((840.0, 600.0))
+        );
+        assert_eq!(
+            clamp_size(PhysicalSize::new(500, 900), 1.0, (840.0, 600.0)),
+            Some((840.0, 900.0))
+        );
+        assert_eq!(
+            clamp_size(PhysicalSize::new(1000, 300), 1.0, (840.0, 600.0)),
+            Some((1000.0, 600.0))
+        );
+    }
+
+    #[test]
+    fn clamp_size_uses_logical_units() {
+        // 200% DPI:物理 1000x300 = 逻辑 500x150 < min → 钳到逻辑 840x600
+        assert_eq!(
+            clamp_size(PhysicalSize::new(1000, 300), 2.0, (840.0, 600.0)),
+            Some((840.0, 600.0))
+        );
+        // 200% DPI:物理 1900x1200 = 逻辑 950x600 ≥ min → 不干预
+        assert_eq!(
+            clamp_size(PhysicalSize::new(1900, 1200), 2.0, (840.0, 600.0)),
+            None
+        );
+    }
 }
