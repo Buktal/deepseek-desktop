@@ -12,7 +12,8 @@ import { useThemeSync } from "@/lib/useThemeSync"
 import { isActiveUpdateStatus, useUpdateCheck } from "@/lib/useUpdateCheck"
 
 export default function App() {
-  const { phase, error, logs, retry, quit, mountSnapshotReady } = useBoot()
+  const { phase, error, logs, progress, stage, elapsedSecs, retry, quit, mountSnapshotReady } =
+    useBoot()
   // 主题同步:Rust 下发生效主题 → <html>.dark(boot UI 全程生效)
   useThemeSync()
   // 升级状态镜像(Rust 侧单一事实源,见 useUpdateCheck)
@@ -43,5 +44,12 @@ export default function App() {
     return <ErrorScreen error={error} logs={logs} retry={retry} quit={quit} />
   }
   // idle(快照未到)/checking/installing/starting/ready 均由 BootScreen 呈现对应文案
-  return <BootScreen phase={phase} />
+  return (
+    <BootScreen
+      phase={phase}
+      progress={progress}
+      stage={stage}
+      elapsedSecs={elapsedSecs}
+    />
+  )
 }

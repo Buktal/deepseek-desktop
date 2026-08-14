@@ -1,7 +1,13 @@
 {
   "boot.checking.title": "Checking the environment…",
+  "boot.elapsed.minSec": "Elapsed {{m}}m {{s}}s",
+  "boot.elapsed.sec": "Elapsed {{s}}s",
   "boot.idle.title": "Starting…",
   "boot.installing.hint": "First install may take a few minutes, please wait",
+  "boot.installing.progress": "{{pct}}%",
+  "boot.installing.stage.fetching": "Downloading dependencies…",
+  "boot.installing.stage.finishing": "Almost done…",
+  "boot.installing.stage.reifying": "Installing dependencies…",
   "boot.installing.title": "Installing dsh…",
   "boot.ready.title": "Opening dsh…",
   "boot.starting.hint": "First start initializes the environment and may take a minute or two",

@@ -1,7 +1,13 @@
 {
   "boot.checking.title": "正在检查运行环境…",
+  "boot.elapsed.minSec": "已用时 {{m}} 分 {{s}} 秒",
+  "boot.elapsed.sec": "已用时 {{s}} 秒",
   "boot.idle.title": "正在启动…",
   "boot.installing.hint": "首次安装可能需要几分钟,请耐心等待",
+  "boot.installing.progress": "{{pct}}%",
+  "boot.installing.stage.fetching": "正在下载依赖…",
+  "boot.installing.stage.finishing": "即将完成…",
+  "boot.installing.stage.reifying": "正在写入安装目录…",
   "boot.installing.title": "正在安装 dsh…",
   "boot.ready.title": "正在打开 dsh…",
   "boot.starting.hint": "首次启动需要初始化环境,可能需要一两分钟",

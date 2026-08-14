@@ -39,7 +39,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -94,6 +94,16 @@ pub fn reset_dialog_flag() {
 
 // ── 状态与视图 ─────────────────────────────────────────────────────
 
+/// Windows 任务栏图标进度状态(tauri set_progress_bar 语义的极简映射):
+/// Clear = 隐藏进度,Indeterminate = 流动动画(checking/starting),
+/// Percent(p) = 确定进度 0-100(installing)。
+#[derive(Debug, Clone, Copy)]
+enum TaskbarProgress {
+    Clear,
+    Indeterminate,
+    Percent(u8),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -113,22 +123,53 @@ pub struct LogLine {
     pub line: String,
 }
 
-/// boot-state 事件/命令返回:只含阶段,不含日志(减重,高频推送不影响渲染)
+/// 安装模拟进度的子阶段。npm 安装期**没有真实百分比**(管道非 TTY + `--no-progress`,
+/// 输出块缓冲突发到达,调研 #2 实测),本枚举是时间驱动的语义分段,供进度文案与
+/// 事件携带;boot 安装与 dsh 升级链(未落地)复用同一模拟逻辑(install_progress_at)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum InstallStage {
+    /// 下载依赖
+    Fetching,
+    /// 依赖解包写入安装目录
+    Reifying,
+    /// 收尾(接近完成)
+    Finishing,
+}
+
+/// boot-state 事件/命令返回:只含阶段与进度,不含日志(减重,高频推送不影响渲染)。
+/// 进度字段仅 installing 阶段携带(progress/stage);elapsed_secs 从流水线启动起
+/// 累计,checking/installing/starting 全程可显示耗时(见 BootScreen)。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootStateView {
     pub phase: Phase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<BootError>,
+    /// 安装模拟进度 0-100(None = 非安装阶段;100 只能由 npm 进程退出校准)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
+    /// 安装子阶段(前端拼 `boot.installing.stage.<stage>` 文案键)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<InstallStage>,
+    /// 从流水线启动起的累计秒数(启动页耗时显示;进度 tick 附带)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_secs: Option<u64>,
 }
 
-/// `boot` 命令返回的状态快照:含最近日志(挂载/重试一调两用)
+/// `boot` 命令返回的状态快照:含最近日志与当前进度(挂载/重试一调两用)
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootStateSnapshot {
     pub phase: Phase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<BootError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<InstallStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_secs: Option<u64>,
     pub logs: Vec<LogLine>,
 }
 
@@ -198,6 +239,10 @@ struct BootState {
     phase: Phase,
     error: Option<BootError>,
     logs: VecDeque<LogLine>,
+    /// 安装模拟进度与子阶段(installing 期间由 emit_install_progress 维护,
+    /// 快照挂载/重试时同步给前端;离开 installing 阶段清空)
+    progress: Option<u8>,
+    stage: Option<InstallStage>,
 }
 
 /// dsh 生命周期管理器。Clone 共享内部状态(boot 线程与 reaper 线程各持一份)。
@@ -210,6 +255,8 @@ pub struct DshManager {
     install_pid: Arc<Mutex<Option<u32>>>,
     /// 当前 dsh 页 URL(boot 就绪时记录;#3 §7:升级卡片「稍后/返回」的导航目标)。
     dsh_url: Arc<Mutex<Option<String>>>,
+    /// boot 流水线启动时刻(启动页耗时显示起点;重试覆盖为新一轮起点)
+    started_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl DshManager {
@@ -220,10 +267,13 @@ impl DshManager {
                 phase: Phase::Idle,
                 error: None,
                 logs: VecDeque::new(),
+                progress: None,
+                stage: None,
             })),
             child: Arc::new(Mutex::new(None)),
             install_pid: Arc::new(Mutex::new(None)),
             dsh_url: Arc::new(Mutex::new(None)),
+            started_at: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -251,15 +301,24 @@ impl DshManager {
             .into_iter()
             .rev()
             .collect();
+        // 进度字段在状态内维护(见 set_install_progress_snapshot);其余照常
+        let (progress, stage) = match s.phase {
+            Phase::Installing => (s.progress, s.stage),
+            _ => (None, None),
+        };
         BootStateSnapshot {
             phase: s.phase,
             error: s.error.clone(),
+            progress,
+            stage,
+            elapsed_secs: self.boot_elapsed_secs(),
             logs,
         }
     }
 
-    /// 阶段迁移:更新状态并推送 `boot-state` 事件(仅阶段,不含日志)。
+    /// 阶段迁移:更新状态并推送 `boot-state` 事件(阶段 + 耗时,不含日志)。
     /// emit_to("main"):只投递主窗口 webview,不广播给其它窗口。
+    /// 事件同时带 elapsed_secs(从流水线启动起累计)——前端据此显示全程耗时。
     fn set_phase(&self, phase: Phase, error: Option<BootError>) {
         if let Ok(mut s) = self.state.lock() {
             // 新一次 boot 的语义边界:进入 Checking 时清空上一轮的日志缓冲
@@ -268,14 +327,118 @@ impl DshManager {
             }
             s.phase = phase;
             s.error = error.clone();
+            // 离开 installing:进度字段不再有意义,清空防快照残留
+            if phase != Phase::Installing {
+                s.progress = None;
+                s.stage = None;
+            }
         }
         match &error {
             Some(e) => log::error!("[dsh] phase → {phase:?}: {e:?}"),
             None => log::info!("[dsh] phase → {phase:?}"),
         }
+        // 任务栏进度同步(Windows):checking/starting 流动动画、installing 确定进度起点
+        // (进度随后由安装进度线程逐级更新)、ready/error 清除——窗口导航/错误页后
+        // 不得残留旧进度。非安装阶段的事件不带 progress/stage 字段。
+        match phase {
+            Phase::Checking | Phase::Starting => self.set_taskbar_progress(TaskbarProgress::Indeterminate),
+            Phase::Installing => self.set_taskbar_progress(TaskbarProgress::Percent(0)),
+            _ => self.set_taskbar_progress(TaskbarProgress::Clear),
+        }
         let _ = self
             .app
-            .emit_to("main", "boot-state", BootStateView { phase, error });
+            .emit_to("main", "boot-state", BootStateView {
+                phase,
+                error,
+                progress: None,
+                stage: None,
+                elapsed_secs: self.boot_elapsed_secs(),
+            });
+    }
+
+    /// 记录流水线启动时刻(boot_start 时调用;重试会覆盖为新一轮起点)。
+    /// 耗时显示的起点 = 真实流水线启动时刻,不依赖前端挂载时机(挂载可能晚于启动)。
+    fn mark_boot_started(&self) {
+        if let Ok(mut g) = self.started_at.lock() {
+            *g = Some(Instant::now());
+        }
+    }
+
+    /// 从流水线启动起的累计秒数(None = 尚未启动过)。
+    fn boot_elapsed_secs(&self) -> Option<u64> {
+        self.started_at
+            .lock()
+            .ok()
+            .and_then(|g| g.map(|t| t.elapsed().as_secs()))
+    }
+
+    /// 安装进度事件:推 `boot-state` { phase: Installing, progress, stage, elapsed }。
+    /// 纯视觉呈现,不参与任何业务决策;100% 只能由调用方(npm 进程退出)校准。
+    fn emit_install_progress(&self, stage: InstallStage, progress: u8) {
+        // 同步进度到状态:挂载/重试的快照能拿到当前值(进度线程是异步的)
+        if let Ok(mut s) = self.state.lock() {
+            s.progress = Some(progress);
+            s.stage = Some(stage);
+        }
+        self.set_taskbar_progress(TaskbarProgress::Percent(progress));
+        let _ = self
+            .app
+            .emit_to("main", "boot-state", BootStateView {
+                phase: Phase::Installing,
+                error: None,
+                progress: Some(progress),
+                stage: Some(stage),
+                elapsed_secs: self.boot_elapsed_secs(),
+            });
+    }
+
+    /// 启动安装模拟进度线程:每 500ms 按真实流逝时间推进一次(install_progress_at),
+    /// 百分比变化才 emit(安装期事件量 ≈ 200 发/分钟,量级与现有阶段事件一致)。
+    /// 线程只做视觉呈现,与 npm 进程的真实成功/失败/超时判定完全无关。
+    /// 返回 JoinHandle:调用方停表(内部 stop 标志)后必须 join 才能继续——
+    /// 保证线程在途事件先于终态事件(100% 校准 / 错误)送达,事件流确定性收尾
+    /// (否则旧进度事件可能晚于错误事件到达,把前端从错误页拉回 installing 卡死)。
+    fn start_install_progress(&self) -> JoinHandle<()> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        let m = self.clone();
+        let started = Instant::now();
+        thread::spawn(move || {
+            let mut last_pct: Option<u8> = None;
+            while !s.load(Ordering::SeqCst) {
+                let (stage, pct) = install_progress_at(started.elapsed().as_secs_f64());
+                if last_pct != Some(pct) {
+                    last_pct = Some(pct);
+                    m.emit_install_progress(stage, pct);
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+        })
+    }
+
+    /// Windows 任务栏图标进度(tauri `set_progress_bar`,仅 Windows 生效;
+    /// 其余平台 no-op——macOS 无任务栏进度、Linux 仅 libunity 桌面环境)。
+    fn set_taskbar_progress(&self, state: TaskbarProgress) {
+        #[cfg(windows)]
+        {
+            use tauri::window::{ProgressBarState, ProgressBarStatus};
+            let Some(win) = self.app.get_webview_window("main") else {
+                return;
+            };
+            let (status, progress) = match state {
+                TaskbarProgress::Clear => (ProgressBarStatus::None, None),
+                TaskbarProgress::Indeterminate => (ProgressBarStatus::Indeterminate, None),
+                TaskbarProgress::Percent(p) => (ProgressBarStatus::Normal, Some(p.into())),
+            };
+            let _ = win.set_progress_bar(ProgressBarState {
+                status: Some(status),
+                progress,
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = state; // 平台守卫:非 Windows 不调用(避免无意义开销)
+        }
     }
 
     fn set_error(&self, error: BootError) {
@@ -603,6 +766,31 @@ fn bundle_cache_dir(resource_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// 按真实流逝时间给出安装模拟进度(纯函数,可测试)。
+///
+/// 分段锚点(实测 #2:暖缓存 ~26s、冷缓存 ~4m16s、离线缓存命中秒级):
+/// - 0-10s 下载(0% → 60%)——网络为主,占大头
+/// - 10-60s 解包写入(60% → 85%)
+/// - 60-120s 收尾(85% → 99%),之后停在 99%
+///
+/// 连续(拐点处百分比相等)、单调不减、**永不提前到 100%**——100% 只能由 npm
+/// 进程退出校准(锚点语义,见 boot_pipeline 的 installing 分支)。模拟只做视觉
+/// 呈现,不参与任何业务决策(成功/失败/超时全由真实进程事件驱动)。
+/// boot 安装与 dsh 升级链(未落地)复用同一逻辑。
+pub(crate) fn install_progress_at(elapsed_secs: f64) -> (InstallStage, u8) {
+    let t = elapsed_secs.max(0.0);
+    // 分段区间内线性插值:拐点处百分比相等,推进平滑无跳变
+    let (stage, pct) = if t < 10.0 {
+        (InstallStage::Fetching, t / 10.0 * 60.0) // 0-10s:0% → 60%
+    } else if t < 60.0 {
+        (InstallStage::Reifying, 60.0 + (t - 10.0) * 0.5) // 10-60s:60% → 85%
+    } else {
+        // 60-120s:85% → 99%;之后封顶 99%
+        (InstallStage::Finishing, 85.0 + (t - 60.0).min(60.0) * (14.0 / 60.0))
+    };
+    (stage, pct.round().clamp(0.0, 99.0) as u8)
+}
+
 /// npm 全局安装参数组装(纯函数,可测试)。
 /// 离线缓存目录存在时加 `--prefer-offline --cache <目录>`:
 /// 缓存命中走本地秒级完成,缺失自动回退网络(用户拍板语义)。
@@ -900,10 +1088,20 @@ fn boot_pipeline(manager: &DshManager) {
         None => {
             log::info!("[dsh] boot: global dsh not found, installing…");
             manager.set_phase(Phase::Installing, None);
-            if let Err(e) = npm_install_global(manager) {
+            // 进度模拟(纯视觉):0% 起点 → 进度线程按真实时间推进(封顶 99%)。
+            // 锚点 = npm 进程退出:成功 → 校准 100%;失败/超时 → 不校准,
+            // 直接进错误页(模拟永不领先于真实结果,不会出现「100% 却失败」)。
+            // 停表后 join:线程在途事件先于 100% 校准/错误事件送达(见
+            // start_install_progress 的说明),join 后进度字段不再被线程改写。
+            manager.emit_install_progress(InstallStage::Fetching, 0);
+            let progress_thread = manager.start_install_progress();
+            let result = npm_install_global(manager);
+            let _ = progress_thread.join();
+            if let Err(e) = result {
                 manager.set_error(e);
                 return;
             }
+            manager.emit_install_progress(InstallStage::Finishing, 100);
             // 安装后完整性复检:装完仍然不可用视为失败
             match global_dsh_bin() {
                 Some(b) => b,
@@ -1018,6 +1216,8 @@ pub fn boot_start(manager: &DshManager) {
     if BOOTING.swap(true, Ordering::SeqCst) {
         return;
     }
+    // 耗时显示起点:真实流水线启动时刻(重试会覆盖为新一轮起点)
+    manager.mark_boot_started();
     log::info!("[dsh] boot 流水线启动(phase={phase:?})");
     let m = manager.clone();
     thread::spawn(move || {
@@ -1391,6 +1591,92 @@ mod tests {
         assert!(
             stdout.contains("spaced cache dir"),
             "含空格 cache 路径被 cmd 拆坏: {stdout}"
+        );
+    }
+
+    // ── 安装进度模拟(#7)──────────────────────────────────────────
+
+    #[test]
+    fn install_progress_anchors_match_design() {
+        // 生产路径:boot_pipeline 的进度线程每 500ms 调 install_progress_at 一次,
+        // 阶段与百分比驱动前端进度条与阶段文案。锚点必须与设计一致。
+        assert_eq!(install_progress_at(0.0), (InstallStage::Fetching, 0));
+        assert_eq!(install_progress_at(5.0), (InstallStage::Fetching, 30));
+        assert_eq!(install_progress_at(10.0), (InstallStage::Reifying, 60)); // 拐点连续
+        assert_eq!(install_progress_at(35.0), (InstallStage::Reifying, 73)); // 60 + 25*0.5
+        assert_eq!(install_progress_at(60.0), (InstallStage::Finishing, 85)); // 拐点连续
+        assert_eq!(install_progress_at(120.0), (InstallStage::Finishing, 99));
+        assert_eq!(install_progress_at(600.0), (InstallStage::Finishing, 99)); // 封顶
+    }
+
+    #[test]
+    fn install_progress_is_monotonic_and_never_reaches_100() {
+        // 模拟进度单调不减、永不提前 100%(100% 只能由 npm 进程退出校准):
+        // 失败/超时路径不会出现「已 100% 却失败」的矛盾呈现
+        let mut prev = 0u8;
+        for secs in (0..300).map(|s| s as f64 + 0.1) {
+            let (_, pct) = install_progress_at(secs);
+            assert!(pct >= prev, "进度回退: {secs}s → {pct} < {prev}");
+            assert!(pct < 100, "模拟进度提前到 100%: {secs}s");
+            prev = pct;
+        }
+    }
+
+    #[test]
+    fn install_progress_offline_cache_fast_path_stays_low() {
+        // 离线缓存命中秒级完成(#16):安装开始即校准 100%,模拟值短暂出现且远低于
+        // 100%——快路径下进度条从 0 快速跳到 100 是预期行为,不得到处乱跳
+        let (stage, pct) = install_progress_at(1.5);
+        assert_eq!(stage, InstallStage::Fetching);
+        assert!(pct < 20, "离线快路径下 1.5s 进度应很低,实际 {pct}");
+        let (_, pct) = install_progress_at(3.0);
+        assert!(pct < 30, "离线快路径下 3s 进度应较低,实际 {pct}");
+    }
+
+    #[test]
+    fn install_progress_clamps_negative_input() {
+        // 防御:负流逝时间(时钟异常)按 0 处理
+        assert_eq!(install_progress_at(-1.0), (InstallStage::Fetching, 0));
+    }
+
+    #[test]
+    fn boot_state_view_omits_progress_fields_when_not_installing() {
+        // 线上契约:非安装阶段的事件/快照不带 progress/stage 字段
+        // (skip_serializing_if),前端据此区分确定/不确定进度
+        let view = BootStateView {
+            phase: Phase::Checking,
+            error: None,
+            progress: None,
+            stage: None,
+            elapsed_secs: Some(3),
+        };
+        let v = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "phase": "checking", "elapsedSecs": 3 })
+        );
+        assert!(v.get("progress").is_none());
+        assert!(v.get("stage").is_none());
+    }
+
+    #[test]
+    fn boot_state_view_serializes_install_progress_fields() {
+        // 安装中:progress/stage 以 camelCase/小写形态进 payload,前端直接消费
+        let view = BootStateView {
+            phase: Phase::Installing,
+            error: None,
+            progress: Some(62),
+            stage: Some(InstallStage::Reifying),
+            elapsed_secs: Some(35),
+        };
+        assert_eq!(
+            serde_json::to_value(&view).unwrap(),
+            serde_json::json!({
+                "phase": "installing",
+                "progress": 62,
+                "stage": "reifying",
+                "elapsedSecs": 35
+            })
         );
     }
 }
