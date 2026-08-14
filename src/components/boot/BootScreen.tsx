@@ -11,6 +11,7 @@ import { useTranslation } from "react-i18next"
 
 import { InstallProgress } from "@/components/install/InstallProgress"
 import { formatElapsed } from "@/lib/elapsed"
+import { cn } from "@/lib/utils"
 
 export type BootPhase = "idle" | "checking" | "installing" | "starting" | "ready"
 
@@ -20,6 +21,8 @@ export function BootScreen({
   stage,
   nodeVersion,
   elapsedSecs,
+  exiting = false,
+  onExitAnimationEnd,
 }: {
   phase: BootPhase
   /** 安装模拟进度 0-100(null = 非安装阶段) */
@@ -30,6 +33,10 @@ export function BootScreen({
   nodeVersion: string | null
   /** 从 boot 启动起的累计秒数(null = 快照未到,尚无起点) */
   elapsedSecs: number | null
+  /** 就绪退出动画中(#4):整屏溶解 + 圆环收缩收敛 */
+  exiting?: boolean
+  /** 退出动画结束(CSS onAnimationEnd,动画名过滤后上报) */
+  onExitAnimationEnd?: () => void
 }) {
   const { t } = useTranslation()
   // hint 键仅 installing/starting 存在;defaultValue 兜底让其余阶段静默无提示
@@ -45,12 +52,27 @@ export function BootScreen({
   }
   const installing = phase === "installing" && progress !== null
   return (
-    <main className="flex h-screen w-screen flex-col items-center justify-center gap-7 bg-background text-foreground">
-      {/* 旋转圆环:loading 指示 */}
-      <div
-        aria-hidden
-        className="size-[124px] animate-spin rounded-full border-[3px] border-transparent border-t-indigo-500/80"
-      />
+    <main
+      className={cn(
+        "flex h-screen w-screen flex-col items-center justify-center gap-7 bg-background text-foreground",
+        exiting && "boot-exit",
+      )}
+      onAnimationEnd={
+        exiting
+          ? (e) => {
+              // 只认退出动画的结束事件(子元素动画冒泡也会触达,过滤防误信号)
+              if (e.animationName === "boot-exit" || e.animationName === "boot-exit-ring") {
+                onExitAnimationEnd?.()
+              }
+            }
+          : undefined
+      }
+    >
+      {/* 旋转圆环:loading 指示;就绪退出时外层收缩收敛(缩到中心点消失),
+          内层自转动画独立在子元素上,无 transform 冲突 */}
+      <div className={cn(exiting && "boot-exit-ring")} aria-hidden>
+        <div className="size-[124px] animate-spin rounded-full border-[3px] border-transparent border-t-indigo-500/80" />
+      </div>
 
       <div className="text-center">
         <h1 className="text-lg font-medium">{t(`boot.${phase}.title`)}</h1>

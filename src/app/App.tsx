@@ -9,6 +9,7 @@ import { ErrorScreen } from "@/components/boot/ErrorScreen"
 import { UpgradeCard } from "@/components/update/UpgradeCard"
 import { UpgradeScreen } from "@/components/upgrade/UpgradeScreen"
 import { useBoot } from "@/lib/useBoot"
+import { useBootExit } from "@/lib/useBootExit"
 import { useDshUpgrade, isActiveDshUpgradeStatus } from "@/lib/useDshUpgrade"
 import { useThemeSync } from "@/lib/useThemeSync"
 import { isActiveUpdateStatus, useUpdateCheck } from "@/lib/useUpdateCheck"
@@ -28,6 +29,12 @@ export default function App() {
   } = useBoot()
   // 主题同步:Rust 下发生效主题 → <html>.dark(boot UI 全程生效)
   useThemeSync()
+  // 退出动画编排(#4):phase=ready 即播放动画(整屏溶解 + 圆环收缩)——
+  // 活体 boot 的 ready 事件与「挂载快照即 ready」(webview 挂载晚于 boot
+  // 完成,实机常态)都走动画;动画结束信号 navigate_to_dsh → Rust 侧导航
+  // 去 dsh 页(等待期信号给 boot_pipeline;已过等待期则命令直接导航)。
+  // 升级/更新卡场景渲染在 boot 分发之前,不经过本动画。
+  const { exiting, onExitAnimationEnd } = useBootExit({ ready: phase === "ready" })
   // 升级状态镜像(Rust 侧单一事实源,见 useDshUpgrade / useUpdateCheck)
   const dshUpgrade = useDshUpgrade()
   const update = useUpdateCheck()
@@ -80,6 +87,8 @@ export default function App() {
       stage={stage}
       nodeVersion={nodeVersion}
       elapsedSecs={elapsedSecs}
+      exiting={exiting}
+      onExitAnimationEnd={onExitAnimationEnd}
     />
   )
 }

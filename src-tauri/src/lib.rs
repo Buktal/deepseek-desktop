@@ -108,6 +108,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             dsh::boot,
+            dsh::navigate_to_dsh,
             dsh::quit_app,
             theme::theme_state,
             update::update_state,

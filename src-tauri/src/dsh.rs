@@ -67,6 +67,11 @@ const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 const BUNDLE_CACHE_REL: &str = "npm-cache";
 /// 日志环形缓冲容量(仅供异常时附上下文,不推流)
 const LOG_CAP: usize = 200;
+/// 就绪后等待前端退出动画完成信号的超时(#4)。
+/// 前端退出动画时长 400ms + 余量;超时兜底照常导航——动画是纯装饰,不是
+/// 完成条件,前端 JS 故障 / 动画事件缺失(如 reduced-motion 下 animation: none)
+/// 不得阻塞 boot。
+const NAVIGATE_SIGNAL_TIMEOUT: Duration = Duration::from_millis(1500);
 
 // ── 全局守卫(跨线程)────────────────────────────────────────────────
 
@@ -284,6 +289,10 @@ pub struct DshManager {
     dsh_url: Arc<Mutex<Option<String>>>,
     /// boot 流水线启动时刻(启动页耗时显示起点;重试覆盖为新一轮起点)
     started_at: Arc<Mutex<Option<Instant>>>,
+    /// 前端退出动画完成信号发送端(#4)。boot_pipeline 就绪后等待期间存入
+    /// (wait_navigate_signal_or_timeout),等待结束(rx drop)后 try_send 自然
+    /// 失败——跨轮信号串扰由通道生命周期兜底,无需额外标志。
+    navigate_tx: Arc<Mutex<Option<mpsc::SyncSender<()>>>>,
 }
 
 impl DshManager {
@@ -302,6 +311,7 @@ impl DshManager {
             install_pid: Arc::new(Mutex::new(None)),
             dsh_url: Arc::new(Mutex::new(None)),
             started_at: Arc::new(Mutex::new(None)),
+            navigate_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -429,6 +439,51 @@ impl DshManager {
             .lock()
             .ok()
             .and_then(|g| g.map(|t| t.elapsed().as_secs()))
+    }
+
+    /// 等待前端退出动画完成信号(#4)。信号通道按轮创建:
+    /// - boot_pipeline 就绪后在此等待(tx 存入 navigate_tx 供命令 try_send)
+    /// - 前端动画结束经 navigate_to_dsh 命令 try_send
+    /// - 超时(前端故障 / JS 错误)照常返回——动画是纯装饰,不是完成条件
+    /// - rx drop(= 本方法返回)后信号自然失效:跨轮串扰(旧命令晚到)由
+    ///   通道生命周期兜底,无需额外标志
+    fn wait_navigate_signal_or_timeout(&self, timeout: Duration) {
+        let (tx, rx) = mpsc::sync_channel::<()>(1);
+        if let Ok(mut g) = self.navigate_tx.lock() {
+            *g = Some(tx);
+        }
+        let _ = rx.recv_timeout(timeout);
+        if let Ok(mut g) = self.navigate_tx.lock() {
+            *g = None;
+        }
+    }
+
+    /// 前端请求导航(退出动画完成信号,#4)。幂等:
+    /// - phase 非 Ready 一律 no-op(非就绪不导航,防跨轮串扰)
+    /// - 有等待者(boot_pipeline 就绪等待中)→ 信号,boot_pipeline 负责导航
+    /// - 无等待者(rx 已随上一轮等待结束而 drop)→ dsh 在跑则直接导航:
+    ///   实机场景「全新启动时 webview 挂载晚于 boot 完成」(挂载快照即 ready,
+    ///   动画照播),此时 boot_pipeline 早已过等待期,前端信号成为导航入口。
+    ///   双重竞态防护:前端单发信号(useBootExit once-only)+ 无等待者时
+    ///   try_send 失败才走直接导航——正常路径永不双导航。
+    fn request_navigate(&self) {
+        if self.phase() != Phase::Ready {
+            return;
+        }
+        let sent = self
+            .navigate_tx
+            .lock()
+            .map(|g| g.as_ref().is_some_and(|tx| tx.try_send(()).is_ok()))
+            .unwrap_or(false);
+        if sent {
+            return;
+        }
+        if let Some(url) = dsh_url(self) {
+            if dsh_is_running(self) {
+                log::info!("[dsh] navigate_to_dsh: boot 已过等待期,直接导航 → {url}");
+                let _ = navigate_main_window(&self.app, &url);
+            }
+        }
     }
 
     /// 安装进度事件:推 `boot-state` { phase: Installing, progress, stage, elapsed }。
@@ -1337,11 +1392,18 @@ fn boot_pipeline(manager: &DshManager) {
     };
     log::info!("[dsh] boot: ready on port {port}");
 
-    // 6. 就绪:记录 dsh URL(升级卡片「稍后/返回」导航目标,#3 §7)→ 导航窗口
-    //    到 dsh Web UI,窗口自此变纯 dsh 页面(只做显示,不干扰功能)
+    // 6. 就绪:记录 dsh URL(升级卡片「稍后/返回」导航目标,#3 §7)
+    //    → 等前端退出动画完成信号(动画在 boot UI 侧播放,动画结束前端
+    //      invoke navigate_to_dsh;超时兜底照常导航——动画是纯装饰,前端
+    //      故障不阻塞 boot,#4)→ 导航窗口到 dsh Web UI
     manager.set_phase(Phase::Ready, None);
     let url = format!("http://127.0.0.1:{port}");
     manager.record_dsh_url(url.clone());
+    log::info!(
+        "[dsh] boot: ready, 等前端退出动画完成信号(≤{}ms)",
+        NAVIGATE_SIGNAL_TIMEOUT.as_millis()
+    );
+    manager.wait_navigate_signal_or_timeout(NAVIGATE_SIGNAL_TIMEOUT);
     log::info!("[dsh] boot: navigate → {url}");
     if !navigate_main_window(&manager.app, &url) {
         // 导航失败:dsh 仍在运行,先杀子进程再进错误态(否则重试会再起一个 dsh)
@@ -1435,6 +1497,15 @@ pub fn boot_start(manager: &DshManager) {
             m.set_error(BootError::Internal { message: msg });
         }
     });
+}
+
+/// 前端退出动画完成信号(#4):boot_pipeline 就绪后等待此信号再导航窗口到
+/// dsh 页——窗口 navigate 是 Rust 侧职责,前端只发「动画结束」信号。
+/// 幂等:phase 非 Ready / 无等待者时 no-op;StrictMode 双 invoke 无害。
+#[tauri::command]
+pub async fn navigate_to_dsh(state: tauri::State<'_, DshManager>) -> Result<(), String> {
+    state.inner().request_navigate();
+    Ok(())
 }
 
 /// 退出应用:杀子进程 + exit(0)。程序化退出先置 QUITTING 标志放行 CloseRequested。

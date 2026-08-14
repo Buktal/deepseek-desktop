@@ -149,3 +149,47 @@
 .animate-loading-slide {
   animation: loading-slide 1.4s ease-in-out infinite;
 }
+
+/* boot 就绪退出动画(#4):整屏溶解(淡出 + 微缩放)。
+   时长与 src/lib/bootExit.ts 的 BOOT_EXIT_ANIMATION_MS 一致(改动需同步)。
+   动画结束事件经 BootScreen root 上报,兜底定时器保证导航不依赖 CSS 事件 */
+@keyframes boot-exit {
+  0% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+}
+
+.boot-exit {
+  animation: boot-exit 400ms ease-out forwards;
+}
+
+/* 旋转圆环收缩收敛:就绪时缩到中心点消失(「加载完成」的视觉表达)。
+   缩放在外层 wrapper 上,内层自转动画独立,无 transform 冲突 */
+@keyframes boot-exit-ring {
+  0% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(0);
+    opacity: 0;
+  }
+}
+
+.boot-exit-ring {
+  animation: boot-exit-ring 400ms cubic-bezier(0.45, 0, 0.6, 1) forwards;
+}
+
+/* reduced-motion:不播放退出动画(CSS 动画事件随之不触发,兜底定时器
+   到点照常发信号 → 仍按动画时长后导航,视觉过渡被省略) */
+@media (prefers-reduced-motion: reduce) {
+  .boot-exit,
+  .boot-exit-ring {
+    animation: none;
+  }
+}
