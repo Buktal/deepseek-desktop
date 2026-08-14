@@ -373,19 +373,11 @@ fn navigate_webview(app: &AppHandle, url: &str) {
     let _ = dsh::navigate_main_window(app, url);
 }
 
-/// 导航窗口回外壳本地页(生产 Windows 为 `http://tauri.localhost`,dev 为 devUrl;
+/// 导航窗口回外壳本地页(dev 为 devUrl,prod 为 `http://tauri.localhost`;
 /// #3 §5 的导航函数)。托盘动态菜单项与手动检查对话框「升级」共用。
+/// URL 单一事实来源在 navigation::shell_page_url(#15 导航拦截判定同源共用)。
 pub fn navigate_to_shell(app: &AppHandle) {
-    let url = if cfg!(debug_assertions) {
-        app.config()
-            .build
-            .dev_url
-            .clone()
-            .map(|u| u.to_string())
-            .unwrap_or_else(|| "http://localhost:1420".into())
-    } else {
-        "http://tauri.localhost".into()
-    };
+    let url = crate::navigation::shell_page_url(app);
     log::info!("[update] 导航回外壳本地页: {url}");
     navigate_webview(app, &url);
 }

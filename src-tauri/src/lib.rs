@@ -7,6 +7,7 @@ mod autostart;
 mod dsh;
 mod locales;
 mod logging;
+mod navigation;
 mod theme;
 mod tray;
 mod update;
@@ -68,15 +69,21 @@ pub fn run() {
             // 须在 setup_tray 之前:托盘勾选状态读 autostart::current()
             autostart::init(app.handle());
 
+            // dsh 管理器(Clone 共享内部 Arc 状态)。先 manage:主窗口导航
+            // 回调经 try_state 读 dsh URL(#15),顺序无硬依赖,放这里语义就近
+            let manager = dsh::DshManager::new(app.handle().clone());
+            app.manage(manager.clone());
+
+            // 主窗口:config `create: false`(#15),此处用 builder 创建并挂
+            // 导航拦截(on_navigation / on_new_window 只存在于 builder,
+            // 见 navigation.rs:外部链接交系统浏览器、只放行 dsh/壳本地页)
+            navigation::create_main_window(app.handle())?;
+
             // 窗口恢复后几何钳制:restore 的保存值可能小于 minWidth/minHeight
             // (插件 set_size 是编程 resize,OS 不强制 min 约束),此处保证实际
             // 尺寸不小于 config 的最小值。双保险:同步检查 + Resized 监听,
             // 覆盖插件 restore 在 setup 前后两种完成时序。
             enforce_min_window_size(app.handle());
-
-            // dsh 管理器(Clone 共享内部 Arc 状态)
-            let manager = dsh::DshManager::new(app.handle().clone());
-            app.manage(manager.clone());
 
             // 应用升级管理器 + 常驻检查(启动探测 + 6h 轮询,#9:检查逻辑在 Rust 侧)
             let updater = update::UpdateManager::new(app.handle().clone());

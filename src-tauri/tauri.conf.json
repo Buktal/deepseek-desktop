@@ -14,6 +14,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "DeepSeek Desktop",
         "width": 920,
         "height": 680,
