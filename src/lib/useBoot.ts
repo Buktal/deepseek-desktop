@@ -21,6 +21,8 @@ export interface BootStateView {
   progress?: number | null
   /** 安装子阶段键后缀("fetching"|"reifying"|"finishing") */
   stage?: string | null
+  /** Node 检测结果,仅 checking 阶段携带(启动页「检测到 Node.js vX」) */
+  nodeVersion?: string | null
   /** 从流水线启动起的累计秒数(耗时显示起点 = Rust 真实启动时刻) */
   elapsedSecs?: number | null
 }
@@ -39,6 +41,8 @@ export function useBoot() {
   // 跨边界保持结构化形态,ErrorScreen 渲染时才翻译(语言切换不冻结旧文案)
   const [error, setError] = useState<StructuredError | null>(null)
   const [logs, setLogs] = useState<BootLog[]>([])
+  // Node 检测结果:仅 checking 阶段有值(Rust 侧离开 checking 清空)
+  const [nodeVersion, setNodeVersion] = useState<string | null>(null)
   // 安装进度与子阶段:仅 installing 阶段有值;100 = npm 退出校准
   const [progress, setProgress] = useState<number | null>(null)
   const [stage, setStage] = useState<string | null>(null)
@@ -68,6 +72,8 @@ export function useBoot() {
       setProgress(null)
       setStage(null)
     }
+    // node 检测结果仅 checking 携带;其余阶段事件不带字段 → 清空
+    setNodeVersion(v.nodeVersion ?? null)
     if (v.elapsedSecs != null) {
       setElapsedSecs(v.elapsedSecs)
       elapsedAnchor.current = { baseSecs: v.elapsedSecs, atMs: Date.now() }
@@ -153,6 +159,7 @@ export function useBoot() {
     logs,
     progress,
     stage,
+    nodeVersion,
     elapsedSecs: displayElapsedSecs,
     retry,
     quit,

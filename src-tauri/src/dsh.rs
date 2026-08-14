@@ -138,7 +138,8 @@ pub(crate) enum InstallStage {
 }
 
 /// boot-state 事件/命令返回:只含阶段与进度,不含日志(减重,高频推送不影响渲染)。
-/// 进度字段仅 installing 阶段携带(progress/stage);elapsed_secs 从流水线启动起
+/// 进度字段仅 installing 阶段携带(progress/stage);node_version 仅 checking 阶段
+/// 携带(检测结果可视化,见 set_node_version);elapsed_secs 从流水线启动起
 /// 累计,checking/installing/starting 全程可显示耗时(见 BootScreen)。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -146,6 +147,9 @@ pub struct BootStateView {
     pub phase: Phase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<BootError>,
+    /// Node 检测结果(仅 checking 阶段携带,启动页显示「检测到 Node.js vX」)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_version: Option<String>,
     /// 安装模拟进度 0-100(None = 非安装阶段;100 只能由 npm 进程退出校准)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<u8>,
@@ -165,6 +169,8 @@ pub struct BootStateSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<BootError>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage: Option<InstallStage>,
@@ -178,11 +184,16 @@ pub struct BootStateSnapshot {
 /// 前端经 toStructuredError 归约、渲染时按 `errors.<kind>` 键翻译
 /// (见 src/lib/error.ts 与 src/locales/*.json)——错误串不在此处拼装,
 /// 数据只携带运行时事实(超时秒数/退出码/版本/stderr 原文),文案模板在 locale JSON。
+///
+/// NodeMissing/NodeVersionUnmet 两个 kind 走 Node 引导页(展示要求 + 当前检测结果
+/// + 官网下载/重试,见前端 isNodeGuideError);其余错误留通用错误页。
+/// 版本规格(required)只由本文件 NODE_REQ 持有,随错误数据传给前端渲染——
+/// 前端不复制规格文本,避免 zh/en 与 Rust 三处维护同一串。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "data", rename_all = "PascalCase", rename_all_fields = "camelCase")]
 pub enum BootError {
-    /// 未检测到 Node.js
-    NodeMissing,
+    /// 未检测到 Node.js(带版本要求,供引导页展示)
+    NodeMissing { required: String },
     /// `node --version` 检查超时
     NodeCheckTimeout { seconds: u64 },
     /// `node --version` 进程 IO 失败
@@ -239,6 +250,9 @@ struct BootState {
     phase: Phase,
     error: Option<BootError>,
     logs: VecDeque<LogLine>,
+    /// Node 检测结果(仅 checking 阶段携带;set_node_version 写入并推事件,
+    /// 离开 checking 阶段清空——检测结果是 checking 阶段的呈现,不留到下一阶段)
+    node_version: Option<String>,
     /// 安装模拟进度与子阶段(installing 期间由 emit_install_progress 维护,
     /// 快照挂载/重试时同步给前端;离开 installing 阶段清空)
     progress: Option<u8>,
@@ -267,6 +281,7 @@ impl DshManager {
                 phase: Phase::Idle,
                 error: None,
                 logs: VecDeque::new(),
+                node_version: None,
                 progress: None,
                 stage: None,
             })),
@@ -309,6 +324,7 @@ impl DshManager {
         BootStateSnapshot {
             phase: s.phase,
             error: s.error.clone(),
+            node_version: s.node_version.clone(),
             progress,
             stage,
             elapsed_secs: self.boot_elapsed_secs(),
@@ -320,6 +336,7 @@ impl DshManager {
     /// emit_to("main"):只投递主窗口 webview,不广播给其它窗口。
     /// 事件同时带 elapsed_secs(从流水线启动起累计)——前端据此显示全程耗时。
     fn set_phase(&self, phase: Phase, error: Option<BootError>) {
+        let mut node_version = None;
         if let Ok(mut s) = self.state.lock() {
             // 新一次 boot 的语义边界:进入 Checking 时清空上一轮的日志缓冲
             if phase == Phase::Checking {
@@ -332,6 +349,12 @@ impl DshManager {
                 s.progress = None;
                 s.stage = None;
             }
+            // 离开 checking:node 检测结果不再有意义,清空防快照残留
+            // (检测结果是 checking 阶段的呈现,set_node_version 在阶段内写入)
+            if phase != Phase::Checking {
+                s.node_version = None;
+            }
+            node_version = s.node_version.clone();
         }
         match &error {
             Some(e) => log::error!("[dsh] phase → {phase:?}: {e:?}"),
@@ -350,6 +373,28 @@ impl DshManager {
             .emit_to("main", "boot-state", BootStateView {
                 phase,
                 error,
+                node_version,
+                progress: None,
+                stage: None,
+                elapsed_secs: self.boot_elapsed_secs(),
+            });
+    }
+
+    /// 写入 Node 检测结果并推送 checking 阶段事件(前端启动页显示
+    /// 「检测到 Node.js vX」,让用户看到检测在推进——checking 阶段检测后
+    /// 还要做 npm root -g 等检查,有可感知的展示窗口)。
+    /// 由 boot_pipeline 在 check_node 成功后调用;阶段仍在 Checking。
+    fn set_node_version(&self, ver: String) {
+        if let Ok(mut s) = self.state.lock() {
+            s.node_version = Some(ver.clone());
+        }
+        log::info!("[dsh] node 检测完成: {ver}");
+        let _ = self
+            .app
+            .emit_to("main", "boot-state", BootStateView {
+                phase: Phase::Checking,
+                error: None,
+                node_version: Some(ver),
                 progress: None,
                 stage: None,
                 elapsed_secs: self.boot_elapsed_secs(),
@@ -386,6 +431,7 @@ impl DshManager {
             .emit_to("main", "boot-state", BootStateView {
                 phase: Phase::Installing,
                 error: None,
+                node_version: None,
                 progress: Some(progress),
                 stage: Some(stage),
                 elapsed_secs: self.boot_elapsed_secs(),
@@ -661,7 +707,9 @@ fn check_node() -> Result<String, BootError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|_| BootError::NodeMissing)?;
+        .map_err(|_| BootError::NodeMissing {
+            required: NODE_REQ.to_string(),
+        })?;
     let out = match wait_with_timeout(&mut child, CHECK_NODE_TIMEOUT) {
         Ok(out) => out,
         Err(ChildWaitError::Timeout(_)) => {
@@ -1076,10 +1124,15 @@ fn boot_pipeline(manager: &DshManager) {
     // 1. 环境检查
     log::info!("[dsh] boot: checking node…");
     manager.set_phase(Phase::Checking, None);
-    if let Err(e) = check_node() {
-        manager.set_error(e);
-        return;
-    }
+    let node_version = match check_node() {
+        Ok(v) => v,
+        Err(e) => {
+            manager.set_error(e);
+            return;
+        }
+    };
+    // 检测结果可视化:checking 阶段推版本信息,启动页显示「检测到 Node.js vX」
+    manager.set_node_version(node_version);
 
     // 2. 全局 dsh 检测(完整性校验:bin.js 存在,不只版本号)
     //    「有则用」:全局已有 dsh(任意可用版本)直接用,不重装不强制升级
@@ -1335,6 +1388,20 @@ mod tests {
     }
 
     #[test]
+    fn check_node_version_handles_short_forms_and_whitespace() {
+        // 缺段容错(minor 缺省按 0):^22.19 边界在 minor 上,22.x 缺 minor 视为 22.0
+        assert!(matches!(
+            check_node_version("v22"),
+            Err(BootError::NodeVersionUnmet { .. })
+        ));
+        assert!(check_node_version("v22.19").is_ok()); // 22.19 无 patch
+        assert!(check_node_version("24").is_ok()); // >=24 无 minor
+        assert!(check_node_version("v24").is_ok());
+        // 首尾空白(检查输出 / 管道可能带换行,调用方先 trim 再进比较,单测守住边界)
+        assert!(check_node_version("  v22.22.2  ").is_ok());
+    }
+
+    #[test]
     fn tcp_wait_detects_open_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1565,8 +1632,11 @@ mod tests {
             serde_json::json!({ "kind": "DshExitedEarly", "data": { "exitCode": 1 } })
         );
         assert_eq!(
-            serde_json::to_value(BootError::NodeMissing).unwrap(),
-            serde_json::json!({ "kind": "NodeMissing" })
+            serde_json::to_value(BootError::NodeMissing {
+                required: NODE_REQ.to_string()
+            })
+            .unwrap(),
+            serde_json::json!({ "kind": "NodeMissing", "data": { "required": "Node.js ^22.19 or >=24" } })
         );
     }
 
@@ -1646,6 +1716,7 @@ mod tests {
         let view = BootStateView {
             phase: Phase::Checking,
             error: None,
+            node_version: None,
             progress: None,
             stage: None,
             elapsed_secs: Some(3),
@@ -1655,8 +1726,31 @@ mod tests {
             v,
             serde_json::json!({ "phase": "checking", "elapsedSecs": 3 })
         );
+        assert!(v.get("node_version").is_none());
         assert!(v.get("progress").is_none());
         assert!(v.get("stage").is_none());
+    }
+
+    #[test]
+    fn boot_state_view_serializes_node_version_in_checking() {
+        // 线上契约:checking 阶段检测完成携带 nodeVersion(前端「检测到 Node.js vX」);
+        // 其余阶段不携带(离开 checking 清空,见 set_phase)
+        let view = BootStateView {
+            phase: Phase::Checking,
+            error: None,
+            node_version: Some("v22.19.0".into()),
+            progress: None,
+            stage: None,
+            elapsed_secs: Some(1),
+        };
+        assert_eq!(
+            serde_json::to_value(&view).unwrap(),
+            serde_json::json!({
+                "phase": "checking",
+                "nodeVersion": "v22.19.0",
+                "elapsedSecs": 1
+            })
+        );
     }
 
     #[test]
@@ -1665,6 +1759,7 @@ mod tests {
         let view = BootStateView {
             phase: Phase::Installing,
             error: None,
+            node_version: None,
             progress: Some(62),
             stage: Some(InstallStage::Reifying),
             elapsed_secs: Some(35),

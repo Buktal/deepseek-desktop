@@ -4,6 +4,9 @@
 // #7:installing 显示确定进度(模拟 + npm 退出校准,InstallProgress 组件);
 // 其余阶段不确定进度条(滑动指示,不显示假百分比);全程显示耗时
 // (boot.elapsed.* 键,秒级累计,checking/installing/starting 持续可见)
+// #13:checking 阶段携带 nodeVersion 时显示检测结果(「检测到 Node.js vX」),
+// 让用户看到检测在推进(checking 还要做 npm root -g 等检查,有展示窗口)
+import { Check } from "lucide-react"
 import { useTranslation } from "react-i18next"
 
 import { InstallProgress } from "@/components/install/InstallProgress"
@@ -15,6 +18,7 @@ export function BootScreen({
   phase,
   progress,
   stage,
+  nodeVersion,
   elapsedSecs,
 }: {
   phase: BootPhase
@@ -22,6 +26,8 @@ export function BootScreen({
   progress: number | null
   /** 安装子阶段键后缀("fetching"|"reifying"|"finishing") */
   stage: string | null
+  /** Node 检测结果,仅 checking 阶段有值(null = 检测中/非 checking 阶段) */
+  nodeVersion: string | null
   /** 从 boot 启动起的累计秒数(null = 快照未到,尚无起点) */
   elapsedSecs: number | null
 }) {
@@ -49,6 +55,13 @@ export function BootScreen({
       <div className="text-center">
         <h1 className="text-lg font-medium">{t(`boot.${phase}.title`)}</h1>
         {hint && <p className="mt-1 text-sm text-muted-foreground">{hint}</p>}
+        {/* #13:checking 阶段检测结果可视化(nodeVersion 仅此时有值) */}
+        {phase === "checking" && nodeVersion && (
+          <p className="mt-1 flex items-center justify-center gap-1 text-sm text-emerald-600">
+            <Check className="size-4" aria-hidden />
+            {t("boot.checking.nodeFound", { version: nodeVersion })}
+          </p>
+        )}
       </div>
 
       {installing ? (

@@ -65,3 +65,22 @@ export function describeError(e: unknown, t: TFunction): string {
   const s = toStructuredError(e)
   return s ? localizeStructuredError(s, t) : ""
 }
+
+/** Node 引导页错误形态:NodeMissing / NodeVersionUnmet 的 app 子集
+ * (kind 判别 + data 载荷,渲染时经 guide.* 键翻译)。 */
+export type NodeGuideError = {
+  kind: "app"
+  type: "NodeMissing" | "NodeVersionUnmet"
+  data?: Record<string, unknown>
+}
+
+/** Node 引导页判定:NodeMissing / NodeVersionUnmet 属于「缺 Node / 版本不符」,
+ *  由 NodeGuideScreen 引导(展示版本要求 + 当前检测结果 + 官网下载/重试);
+ *  其余错误留通用错误页。纯函数、类型守卫,可测——判别与渲染分离。 */
+export function isNodeGuideError(s: StructuredError | null): s is NodeGuideError {
+  return (
+    s !== null &&
+    s.kind === "app" &&
+    (s.type === "NodeMissing" || s.type === "NodeVersionUnmet")
+  )
+}

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 
 import {
   describeError,
+  isNodeGuideError,
   localizeStructuredError,
   rawErrorMessage,
   toStructuredError,
@@ -114,5 +115,41 @@ describe("describeError", () => {
     expect(describeError(null, t)).toBe("")
     expect(describeError({}, t)).toBe("")
     expect(describeError(42, t)).toBe("")
+  })
+})
+
+describe("isNodeGuideError", () => {
+  it("routes NodeMissing / NodeVersionUnmet to the Node guide page", () => {
+    expect(
+      isNodeGuideError({
+        kind: "app",
+        type: "NodeMissing",
+        data: { required: "Node.js ^22.19 or >=24" },
+      }),
+    ).toBe(true)
+    expect(
+      isNodeGuideError({
+        kind: "app",
+        type: "NodeVersionUnmet",
+        data: { current: "v22.18.0", required: "Node.js ^22.19 or >=24" },
+      }),
+    ).toBe(true)
+  })
+
+  it("leaves other errors on the generic error page", () => {
+    // 其余 Node 检查类错误(超时/退出码/解析失败)不是「缺失/版本不符」,不引导
+    expect(
+      isNodeGuideError({ kind: "app", type: "NodeCheckTimeout", data: { seconds: 10 } }),
+    ).toBe(false)
+    expect(
+      isNodeGuideError({
+        kind: "app",
+        type: "NodeVersionParseFailed",
+        data: { version: "garbage" },
+      }),
+    ).toBe(false)
+    // 非 app 形态与空值
+    expect(isNodeGuideError({ kind: "raw", message: "boom" })).toBe(false)
+    expect(isNodeGuideError(null)).toBe(false)
   })
 })

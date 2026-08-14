@@ -12,8 +12,18 @@ import { useThemeSync } from "@/lib/useThemeSync"
 import { isActiveUpdateStatus, useUpdateCheck } from "@/lib/useUpdateCheck"
 
 export default function App() {
-  const { phase, error, logs, progress, stage, elapsedSecs, retry, quit, mountSnapshotReady } =
-    useBoot()
+  const {
+    phase,
+    error,
+    logs,
+    progress,
+    stage,
+    nodeVersion,
+    elapsedSecs,
+    retry,
+    quit,
+    mountSnapshotReady,
+  } = useBoot()
   // 主题同步:Rust 下发生效主题 → <html>.dark(boot UI 全程生效)
   useThemeSync()
   // 升级状态镜像(Rust 侧单一事实源,见 useUpdateCheck)
@@ -49,6 +59,7 @@ export default function App() {
       phase={phase}
       progress={progress}
       stage={stage}
+      nodeVersion={nodeVersion}
       elapsedSecs={elapsedSecs}
     />
   )
