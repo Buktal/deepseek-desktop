@@ -35,3 +35,9 @@ DeepSeek Desktop 是 [DeepSeek dsh](https://www.npmjs.com/package/@deepseek-ai/d
   ```bash
   npm uninstall -g @deepseek-ai/dsh
   ```
+
+## 许可证
+
+[MIT](./LICENSE) © cc one Contributors
+
+[![LINUX DO](https://img.shields.io/badge/LINUX%20DO-%E7%A4%BE%E5%8C%BA%E8%AE%A4%E5%8F%AF-blue?style=flat-square&logo=linux)](https://linux.do)
