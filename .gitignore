@@ -37,6 +37,7 @@ docs/agents/
 docs/prototype
 docs/research
 CLAUDE.md
+CONTEXT.md
 
 # Vite cache
 .vite/
