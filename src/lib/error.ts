@@ -17,20 +17,39 @@ export type StructuredError =
   | { kind: "raw"; message: string }
 
 /** Rust `BootError` 的结构化守卫(`{ kind: string, data?: object }`,
- *  unit 变体无 data 字段——serde tag/content 序列化形态)。 */
+ *  unit 变体无 data 字段——serde tag/content 序列化形态)。
+ *  注意 `kind` 只匹配 Rust 判别式(Rust kind 恒为 PascalCase,如 NodeMissing);
+ *  `"app"` 是 StructuredError 自己的形态标记,不在此列。 */
 function isBootError(e: unknown): e is { kind: string; data?: Record<string, unknown> } {
   if (typeof e !== "object" || e === null) return false
   const rec = e as Record<string, unknown>
+  if (rec.kind === "app") return false // 已归约形态,见 isStructuredApp
   if (typeof rec.kind !== "string") return false
   return rec.data === undefined || (typeof rec.data === "object" && rec.data !== null)
+}
+
+/** 已归约的 `app` 形态守卫(`{ kind: "app", type: string }`——渲染路径的存储形态)。 */
+function isStructuredApp(
+  e: unknown,
+): e is { kind: "app"; type: string; data?: Record<string, unknown> } {
+  if (typeof e !== "object" || e === null) return false
+  const rec = e as Record<string, unknown>
+  return (
+    rec.kind === "app" &&
+    typeof rec.type === "string" &&
+    (rec.data === undefined || (typeof rec.data === "object" && rec.data !== null))
+  )
 }
 
 /**
  * 把任意错误归约为结构化形态——纯函数,不含翻译。`app` 形态保留判别式,
  * 供 `localizeStructuredError` 在语言切换后重译;其余形态坍缩为 raw 原串。
  * 无法识别时返回 null(调用方组合自己的兜底)。
+ * 幂等:已归约的 `app` 形态直接透传(否则 ErrorScreen 渲染路径二次归约会把
+ * type 弄坏,所有 Rust 错误都渲染成 errors.unknown)。
  */
 export function toStructuredError(e: unknown): StructuredError | null {
+  if (isStructuredApp(e)) return { kind: "app", type: e.type, data: e.data }
   if (isBootError(e)) return { kind: "app", type: e.kind, data: e.data }
   const message = rawErrorMessage(e)
   return message ? { kind: "raw", message } : null

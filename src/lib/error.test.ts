@@ -31,6 +31,19 @@ describe("toStructuredError", () => {
     })
   })
 
+  it("is idempotent for the already-reduced app shape (render path)", () => {
+    // 渲染路径(ErrorScreen):存储形态是 app,渲染时经 describeError 再次归约——
+    // 二次归约不得把 type 弄坏(kind="app" 是前端标记,不是 Rust kind)
+    const s = toStructuredError({
+      kind: "NodeCheckTimeout",
+      data: { seconds: 10 },
+    })
+    expect(toStructuredError(s)).toEqual(s)
+    expect(
+      toStructuredError({ kind: "app", type: "NodeMissing", data: { required: "x" } }),
+    ).toEqual({ kind: "app", type: "NodeMissing", data: { required: "x" } })
+  })
+
   it("collapses a thrown Error to its raw message", () => {
     expect(toStructuredError(new Error("boom"))).toEqual({
       kind: "raw",
@@ -101,6 +114,17 @@ describe("describeError", () => {
       describeError({ kind: "NodeCheckTimeout", data: { seconds: 10 } }, t),
     ).toBe('errors.NodeCheckTimeout:{"seconds":10}')
     expect(describeError({ kind: "NodeMissing" }, t)).toBe("errors.NodeMissing")
+  })
+
+  it("maps an already-reduced app shape (ErrorScreen render path)", () => {
+    // useBoot 存储的是 app 形态,ErrorScreen 渲染时 describeError 再次归约——
+    // 必须翻译到 errors.<type> 而不是被二次归约弄坏成 errors.app / errors.unknown
+    expect(
+      describeError(
+        { kind: "app", type: "NodeCheckTimeout", data: { seconds: 10 } },
+        t,
+      ),
+    ).toBe('errors.NodeCheckTimeout:{"seconds":10}')
   })
 
   it("extracts the message from a thrown Error (non-API path)", () => {
