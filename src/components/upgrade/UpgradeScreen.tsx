@@ -1,6 +1,8 @@
-// dsh 升级卡片(#17,#3 §1 定稿形态):全屏卡片,外壳本地页上展示。
+// dsh 升级卡片(#17,#3 §1 定稿形态):全屏本地页上的升级卡片,外壳窗口内展示。
 // 形态与应用升级卡同款:不用 Popover(本外壳无常驻可锚定页面),不用模态弹窗
 // (升级流程含分钟级安装进度,卡片提供「稍后」,不强制决策)。
+// 视觉(#20 审核定稿):决策面 = 收容卡片(bg-card + border),与 boot 流程的
+// 开放画布区分——升级是用户可执行的动作面板,不是状态仪表。
 //
 // 状态机由 Rust 侧持有(upgrade.rs 单一事实源),本组件只按 upgrade-state
 // 快照/事件渲染:
@@ -18,18 +20,10 @@ import { CircleArrowUp, Loader2, RotateCw } from "lucide-react"
 import { useTranslation } from "react-i18next"
 
 import { InstallProgress } from "@/components/install/InstallProgress"
+import { ProgressRail } from "@/components/shell/ProgressRail"
 import { Button } from "@/components/ui/button"
 import { localizeStructuredError, type StructuredError } from "@/lib/error"
 import type { DshUpgradePhase, DshUpgradeStatus } from "@/lib/useDshUpgrade"
-
-/** 不确定进度条(滑动指示):killing/verifying 阶段与 ready 过渡用。 */
-function IndeterminateBar() {
-  return (
-    <div className="h-1.5 w-72 overflow-hidden rounded-full bg-muted" role="progressbar">
-      <div className="h-full w-1/3 animate-loading-slide rounded-full bg-indigo-500" />
-    </div>
-  )
-}
 
 export function UpgradeScreen({
   status,
@@ -63,8 +57,8 @@ export function UpgradeScreen({
       : null
 
   return (
-    <main className="flex h-screen w-screen flex-col items-center justify-center gap-7 bg-background text-foreground">
-      <div className="flex w-full max-w-md flex-col items-center gap-4 text-center">
+    <main className="flex h-screen w-screen items-center justify-center bg-background p-10 text-foreground">
+      <div className="flex w-full max-w-md flex-col items-center gap-5 rounded-2xl border border-border bg-card p-10 text-center shadow-sm">
         {status === "available" && (
           <>
             <CircleArrowUp className="size-9 text-primary" />
@@ -76,7 +70,7 @@ export function UpgradeScreen({
             <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
               {t("upgrade.available.impact")}
             </p>
-            <div className="flex items-center gap-3 pt-1">
+            <div className="flex items-center gap-3">
               <Button size="lg" onClick={onConfirm}>
                 <CircleArrowUp />
                 {t("upgrade.now")}
@@ -99,7 +93,7 @@ export function UpgradeScreen({
             {phase === "installing" && progress !== null ? (
               <InstallProgress progress={progress} stage={stage} i18nPrefix="upgrade" />
             ) : (
-              <IndeterminateBar />
+              <ProgressRail value={null} />
             )}
           </>
         )}
@@ -109,7 +103,7 @@ export function UpgradeScreen({
             <Loader2 className="size-9 animate-spin text-primary" />
             {/* 瞬态:Rust 随即导航回 dsh 页(新端口 URL);复用 boot 的过渡文案 */}
             <h1 className="text-lg font-medium">{t("boot.ready.title")}</h1>
-            <IndeterminateBar />
+            <ProgressRail value={null} />
           </>
         )}
 
@@ -126,7 +120,7 @@ export function UpgradeScreen({
             <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
               {t("upgrade.failed.keepOld")}
             </p>
-            <div className="flex items-center gap-3 pt-1">
+            <div className="flex items-center gap-3">
               <Button size="lg" onClick={onConfirm}>
                 <RotateCw />
                 {t("common.retry")}

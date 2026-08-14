@@ -1,8 +1,10 @@
-// 应用自身升级卡片(#5):全屏卡片,外壳本地页上展示。
+// 应用自身升级卡片(#5):全屏本地页上的升级卡片,外壳窗口内展示。
 // 形态定稿(#3 §1):升级主交互 = 外壳本地页上的全屏升级卡片,不用 Popover——
 // 本外壳窗口没有可锚定 Popover 的常驻页面(窗口几乎总在 dsh 页,由 Rust 导航
 // 回本地页呈现);不用模态弹窗——升级流程含分钟级安装进度,卡片提供「稍后」,
 // 不强制决策。
+// 视觉(#20 审核定稿):决策面 = 收容卡片(bg-card + border),与 boot 流程的
+// 开放画布区分——升级是用户可执行的动作面板,不是状态仪表。
 //
 // 状态机(available/downloading/ready/failed)由 Rust 侧持有(update.rs 单一
 // 事实源),本组件只按 `update-state` 快照/事件渲染对应卡片体;错误经
@@ -18,10 +20,10 @@ import {
 } from "lucide-react"
 import { useTranslation } from "react-i18next"
 
+import { ProgressRail } from "@/components/shell/ProgressRail"
 import { Button } from "@/components/ui/button"
 import { localizeStructuredError, type StructuredError } from "@/lib/error"
 import { updatePercent, type UpdateStatus } from "@/lib/useUpdateCheck"
-import { cn } from "@/lib/utils"
 
 const NOTES_PREVIEW_LINES = 5
 
@@ -43,18 +45,7 @@ function DownloadingBody({
       <p className="text-sm text-muted-foreground">
         {pct !== null ? t("update.downloaded", { pct }) : t("update.pleaseWait")}
       </p>
-      <div
-        className="h-1.5 w-72 overflow-hidden rounded-full bg-muted"
-        role="progressbar"
-      >
-        <div
-          className={cn(
-            "h-full rounded-full bg-indigo-500",
-            pct === null && "w-1/3 animate-loading-slide",
-          )}
-          style={pct !== null ? { width: `${pct}%` } : undefined}
-        />
-      </div>
+      <ProgressRail value={pct} />
     </>
   )
 }
@@ -104,11 +95,11 @@ export function UpgradeCard({
   const { t } = useTranslation()
 
   return (
-    <main className="flex h-screen w-screen flex-col items-center justify-center gap-7 bg-background text-foreground">
-      <div className="flex w-full max-w-md flex-col items-center gap-4 text-center">
+    <main className="flex h-screen w-screen items-center justify-center bg-background p-10 text-foreground">
+      <div className="flex w-full max-w-md flex-col items-center gap-5 rounded-2xl border border-border bg-card p-10 text-center shadow-sm">
         {status === "available" && (
           <>
-            <CircleArrowUp className="text-primary size-9" />
+            <CircleArrowUp className="size-9 text-primary" />
             <h1 className="text-lg font-medium">
               {t("update.available.found", { version })}
             </h1>
@@ -122,7 +113,7 @@ export function UpgradeCard({
                 {summarizeNotes(notes)}
               </p>
             ) : null}
-            <div className="flex items-center gap-3 pt-1">
+            <div className="flex items-center gap-3">
               <Button size="lg" onClick={onApply}>
                 <CircleArrowUp />
                 {t("update.updateNow")}
@@ -144,13 +135,13 @@ export function UpgradeCard({
 
         {status === "ready" && (
           <>
-            <PartyPopper className="text-primary size-9" />
+            <PartyPopper className="size-9 text-primary" />
             <h1 className="text-lg font-medium">{t("update.ready")}</h1>
             {/* 中断影响明示(#3 §4):重启按钮即授权点,文案必须说清语义 */}
             <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
               {t("update.restartToInstall")}
             </p>
-            <div className="flex items-center gap-3 pt-1">
+            <div className="flex items-center gap-3">
               <Button size="lg" onClick={onRestart}>
                 <RotateCw />
                 {t("update.restartNow")}
@@ -174,7 +165,7 @@ export function UpgradeCard({
             <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
               {t("update.manualHint")}
             </p>
-            <div className="flex items-center gap-3 pt-1">
+            <div className="flex items-center gap-3">
               <Button variant="outline" size="lg" onClick={onOpenReleases}>
                 <ExternalLink />
                 {t("update.openGithub")}

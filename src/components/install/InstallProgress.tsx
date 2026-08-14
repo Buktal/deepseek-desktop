@@ -4,11 +4,11 @@
 // 数据来自 Rust 侧 boot-state 事件的 progress/stage 字段:模拟推进 + npm 进程
 // 退出校准 100%(Rust 侧语义,本组件只做纯展示,不做任何业务判断)。
 // 文案键:${i18nPrefix}.installing.stage.<stage> / ${i18nPrefix}.installing.progress,
-// 动态数值一律插值(#12 约束)。
+// 动态数值一律插值(#12 约束)。进度条本体走 ProgressRail(唯一实现)。
 
 import { useTranslation } from "react-i18next"
 
-import { Progress } from "@/components/ui/progress"
+import { ProgressRail } from "@/components/shell/ProgressRail"
 
 export function InstallProgress({
   progress,
@@ -27,7 +27,7 @@ export function InstallProgress({
     ? t(`${i18nPrefix}.installing.stage.${stage}`, { defaultValue: "" })
     : ""
   return (
-    <div className="flex w-72 flex-col gap-2">
+    <div className="flex w-full flex-col gap-2">
       <div className="flex items-baseline justify-between text-sm">
         <span className="text-muted-foreground">{stageText}</span>
         {/* 百分比符号是语言中立符号,随 #12 惯例进模板键(见 update.downloaded) */}
@@ -35,12 +35,7 @@ export function InstallProgress({
           {t(`${i18nPrefix}.installing.progress`, { pct: progress })}
         </span>
       </div>
-      {/* shadcn Progress(value 驱动宽度 + aria-valuenow;Base UI 自动带进度语义) */}
-      <Progress
-        value={progress}
-        aria-label={stageText || undefined}
-        className="h-1.5 w-full [&>[data-slot='progress-track']]:h-full [&>[data-slot='progress-track']]:rounded-full"
-      />
+      <ProgressRail value={progress} aria-label={stageText || undefined} />
     </div>
   )
 }

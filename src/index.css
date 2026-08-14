@@ -185,11 +185,14 @@
   animation: boot-exit-ring 400ms cubic-bezier(0.45, 0, 0.6, 1) forwards;
 }
 
-/* reduced-motion:不播放退出动画(CSS 动画事件随之不触发,兜底定时器
-   到点照常发信号 → 仍按动画时长后导航,视觉过渡被省略) */
+/* reduced-motion:不播放装饰性动画。退出动画不播(CSS 动画事件随之不触发,
+   兜底定时器到点照常发信号 → 仍按动画时长后导航,视觉过渡被省略);
+   圆环自转与滑动指示也停(阶段标题文本仍在,状态不丢失) */
 @media (prefers-reduced-motion: reduce) {
   .boot-exit,
-  .boot-exit-ring {
+  .boot-exit-ring,
+  .animate-spin,
+  .animate-loading-slide {
     animation: none;
   }
 }

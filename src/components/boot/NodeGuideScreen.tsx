@@ -1,6 +1,8 @@
 // Node 引导页(#13):node 缺失 / 版本不符时替代通用错误页。
 // 展示版本要求 + 当前检测结果(未安装 / 版本不符)+「前往 Node.js 官网下载」+
 // 重试/退出(复用错误页现有 retry/quit 结构,不另起炉灶)。
+// 按钮层级(#20 审核定稿):本页主任务是引导下载,下载 = primary;
+// 重试 = outline(装好 Node 后的第二个动作),退出 = ghost。
 // 判定:isNodeGuideError(仅 NodeMissing / NodeVersionUnmet 两个 kind 走这里,
 // 其余错误留 ErrorScreen 通用布局)——错误跨边界保持结构化形态,渲染时翻译。
 // 版本要求文本单一事实源在 Rust(NODE_REQ,经错误数据 required 携带),
@@ -38,13 +40,13 @@ export function NodeGuideScreen({
   }, [])
 
   return (
-    <main className="flex h-screen w-screen flex-col items-center justify-center gap-6 bg-background text-foreground">
-      <div className="max-w-md text-center">
+    <main className="flex h-screen w-screen flex-col items-center justify-center gap-8 bg-background text-foreground">
+      <div className="flex w-full max-w-md flex-col items-center gap-2.5 text-center">
         <h1 className="text-lg font-medium">{t("guide.title")}</h1>
-        <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+        <p className="text-sm leading-relaxed text-muted-foreground">
           {t("guide.requirement", { required })}
         </p>
-        <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+        <p className="text-sm leading-relaxed text-muted-foreground">
           {missing
             ? t("guide.current.missing")
             : t("guide.current.unmet", { current })}
@@ -57,7 +59,7 @@ export function NodeGuideScreen({
           {t("guide.download")}
         </Button>
         <div className="flex items-center gap-3">
-          <Button size="lg" onClick={retry}>
+          <Button variant="outline" size="lg" onClick={retry}>
             {t("common.retry")}
           </Button>
           <Button variant="ghost" size="lg" onClick={quit}>

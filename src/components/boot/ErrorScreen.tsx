@@ -1,4 +1,6 @@
-// 错误页:失败原因 + 最近日志 + 重试/退出(外壳界面不展示 Logo)
+// 错误页:失败原因 + 最近日志 + 重试/退出(外壳界面不展示 Logo)。
+// 视觉(#20 审核定稿):错误属于 boot 流程,保持开放画布(非升级卡的收容卡片),
+// 居中列 + 结构化信息层次;日志框与文案列同宽,stderr 暗色下用 red-400 保对比。
 // error 是未翻译的结构化失败原因(Rust BootError 或 raw 串),渲染时才翻译,
 // 语言切换后重新渲染会得到新语言的文案而不是冻结旧串。
 // #13:NodeMissing / NodeVersionUnmet 两个 kind 走 Node 引导页(NodeGuideScreen,
@@ -32,21 +34,24 @@ export function ErrorScreen({
   const message = describeError(error, t) || t("errors.unknown")
   const tail = logs.slice(-5)
   return (
-    <main className="flex h-screen w-screen flex-col items-center justify-center gap-6 bg-background text-foreground">
-      <div className="max-w-md text-center">
+    <main className="flex h-screen w-screen flex-col items-center justify-center gap-8 bg-background text-foreground">
+      <div className="flex w-full max-w-md flex-col items-center gap-5 text-center">
         <h1 className="text-lg font-medium">{t("error.title")}</h1>
-        <p className="mt-1 text-sm leading-relaxed text-muted-foreground">{message}</p>
-      </div>
+        <p className="text-sm leading-relaxed text-muted-foreground">{message}</p>
 
-      {tail.length > 0 && (
-        <div className="max-h-24 w-80 overflow-y-auto rounded-lg bg-muted/50 p-3 font-mono text-xs leading-relaxed text-muted-foreground">
-          {tail.map((l, i) => (
-            <div key={i} className={cn("truncate", l.stream === "stderr" && "text-red-500")}>
-              {l.line}
-            </div>
-          ))}
-        </div>
-      )}
+        {tail.length > 0 && (
+          <div className="max-h-28 w-full overflow-y-auto rounded-xl border border-border bg-muted/60 p-3 text-left font-mono text-xs leading-relaxed text-muted-foreground">
+            {tail.map((l, i) => (
+              <div
+                key={i}
+                className={cn("truncate", l.stream === "stderr" && "text-red-500 dark:text-red-400")}
+              >
+                {l.line}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
 
       <div className="flex items-center gap-3">
         <Button size="lg" onClick={retry}>
