@@ -14,6 +14,11 @@
 //!   `theme-changed` 事件(payload "light"|"dark");跟随系统时 OS 主题变化
 //!   (`WindowEvent::ThemeChanged`,仅窗口主题为 None 时由 OS 触发)实时重推。
 //! - **原生窗口**:`set_theme` 让标题栏与页面同主题;"跟随系统"置 None 跟随 OS。
+//!   平台分治(ADR 0002 / #37):Windows(DWM 暗色)/macOS 生效;Linux 无操作
+//!   ——tao 的 SetTheme 请求处理为 `unreachable!()`,调用即主线程崩溃。
+//!   时机:窗口由 builder 在 setup 中创建(create: false,#15),原生主题应用
+//!   与 OS 主题监听在 create_main_window 之后经 `attach_main_window` 完成,
+//!   `init` 只负责读持久化进内存。
 //! - **事件契约(#9)**:托盘点击仍按 #9 契约推 `tray-theme`(选择串,见 tray.rs);
 //!   本模块的 `theme-changed`(生效主题)是前端实际消费的事件——选择串
 //!   "system" 对前端不可直接应用,解析在 Rust 侧单点完成,不重复 OS 检测。
@@ -121,7 +126,11 @@ fn save_choice(path: &Path, choice: ThemeChoice) -> std::io::Result<()> {
 }
 
 /// 启动初始化(setup 中调用,须在 setup_tray 之前——托盘勾选读内存):
-/// 读持久化 → 内存;窗口原生主题按选择应用;注册 OS 主题变化监听。
+/// 读持久化 → 内存。窗口原生主题应用与 OS 主题监听不在此处:主窗口
+/// `create: false`(#15)由 navigation.rs 在 setup 中 builder 创建,本调用点
+/// 窗口尚不存在;相关步骤在窗口创建后经 `attach_main_window` 完成
+/// (#37 修 #15 引入的时序回归——原代码在窗口存在前调用,原生主题从未
+/// 应用、ThemeChanged 监听从未注册)。
 pub fn init(app: &AppHandle) {
     if let Some(path) = config_path(app) {
         if let Some(choice) = load_choice(&path) {
@@ -129,22 +138,29 @@ pub fn init(app: &AppHandle) {
             log::info!("[theme] 从配置恢复主题选择: {:?}", choice);
         }
     }
+}
+
+/// 窗口创建后调用(lib.rs setup 中 create_main_window 之后,#37):
+/// 按当前选择应用窗口原生主题(启动恢复持久化选择的必要一步)
+/// + 注册 OS 主题变化监听。
+pub fn attach_main_window(app: &AppHandle) {
     apply_native(app, current_choice());
 
     // OS 主题变化监听。WindowEvent::ThemeChanged 仅在窗口主题为 None
     // (跟随系统)时由 OS 变化触发(tauri WindowEvent 文档);显式亮/暗模式下
     // set_theme 引发的同名单事件由 System 守卫忽略(选择未变,无需重推)。
-    if let Some(win) = app.get_webview_window("main") {
-        let app = app.clone();
-        win.on_window_event(move |event| {
-            if matches!(event, WindowEvent::ThemeChanged(_))
-                && current_choice() == ThemeChoice::System
-            {
-                log::info!("[theme] OS 主题变化 → 重推生效主题");
-                push_resolved(&app);
-            }
-        });
-    }
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+    let app = app.clone();
+    win.on_window_event(move |event| {
+        if matches!(event, WindowEvent::ThemeChanged(_))
+            && current_choice() == ThemeChoice::System
+        {
+            log::info!("[theme] OS 主题变化 → 重推生效主题");
+            push_resolved(&app);
+        }
+    });
 }
 
 /// 选择变更(唯一写入口:托盘菜单点击经 tray.rs 收敛到此;将来的设置入口同此)。
@@ -165,6 +181,8 @@ pub fn choose(app: &AppHandle, choice: ThemeChoice) {
 
 /// 窗口原生主题(标题栏):亮/暗显式指定,"跟随系统"置 None 跟随 OS
 /// (且只有 None 时 ThemeChanged 事件才会投递,恢复跟随语义的必要一步)。
+/// Windows:DWM 暗色模式(Win10 1809+);macOS:NSAppearance。
+#[cfg(not(target_os = "linux"))]
 fn apply_native(app: &AppHandle, choice: ThemeChoice) {
     let Some(win) = app.get_webview_window("main") else {
         return;
@@ -178,6 +196,12 @@ fn apply_native(app: &AppHandle, choice: ThemeChoice) {
         log::warn!("[theme] 设置窗口主题失败: {e}");
     }
 }
+
+/// Linux 无操作(ADR 0002「Linux 由 GTK 主题决定」)。不是可省略的优化:
+/// tao 的 Linux SetTheme 请求处理是 `unreachable!()`(tao 0.35 源码),
+/// 调用即主线程崩溃——#37 修 #8/#9 遗留的崩溃隐患,须完全不调用 set_theme。
+#[cfg(target_os = "linux")]
+fn apply_native(_app: &AppHandle, _choice: ThemeChoice) {}
 
 /// 当前生效主题:选择 × 窗口 OS 主题(tauri 2 theme API;窗口主题为 None
 /// 时返回 OS 主题,与 resolve 的 System 分支互补)。

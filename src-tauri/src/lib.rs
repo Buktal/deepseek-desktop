@@ -64,8 +64,11 @@ pub fn run() {
                 eprintln!("[logging] init 失败,日志仅输出到控制台: {e}");
             }
 
-            // 主题:读持久化 → 内存 + 注册 OS 主题变化监听。
-            // 须在 setup_tray 之前:托盘勾选状态读 theme::current_choice()
+            // 主题:读持久化 → 内存。须在 setup_tray 之前(托盘勾选状态读
+            // theme::current_choice());原生主题应用与 OS 主题监听在窗口创建
+            // 后经 attach_main_window 完成——主窗口 create: false,由
+            // navigation.rs 在 setup 中 builder 创建,此时尚不存在(#37 修
+            // #15 引入的时序回归)
             theme::init(app.handle());
 
             // 开机自启:直查 OS 启动项状态 → 内存(默认关闭)。
@@ -82,6 +85,10 @@ pub fn run() {
             // on_new_window 只存在于 builder;iframe 外链经注入脚本 postMessage
             // 回壳页,opener 开系统浏览器)
             navigation::create_main_window(app.handle())?;
+
+            // 主题:窗口创建后应用原生主题(启动恢复持久化选择)+ 注册 OS
+            // 主题变化监听(init 时窗口尚不存在,见上;#37)
+            theme::attach_main_window(app.handle());
 
             // 窗口恢复后几何钳制:restore 的保存值可能小于 minWidth/minHeight
             // (插件 set_size 是编程 resize,OS 不强制 min 约束),此处保证实际
