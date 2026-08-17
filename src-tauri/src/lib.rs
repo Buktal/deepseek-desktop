@@ -4,10 +4,12 @@
 //! + 生产日志 + 窗口状态记忆 + 开机自启。
 
 mod autostart;
+mod close;
 mod dsh;
 mod error;
 mod locales;
 mod logging;
+mod menu;
 mod navigation;
 mod npm;
 mod proc;
@@ -20,6 +22,8 @@ use tauri::{LogicalSize, Manager, PhysicalSize, WindowEvent};
 use tauri_plugin_dialog::{
     DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
 };
+
+use crate::close::CloseBehavior;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -75,6 +79,11 @@ pub fn run() {
             // 须在 setup_tray 之前:托盘勾选状态读 autostart::current()
             autostart::init(app.handle());
 
+            // 关闭行为:读持久化 → 内存(默认"每次询问")。
+            // 须在 setup_tray 之前:托盘勾选状态读 close::current();close
+            // handler 在窗口事件中读(close.rs,#38)
+            close::init(app.handle());
+
             // dsh 管理器(Clone 共享内部 Arc 状态)。先 manage:导航拦截
             // 回调经 try_state 读 dsh URL(#15),顺序无硬依赖,放这里语义就近
             let manager = dsh::DshManager::new(app.handle().clone());
@@ -127,7 +136,9 @@ pub fn run() {
             update::update_dismiss,
             upgrade::upgrade_state,
             upgrade::upgrade_confirm,
-            upgrade::upgrade_dismiss
+            upgrade::upgrade_dismiss,
+            tray::menu_snapshot,
+            tray::menu_action
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -162,14 +173,26 @@ fn setup_close_handler(app: &tauri::AppHandle, manager: dsh::DshManager) {
                 return;
             }
             api.prevent_close();
-            if !dsh::try_show_dialog() {
-                return;
-            }
+            // 关闭行为(#38):非 Ask 直接执行;Ask 期间暂维持原生三选弹窗
+            // (M4 换 UI,见 #31)。行为的内存事实源在 close.rs,菜单勾选同源。
+            match close::current() {
+                CloseBehavior::Quit => {
+                    dsh::set_quitting();
+                    dsh::kill_child(&manager);
+                    app.exit(0);
+                }
+                CloseBehavior::Minimize => {
+                    let _ = handler_win.hide();
+                }
+                CloseBehavior::Ask => {
+                    if !dsh::try_show_dialog() {
+                        return;
+                    }
 
-            let win = handler_win.clone();
-            let app = app.clone();
-            let manager = manager.clone();
-            app.dialog()
+                    let win = handler_win.clone();
+                    let app = app.clone();
+                    let manager = manager.clone();
+                    app.dialog()
                 .message(t.close_message)
                 .title("DeepSeek Desktop")
                 // Info:关闭确认不是错误/警告,图标用中性信息样式
@@ -193,6 +216,8 @@ fn setup_close_handler(app: &tauri::AppHandle, manager: dsh::DshManager) {
                         _ => {} // 取消:保持现状
                     }
                 });
+                }
+            }
         }
     });
 }

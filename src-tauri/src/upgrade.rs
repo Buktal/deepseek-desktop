@@ -345,6 +345,7 @@ impl UpgradeManager {
 
     /// 状态归约 + 下发(生产路径唯一入口,测试的 apply_event 即此处的归约)。
     fn reduce(&self, event: UpgradeEvent) {
+        let was_running = self.is_pipeline_running();
         let next = {
             let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
             let next = apply_event(&s, event);
@@ -353,6 +354,12 @@ impl UpgradeManager {
         };
         log::info!("[upgrade] state → {next:?}");
         let _ = self.app.emit_to("main", "upgrade-state", next);
+        // 流水线启停跨界时刷新菜单:「检查更新」disabled 随快照同步
+        // (Started 进入 Active 置灰,成功/失败离开 Active 恢复;#38;
+        // 成功路径的 set_dsh_update(None) 也会刷新一次,幂等无害)
+        if was_running != self.is_pipeline_running() {
+            tray::refresh_menu(&self.app);
+        }
     }
 
     /// 流水线在途(检查与手动入口的 no-op 守卫,#3 边界)。
