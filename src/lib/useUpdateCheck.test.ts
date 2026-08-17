@@ -1,24 +1,29 @@
-// 升级状态纯函数测试:App 路由守卫与下载百分比(App 挂载 → 升级卡片的分发条件,
-// 生产路径即 App.tsx / UpdateCard.tsx 的渲染路径)
+// 升级卡片可见性与下载百分比纯函数测试:浮层可见性规则(App.tsx 渲染路径,
+// 生产路径即 App.tsx / useUpdateCheck.ts 的渲染决策)
 import { describe, expect, it } from "vitest"
 
 import {
-  isActiveUpdateStatus,
+  isUpdateCardVisible,
   updatePercent,
   type UpdateStatus,
 } from "@/lib/useUpdateCheck"
 
-describe("isActiveUpdateStatus", () => {
-  it("treats the four card states as active", () => {
-    for (const s of ["available", "downloading", "ready", "failed"] as const) {
-      expect(isActiveUpdateStatus(s satisfies UpdateStatus)).toBe(true)
+describe("isUpdateCardVisible", () => {
+  it("always shows card while pipeline is active-ish", () => {
+    for (const s of ["downloading", "ready", "failed"] as const) {
+      expect(isUpdateCardVisible(s satisfies UpdateStatus, false)).toBe(true)
     }
   })
 
-  it("treats idle/checking/undefined as inactive", () => {
-    expect(isActiveUpdateStatus("idle")).toBe(false)
-    expect(isActiveUpdateStatus("checking")).toBe(false)
-    expect(isActiveUpdateStatus(undefined)).toBe(false)
+  it("shows available card only when explicitly requested", () => {
+    // 自动检测只亮托盘徽标,不弹卡片(#3 §1);托盘「升级到 vX」请求后才弹
+    expect(isUpdateCardVisible("available", false)).toBe(false)
+    expect(isUpdateCardVisible("available", true)).toBe(true)
+  })
+
+  it("treats idle/checking as invisible", () => {
+    expect(isUpdateCardVisible("idle", true)).toBe(false)
+    expect(isUpdateCardVisible("checking", true)).toBe(false)
   })
 })
 

@@ -1,19 +1,23 @@
 //! dsh(DeepSeek Harness)子进程管理与启动流水线。
 //!
 //! 生命周期:checking(环境检查)→ installing(npm 安装)→ starting(启动 dsh web)
-//! → ready(服务就绪,窗口导航到 dsh Web UI)。
+//! → ready(服务就绪,记录 URL 并推给壳页,dsh 在 iframe 内呈现)。
 //! 状态迁移经 `boot-state` 事件推给前端(只 emit 到 `main` 窗口);日志不推流,
 //! 只入环形缓冲(异常时附在错误页)。
 //!
-//! IPC 命令面(最小化,3 个):
-//! - `boot`(触发/重试流水线 + 返回含日志的当前状态快照;挂载时一调两用)
-//! - `navigate_to_dsh`(前端退出动画完成信号 #4;就绪后导航窗口到 dsh 页)
+//! IPC 命令面(最小化,2 个):
+//! - `boot`(触发/重试流水线 + 返回含日志与 dshUrl 的当前状态快照;挂载时一调两用)
 //! - `quit_app`(程序化退出:杀子进程 + exit)
 //!
+//! dsh URL 单一事实来源:`record_dsh_url`(boot 就绪 / 升级链就绪 /「稍后/返回」
+//! 重启 / 崩溃重试 4 个时点统一调用)在记录的同时推 `dsh-url` 事件给壳页,壳页
+//! set iframe.src——整窗导航退役(ADR 0001 / #29,#36)。
+//!
 //! 安全语义(tauri 2.11.5 源码确认):
-//! - 窗口 navigate 到 http://127.0.0.1:<port> 后,该页面是 remote origin:
-//!   ACL 按 capability(local-only)拒绝其调用任何命令/监听事件/使用窗口 API;
-//!   Tauri 的 app CSP 只注入资产协议提供的本地页面,dsh 页面的 CSP 归 dsh 服务器自身。
+//! - dsh 以跨源 iframe 嵌入壳页(http://127.0.0.1:<port> 是 remote origin):
+//!   ACL 按 capability(local-only)拒绝其调用任何命令/监听事件/使用窗口 API,
+//!   与整窗模式一致(零 remote capability,#29);Tauri 的 app CSP 只注入资产
+//!   协议提供的本地页面,dsh 页面的 CSP 归 dsh 服务器自身。
 //!
 //! 生产日志:本模块不直接 eprintln,统一走 `log` crate 宏(logging::init 落盘到
 //! `<temp>/deepseek-desktop/logs/app.log`,panic 经 hook 同落盘)。
@@ -61,11 +65,6 @@ const READY_PREFIX: &str = "dsh web: http://";
 const START_TIMEOUT: Duration = Duration::from_secs(180);
 /// 日志环形缓冲容量(仅供异常时附上下文,不推流)
 const LOG_CAP: usize = 200;
-/// 就绪后等待前端退出动画完成信号的超时(#4)。
-/// 前端退出动画时长 400ms + 余量;超时兜底照常导航——动画是纯装饰,不是
-/// 完成条件,前端 JS 故障 / 动画事件缺失(如 reduced-motion 下 animation: none)
-/// 不得阻塞 boot。
-const NAVIGATE_SIGNAL_TIMEOUT: Duration = Duration::from_millis(1500);
 
 // ── 全局守卫(跨线程)────────────────────────────────────────────────
 
@@ -159,7 +158,9 @@ pub struct BootStateView {
     pub elapsed_secs: Option<u64>,
 }
 
-/// `boot` 命令返回的状态快照:含最近日志与当前进度(挂载/重试一调两用)
+/// `boot` 命令返回的状态快照:含最近日志与当前进度(挂载/重试一调两用)。
+/// dshUrl 在就绪过时携带(壳页挂载晚于 boot 完成时,快照是 dsh URL 的唯一
+/// 来源——事件已错过,见 useBoot 的同步骨架与就绪缺 URL 兜底)。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootStateSnapshot {
@@ -175,6 +176,16 @@ pub struct BootStateSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_secs: Option<u64>,
     pub logs: Vec<LogLine>,
+    /// 当前 dsh 页 URL(就绪过即携带;壳页 set iframe.src 用)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dsh_url: Option<String>,
+}
+
+/// `dsh-url` 事件载荷(record_dsh_url 推 URL 给壳页,壳页 set iframe.src)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshUrlView {
+    pub url: String,
 }
 
 struct BootState {
@@ -198,14 +209,10 @@ pub struct DshManager {
     child: Arc<Mutex<Option<Child>>>,
     /// 安装中 npm 子进程 pid(退出收敛时一并杀掉;npm 会再拉起 node 子进程,按树杀)
     install_pid: Arc<Mutex<Option<u32>>>,
-    /// 当前 dsh 页 URL(boot 就绪时记录;#3 §7:升级卡片「稍后/返回」的导航目标)。
+    /// 当前 dsh 页 URL(boot 就绪时记录;单一事实来源,record 即推壳页,#36)。
     dsh_url: Arc<Mutex<Option<String>>>,
     /// boot 流水线启动时刻(启动页耗时显示起点;重试覆盖为新一轮起点)
     started_at: Arc<Mutex<Option<Instant>>>,
-    /// 前端退出动画完成信号发送端(#4)。boot_pipeline 就绪后等待期间存入
-    /// (wait_navigate_signal_or_timeout),等待结束(rx drop)后 try_send 自然
-    /// 失败——跨轮信号串扰由通道生命周期兜底,无需额外标志。
-    navigate_tx: Arc<Mutex<Option<mpsc::SyncSender<()>>>>,
 }
 
 impl DshManager {
@@ -224,15 +231,17 @@ impl DshManager {
             install_pid: Arc::new(Mutex::new(None)),
             dsh_url: Arc::new(Mutex::new(None)),
             started_at: Arc::new(Mutex::new(None)),
-            navigate_tx: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// 记录当前 dsh 页 URL(boot / 升级链就绪时调用;「稍后/返回」导航目标,#3 §7)。
+    /// 记录当前 dsh 页 URL 并推 `dsh-url` 事件给壳页(壳页 set iframe.src)。
+    /// 单一事实来源 + 唯一推送口:4 个端口变化时点(boot 就绪 / 升级链就绪 /
+    /// 升级卡「稍后/返回」重启 / 崩溃重试)统一收敛于此(ADR 0001 / #29,#36)。
     pub(crate) fn record_dsh_url(&self, url: String) {
         if let Ok(mut g) = self.dsh_url.lock() {
-            *g = Some(url);
+            *g = Some(url.clone());
         }
+        let _ = self.app.emit_to("main", "dsh-url", DshUrlView { url });
     }
 
     /// 当前 boot 流水线阶段(升级链确认守卫用:boot 未就绪不升级,#3 §2)。
@@ -266,6 +275,7 @@ impl DshManager {
             stage,
             elapsed_secs: self.boot_elapsed_secs(),
             logs,
+            dsh_url: dsh_url(self),
         }
     }
 
@@ -352,51 +362,6 @@ impl DshManager {
             .lock()
             .ok()
             .and_then(|g| g.map(|t| t.elapsed().as_secs()))
-    }
-
-    /// 等待前端退出动画完成信号(#4)。信号通道按轮创建:
-    /// - boot_pipeline 就绪后在此等待(tx 存入 navigate_tx 供命令 try_send)
-    /// - 前端动画结束经 navigate_to_dsh 命令 try_send
-    /// - 超时(前端故障 / JS 错误)照常返回——动画是纯装饰,不是完成条件
-    /// - rx drop(= 本方法返回)后信号自然失效:跨轮串扰(旧命令晚到)由
-    ///   通道生命周期兜底,无需额外标志
-    fn wait_navigate_signal_or_timeout(&self, timeout: Duration) {
-        let (tx, rx) = mpsc::sync_channel::<()>(1);
-        if let Ok(mut g) = self.navigate_tx.lock() {
-            *g = Some(tx);
-        }
-        let _ = rx.recv_timeout(timeout);
-        if let Ok(mut g) = self.navigate_tx.lock() {
-            *g = None;
-        }
-    }
-
-    /// 前端请求导航(退出动画完成信号,#4)。幂等:
-    /// - phase 非 Ready 一律 no-op(非就绪不导航,防跨轮串扰)
-    /// - 有等待者(boot_pipeline 就绪等待中)→ 信号,boot_pipeline 负责导航
-    /// - 无等待者(rx 已随上一轮等待结束而 drop)→ dsh 在跑则直接导航:
-    ///   实机场景「全新启动时 webview 挂载晚于 boot 完成」(挂载快照即 ready,
-    ///   动画照播),此时 boot_pipeline 早已过等待期,前端信号成为导航入口。
-    ///   双重竞态防护:前端单发信号(useBootExit once-only)+ 无等待者时
-    ///   try_send 失败才走直接导航——正常路径永不双导航。
-    fn request_navigate(&self) {
-        if self.phase() != Phase::Ready {
-            return;
-        }
-        let sent = self
-            .navigate_tx
-            .lock()
-            .map(|g| g.as_ref().is_some_and(|tx| tx.try_send(()).is_ok()))
-            .unwrap_or(false);
-        if sent {
-            return;
-        }
-        if let Some(url) = dsh_url(self) {
-            if dsh_is_running(self) {
-                log::info!("[dsh] navigate_to_dsh: boot 已过等待期,直接导航 → {url}");
-                let _ = crate::navigation::navigate_main_window(&self.app, &url);
-            }
-        }
     }
 
     /// 安装进度事件:推 `boot-state` { phase: Installing, progress, stage, elapsed }。
@@ -918,27 +883,16 @@ fn boot_pipeline(manager: &DshManager) {
     };
     log::info!("[dsh] boot: ready on port {port}");
 
-    // 5. 就绪:记录 dsh URL(升级卡片「稍后/返回」导航目标,#3 §7)
-    //    → 等前端退出动画完成信号(动画在 boot UI 侧播放,动画结束前端
-    //      invoke navigate_to_dsh;超时兜底照常导航——动画是纯装饰,前端
-    //      故障不阻塞 boot,#4)→ 导航窗口到 dsh Web UI
+    // 5. 就绪:记录 dsh URL 并推给壳页(单一事实来源 record_dsh_url,
+    //    ADR 0001)——壳页 set iframe.src,dsh 在 iframe 内呈现。前端 boot
+    //    浮层的退出过渡动画由 URL 到达触发(useBootExit,fallback 兜底,
+    //    动画不阻塞呈现),无需任何导航信号。
     manager.set_phase(Phase::Ready, None);
     let url = dsh_url_for_port(port);
     manager.record_dsh_url(url.clone());
-    log::info!(
-        "[dsh] boot: ready, 等前端退出动画完成信号(≤{}ms)",
-        NAVIGATE_SIGNAL_TIMEOUT.as_millis()
-    );
-    manager.wait_navigate_signal_or_timeout(NAVIGATE_SIGNAL_TIMEOUT);
-    log::info!("[dsh] boot: navigate → {url}");
-    if !crate::navigation::navigate_main_window(&manager.app, &url) {
-        // 导航失败:dsh 仍在运行,先杀子进程再进错误态(否则重试会再起一个 dsh)
-        kill_child(manager);
-        manager.set_error(DshError::NavigateFailed);
-        return;
-    }
+    log::info!("[dsh] boot: ready, 推 URL 给壳页 → {url}");
 
-    // 7. reaper 线程:持续排空输出流(防 64KB 管道阻塞挂死),进程退出后收割
+    // 6. reaper 线程:持续排空输出流(防 64KB 管道阻塞挂死),进程退出后收割
     spawn_reaper(manager.clone(), rx);
 }
 
@@ -1023,15 +977,6 @@ pub fn boot_start(manager: &DshManager) {
             m.set_error(DshError::Internal { message: msg });
         }
     });
-}
-
-/// 前端退出动画完成信号(#4):boot_pipeline 就绪后等待此信号再导航窗口到
-/// dsh 页——窗口 navigate 是 Rust 侧职责,前端只发「动画结束」信号。
-/// 幂等:phase 非 Ready / 无等待者时 no-op;StrictMode 双 invoke 无害。
-#[tauri::command]
-pub async fn navigate_to_dsh(state: tauri::State<'_, DshManager>) -> Result<(), String> {
-    state.inner().request_navigate();
-    Ok(())
 }
 
 /// 退出应用:杀子进程 + exit(0)。程序化退出先置 QUITTING 标志放行 CloseRequested。

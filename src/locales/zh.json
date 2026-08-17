@@ -30,7 +30,6 @@
   "errors.InstallFailedPermissionAbnormal": "dsh 安装失败(异常退出)。{{stderrTail}}可能是 npm 全局目录权限不足:请以管理员身份重试,或改用 nvm 把 Node.js 装到用户目录(从源头避免权限问题);也可手动执行 npm install -g @deepseek-ai/dsh 后点重试",
   "errors.InstallTimeout": "dsh 安装超时({{seconds}}s 内未完成)。请检查网络后点击重试",
   "errors.InstallVerifyFailed": "dsh 安装后校验失败(可执行文件缺失)",
-  "errors.NavigateFailed": "无法打开 dsh 页面,请重试",
   "errors.NodeCheckFailed": "Node.js 检查失败: {{detail}}",
   "errors.NodeCheckTimeout": "Node.js 检查超时({{seconds}}s 无响应):`node --version` 未返回。可能是 node 安装异常或被杀软拦截,请检查后重试",
   "errors.NodeVersionCheckFailed": "Node.js 检查失败:`node --version` 退出码 {{exitCode}}{{detail}}",

@@ -1,21 +1,27 @@
-// dsh 升级状态纯函数测试:App 路由守卫(App 挂载 → UpgradeScreen 的分发条件,
-// 生产路径即 App.tsx / UpgradeScreen.tsx 的渲染路径)
+// dsh 升级卡片可见性纯函数测试:浮层可见性规则(App.tsx 渲染路径,
+// 生产路径即 App.tsx / useDshUpgrade.ts 的渲染决策)
 import { describe, expect, it } from "vitest"
 
 import {
-  isActiveDshUpgradeStatus,
+  isUpgradeCardVisible,
   type DshUpgradeStatus,
 } from "@/lib/useDshUpgrade"
 
-describe("isActiveDshUpgradeStatus", () => {
-  it("treats the four card states as active", () => {
-    for (const s of ["available", "active", "ready", "failed"] as const) {
-      expect(isActiveDshUpgradeStatus(s satisfies DshUpgradeStatus)).toBe(true)
+describe("isUpgradeCardVisible", () => {
+  it("always shows card while pipeline is active-ish", () => {
+    for (const s of ["active", "ready", "failed"] as const) {
+      expect(isUpgradeCardVisible(s satisfies DshUpgradeStatus, false)).toBe(true)
     }
   })
 
-  it("treats idle/undefined as inactive", () => {
-    expect(isActiveDshUpgradeStatus("idle")).toBe(false)
-    expect(isActiveDshUpgradeStatus(undefined)).toBe(false)
+  it("shows available card only when explicitly requested", () => {
+    // 自动检测只亮托盘徽标,不弹卡片(#3 §1);托盘「升级 dsh 到 vX」请求后才弹
+    expect(isUpgradeCardVisible("available", false)).toBe(false)
+    expect(isUpgradeCardVisible("available", true)).toBe(true)
+  })
+
+  it("treats idle as invisible", () => {
+    expect(isUpgradeCardVisible("idle", true)).toBe(false)
+    expect(isUpgradeCardVisible("idle", false)).toBe(false)
   })
 })

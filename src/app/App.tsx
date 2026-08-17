@@ -1,18 +1,23 @@
-// Root app.启动编排:按 boot 阶段分发渲染;升级卡片优先于 boot 分发——
-// 挂载时若升级状态活跃且快照已是 ready(本地页由升级流程导航回来,dsh 已在跑),
-// 渲染对应升级卡片;否则走 boot 分发(现状逻辑不变;全新启动时 ready 事件到达后
-// Rust 即将导航去 dsh 页,靠 useBoot 的 mountSnapshotReady 区分,不中途切卡片)。
-// ready 由 Rust 侧接管(窗口 navigate 到 dsh Web UI),前端只短暂显示过渡。
-// 升级卡优先级(#17):dsh 升级卡(upgrade.*) → 应用升级卡(update.*) → boot 分发。
+// Root app.壳页常驻(ADR 0001 / #36):单一 tauri WebView 窗口内是常驻壳页——
+// 菜单条占位区 + dsh iframe 容器 + 浮层挂载点;boot / 升级卡 / 更新卡 / 错误页
+// 全部作为浮层盖在 iframe 之上(浮层编排 M5 收口,本票 M1 只做骨架)。
+// 浮层互斥与优先级:升级卡 → 更新卡 → 错误页 → boot(升级卡优先,与原分发一致)。
+// dsh URL 单一事实来源在 Rust(record_dsh_url → dsh-url 事件/快照,useBoot 持有),
+// 壳页只负责 set iframe.src;dsh 就绪(URL 到达)后播放退出过渡动画溶解 boot
+// 浮层,揭示 iframe(useBootExit,fallback 兜底,动画不阻塞 dsh 呈现)。
+// 卡片可见性:升级/更新卡由状态 + 托盘显式请求驱动(isUpgradeCardVisible /
+// isUpdateCardVisible),不再依赖「页面挂载」信号(壳页不再重新挂载)。
 import { BootScreen } from "@/components/boot/BootScreen"
 import { ErrorScreen } from "@/components/boot/ErrorScreen"
+import { ShellLayout } from "@/components/shell/ShellLayout"
 import { UpdateCard } from "@/components/update/UpdateCard"
 import { UpgradeScreen } from "@/components/upgrade/UpgradeScreen"
 import { useBoot } from "@/lib/useBoot"
 import { useBootExit } from "@/lib/useBootExit"
-import { useDshUpgrade, isActiveDshUpgradeStatus } from "@/lib/useDshUpgrade"
+import { useDshUpgrade } from "@/lib/useDshUpgrade"
+import { useExternalLinks } from "@/lib/useExternalLinks"
 import { useThemeSync } from "@/lib/useThemeSync"
-import { isActiveUpdateStatus, useUpdateCheck } from "@/lib/useUpdateCheck"
+import { useUpdateCheck } from "@/lib/useUpdateCheck"
 
 export default function App() {
   const {
@@ -23,26 +28,38 @@ export default function App() {
     stage,
     nodeVersion,
     elapsedSecs,
+    dshUrl,
     retry,
     quit,
-    mountSnapshotReady,
   } = useBoot()
-  // 主题同步:Rust 下发生效主题 → <html>.dark(boot UI 全程生效)
+  // 主题同步:Rust 下发生效主题 → <html>.dark(壳页全程生效)
   useThemeSync()
-  // 退出动画编排(#4):phase=ready 即播放动画(整屏溶解 + 圆环收缩)——
-  // 活体 boot 的 ready 事件与「挂载快照即 ready」(webview 挂载晚于 boot
-  // 完成,实机常态)都走动画;动画结束信号 navigate_to_dsh → Rust 侧导航
-  // 去 dsh 页(等待期信号给 boot_pipeline;已过等待期则命令直接导航)。
-  // 升级/更新卡场景渲染在 boot 分发之前,不经过本动画。
-  const { exiting, onExitAnimationEnd } = useBootExit({ ready: phase === "ready" })
+  // 页面层外链拦截接收端:dsh iframe 命中外链 → postMessage → opener 开浏览器
+  useExternalLinks()
   // 升级状态镜像(Rust 侧单一事实源,见 useDshUpgrade / useUpdateCheck)
   const dshUpgrade = useDshUpgrade()
   const update = useUpdateCheck()
 
-  // #3 §5:挂载时先查升级状态,有活跃态(且快照已 ready) → 升级卡片;
-  // 否则走 boot 分发。boot 命令在升级页挂载时仍被调用(phase=Ready 无副作用)。
-  if (mountSnapshotReady && isActiveDshUpgradeStatus(dshUpgrade.status)) {
-    return (
+  // boot 浮层退出过渡:ready 且 URL 已推给壳页(iframe 开始加载)即播放溶解
+  // 动画揭示 dsh;动画纯装饰,fallback 定时器兜底,不阻塞呈现
+  const { exiting, done, onExitAnimationEnd } = useBootExit({
+    ready: phase === "ready" && dshUrl !== null,
+  })
+
+  // 浮层可见性:升级卡优先(与 #3 §5 分发一致),其次更新卡,再次错误页,
+  // boot 兜底(idle 也显示 boot 页,避免挂载瞬间的空壳闪烁)。
+  const showBootOverlay =
+    phase === "idle" ||
+    phase === "error" ||
+    phase === "checking" ||
+    phase === "installing" ||
+    phase === "starting" ||
+    (phase === "ready" && !done)
+  // 单一表达式(无浮层时传 null):ShellLayout 靠 children 真假切换浮层挂载点
+  // 的 pointer-events——多个条件兄弟表达式会形成 [null,…] 数组,空浮层挡
+  // 不住 iframe 点击,故这里只产出一个值。
+  const overlay =
+    dshUpgrade.visible ? (
       <UpgradeScreen
         status={dshUpgrade.status}
         version={dshUpgrade.version}
@@ -54,11 +71,7 @@ export default function App() {
         onConfirm={dshUpgrade.confirm}
         onDismiss={dshUpgrade.dismiss}
       />
-    )
-  }
-
-  if (mountSnapshotReady && isActiveUpdateStatus(update.status)) {
-    return (
+    ) : update.visible ? (
       <UpdateCard
         status={update.status}
         version={update.version}
@@ -72,23 +85,21 @@ export default function App() {
         onDismiss={update.dismiss}
         onOpenReleases={update.openReleases}
       />
-    )
-  }
+    ) : showBootOverlay ? (
+      phase === "error" ? (
+        <ErrorScreen error={error} logs={logs} retry={retry} quit={quit} />
+      ) : (
+        <BootScreen
+          phase={phase}
+          progress={progress}
+          stage={stage}
+          nodeVersion={nodeVersion}
+          elapsedSecs={elapsedSecs}
+          exiting={exiting}
+          onExitAnimationEnd={onExitAnimationEnd}
+        />
+      )
+    ) : null
 
-  if (phase === "error") {
-    // error 是结构化失败原因,ErrorScreen 渲染时翻译(兜底 errors.unknown 在彼处)
-    return <ErrorScreen error={error} logs={logs} retry={retry} quit={quit} />
-  }
-  // idle(快照未到)/checking/installing/starting/ready 均由 BootScreen 呈现对应文案
-  return (
-    <BootScreen
-      phase={phase}
-      progress={progress}
-      stage={stage}
-      nodeVersion={nodeVersion}
-      elapsedSecs={elapsedSecs}
-      exiting={exiting}
-      onExitAnimationEnd={onExitAnimationEnd}
-    />
-  )
+  return <ShellLayout dshUrl={dshUrl}>{overlay}</ShellLayout>
 }

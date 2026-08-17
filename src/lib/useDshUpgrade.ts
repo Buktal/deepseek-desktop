@@ -11,7 +11,8 @@
 // 翻译(语言切换可重译,见 src/lib/error.ts 与 #12)。
 
 import { invoke } from "@tauri-apps/api/core"
-import { useCallback, useState } from "react"
+import { listen } from "@tauri-apps/api/event"
+import { useCallback, useEffect, useState } from "react"
 
 import { toStructuredError, type RustErrorPayload, type StructuredError } from "@/lib/error"
 import { useRustStateSync } from "@/lib/useRustStateSync"
@@ -37,12 +38,13 @@ export interface DshUpgradeStateView {
 }
 
 /**
- * 升级状态是否为「需要展示升级卡片」的活跃态。
- * App 挂载时用它决定先渲染 UpgradeScreen 还是走 boot 分发(#3 §5)。
- * 纯函数,可测。
+ * 升级卡片是否可见(纯函数,可测)。壳页常驻后(#36)卡片是浮层,可见性 =
+ * 流水线活跃态(active/ready/failed 必有卡片,流水线是用户动作触发的)
+ * + available 需显式请求(托盘「升级 dsh 到 vX」菜单 → upgrade-card-request
+ * 事件;自动检测只亮托盘徽标,不弹卡片,#3 §1)。
  */
-export function isActiveDshUpgradeStatus(status: DshUpgradeStatus | undefined): boolean {
-  return status === "available" || status === "active" || status === "ready" || status === "failed"
+export function isUpgradeCardVisible(status: DshUpgradeStatus, requested: boolean): boolean {
+  return status === "available" ? requested : status !== "idle"
 }
 
 export function useDshUpgrade() {
@@ -54,6 +56,25 @@ export function useDshUpgrade() {
   const [phase, setPhase] = useState<DshUpgradePhase | null>(null)
   const [progress, setProgress] = useState<number | null>(null)
   const [stage, setStage] = useState<string | null>(null)
+  // 卡片显式请求:托盘「升级 dsh 到 vX」点击(壳页常驻后无页面切换,available
+  // 态需此请求才弹卡;状态离开 available 即复位,不跨轮残留)
+  const [requested, setRequested] = useState(false)
+
+  // 托盘「升级 dsh 到 vX」菜单 → 显示升级卡片(事件由 tray.rs 推送)
+  useEffect(() => {
+    let alive = true
+    let stop: (() => void) | undefined
+    void listen("upgrade-card-request", () => {
+      if (alive) setRequested(true)
+    }).then((un) => {
+      stop = un
+      if (!alive) un()
+    })
+    return () => {
+      alive = false
+      stop?.()
+    }
+  }, [])
 
   // 事件与快照来自同一 Rust 状态,后到者覆盖,无竞态
   const applyView = useCallback((view: DshUpgradeStateView) => {
@@ -64,6 +85,9 @@ export function useDshUpgrade() {
     setPhase(view.phase ?? null)
     setProgress(view.progress ?? null)
     setStage(view.stage ?? null)
+    // 请求只对 available 有意义:进入流水线/消费完毕(Idle)后复位,
+    // 避免旧请求在下一轮自动检测命中时误弹卡片
+    if (view.status !== "available") setRequested(false)
   }, [])
 
   useRustStateSync({
@@ -90,6 +114,7 @@ export function useDshUpgrade() {
     phase,
     progress,
     stage,
+    visible: isUpgradeCardVisible(status, requested),
     confirm,
     dismiss,
   }

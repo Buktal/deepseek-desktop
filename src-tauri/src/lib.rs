@@ -72,14 +72,15 @@ pub fn run() {
             // 须在 setup_tray 之前:托盘勾选状态读 autostart::current()
             autostart::init(app.handle());
 
-            // dsh 管理器(Clone 共享内部 Arc 状态)。先 manage:主窗口导航
+            // dsh 管理器(Clone 共享内部 Arc 状态)。先 manage:导航拦截
             // 回调经 try_state 读 dsh URL(#15),顺序无硬依赖,放这里语义就近
             let manager = dsh::DshManager::new(app.handle().clone());
             app.manage(manager.clone());
 
             // 主窗口:config `create: false`(#15),此处用 builder 创建并挂
-            // 导航拦截(on_navigation / on_new_window 只存在于 builder,
-            // 见 navigation.rs:外部链接交系统浏览器、只放行 dsh/壳本地页)
+            // 导航拦截 + 页面层外链拦截脚本(见 navigation.rs:on_navigation /
+            // on_new_window 只存在于 builder;iframe 外链经注入脚本 postMessage
+            // 回壳页,opener 开系统浏览器)
             navigation::create_main_window(app.handle())?;
 
             // 窗口恢复后几何钳制:restore 的保存值可能小于 minWidth/minHeight
@@ -111,7 +112,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             dsh::boot,
-            dsh::navigate_to_dsh,
             dsh::quit_app,
             theme::theme_state,
             update::update_state,

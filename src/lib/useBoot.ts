@@ -3,6 +3,7 @@
 // 本 hook 只负责 boot 特有的部分:applyView 字段映射、错误转结构化形态(fatal)、
 // 耗时锚点插值、quit/retry。
 import { invoke } from "@tauri-apps/api/core"
+import { listen } from "@tauri-apps/api/event"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { interpolateElapsed } from "@/lib/elapsed"
@@ -32,11 +33,18 @@ export interface BootStateView {
 
 export interface BootStateSnapshot extends BootStateView {
   logs: BootLog[]
+  /** 当前 dsh 页 URL(就绪过即携带;壳页 set iframe.src 用) */
+  dshUrl?: string | null
 }
 
 export interface BootLog {
   stream: "stdout" | "stderr"
   line: string
+}
+
+/** Rust 侧 dsh-url 事件载荷(record_dsh_url 推 URL 给壳页,见 dsh.rs) */
+export interface DshUrlPayload {
+  url: string
 }
 
 export function useBoot() {
@@ -55,14 +63,13 @@ export function useBoot() {
   const [elapsedSecs, setElapsedSecs] = useState<number | null>(null)
   const elapsedAnchor = useRef<{ baseSecs: number; atMs: number } | null>(null)
   const [elapsedTick, setElapsedTick] = useState(0)
-  // 挂载时快照是否已是 ready:true = 本地页由升级流程导航回来(dsh 已在跑),
-  // 升级卡片可展示(#5 路由);false = 本次挂载经历 boot 推进(全新启动),
-  // ready 事件到达后 Rust 即将导航去 dsh 页,不得中途切升级卡片。
-  const [mountSnapshotReady, setMountSnapshotReady] = useState(false)
+  // dsh URL(壳页 set iframe.src;单一事实来源在 Rust record_dsh_url):
+  // 快照携带 + dsh-url 事件两条来源,后到者覆盖(与 boot-state 同款竞态语义);
+  // 只增不清——URL 记录后就一直有效,旧值在新 URL 到达前仍是当前呈现
+  const [dshUrl, setDshUrl] = useState<string | null>(null)
 
   /** 应用一份状态视图(事件或快照):阶段/错误/进度/耗时统一入口。
-   *  logs 与 mountSnapshotReady 只有快照携带(事件载荷是快照子集,经
-   *  source 区分)。 */
+   *  logs 只有快照携带(事件载荷是快照子集,经 source 区分)。 */
   const applyView = useCallback((view: BootStateSnapshot, source: "event" | "snapshot") => {
     if (view.phase === "checking") {
       setLogs([]) // 全新一次 boot 的语义边界(Rust 侧同步清空缓冲)
@@ -79,19 +86,37 @@ export function useBoot() {
     }
     // node 检测结果仅 checking 携带;其余阶段事件不带字段 → 清空
     setNodeVersion(view.nodeVersion ?? null)
+    if (view.dshUrl) setDshUrl(view.dshUrl)
     if (view.elapsedSecs != null) {
       setElapsedSecs(view.elapsedSecs)
       elapsedAnchor.current = { baseSecs: view.elapsedSecs, atMs: Date.now() }
     }
     if (source === "snapshot") {
       setLogs(view.logs)
-      if (view.phase === "ready") setMountSnapshotReady(true)
     }
   }, [])
 
   const fail = useCallback((e: StructuredError) => {
     setPhase("error")
     setError(e)
+  }, [])
+
+  // dsh-url 事件:record_dsh_url 推 URL(单一事实来源,4 时点统一,ADR 0001)。
+  // 先于快照注册监听(与 boot-state 同款「先监听后快照,后到者覆盖」语义;
+  // 快照遗漏的极窄竞态由下方就绪缺 URL 兜底覆盖)
+  useEffect(() => {
+    let alive = true
+    let stop: (() => void) | undefined
+    void listen<DshUrlPayload>("dsh-url", (e) => {
+      if (alive && typeof e.payload?.url === "string") setDshUrl(e.payload.url)
+    }).then((un) => {
+      stop = un
+      if (!alive) un()
+    })
+    return () => {
+      alive = false
+      stop?.()
+    }
   }, [])
 
   // 同步骨架走共享核心:先注册监听再触发(增量事件一个不丢);
@@ -110,6 +135,13 @@ export function useBoot() {
         data: { detail: rawErrorMessage(e) },
       }),
   })
+
+  // 就绪缺 URL 兜底:phase=ready 而 dshUrl 仍为空(挂载晚于就绪且 dsh-url
+  // 事件已错过、或快照竞态)时重拉一次快照——快照携带 dshUrl,覆盖事件
+  // 丢帧;一次触发即止(deps 不变不循环),正常路径永不触发
+  useEffect(() => {
+    if (phase === "ready" && dshUrl === null) refresh()
+  }, [phase, dshUrl, refresh])
 
   // 耗时显示时钟:boot 阶段(含 ready 过渡)有秒数后每秒重渲染一次,渲染时
   // 按锚点插值(无 setTimeout 漂移);错误/待机页不显示耗时,停表免无谓的
@@ -140,8 +172,8 @@ export function useBoot() {
     stage,
     nodeVersion,
     elapsedSecs: displayElapsedSecs,
+    dshUrl,
     retry,
     quit,
-    mountSnapshotReady,
   }
 }

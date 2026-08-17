@@ -40,7 +40,7 @@ export function NodeGuideScreen({
   }, [])
 
   return (
-    <main className="flex h-screen w-screen flex-col items-center justify-center gap-8 bg-background text-foreground">
+    <main className="flex h-full w-full flex-col items-center justify-center gap-8 bg-background text-foreground">
       <div className="flex w-full max-w-md flex-col items-center gap-2.5 text-center">
         <h1 className="text-lg font-medium">{t("guide.title")}</h1>
         <p className="text-sm leading-relaxed text-muted-foreground">

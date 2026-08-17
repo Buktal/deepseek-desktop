@@ -30,7 +30,6 @@
   "errors.InstallFailedPermissionAbnormal": "dsh install failed (abnormal exit). {{stderrTail}}The npm global directory may lack permissions: retry as administrator, or install Node.js into your user directory with nvm (avoids the issue at the source); you can also run npm install -g @deepseek-ai/dsh manually and retry",
   "errors.InstallTimeout": "dsh install timed out (did not finish within {{seconds}}s). Check your network and click retry",
   "errors.InstallVerifyFailed": "dsh verification failed after install (executable missing)",
-  "errors.NavigateFailed": "Could not open the dsh page, please retry",
   "errors.NodeCheckFailed": "Node.js check failed: {{detail}}",
   "errors.NodeCheckTimeout": "Node.js check timed out (no response in {{seconds}}s): `node --version` returned nothing. The Node.js install may be broken or blocked by antivirus; check it and retry",
   "errors.NodeVersionCheckFailed": "Node.js check failed: `node --version` exited with code {{exitCode}}{{detail}}",

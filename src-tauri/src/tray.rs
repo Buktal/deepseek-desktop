@@ -31,8 +31,9 @@
 //!   前端不再监听;事件 emit 移除(不留死契约)。
 //! - 升级通知形态(#3 §1,两层升级共用同一 Rust 侧机制):自动检测发现新版 →
 //!   徽标图标变体 + 动态菜单项(app「升级到 vX」/ dsh「升级 dsh 到 vX」)+ tooltip,
-//!   不弹窗打断;点击动态菜单项 → 显示窗口(若隐藏)→ 导航回本地升级页
-//!   (navigation::navigate_to_shell,App 挂载时按优先级分发两张卡)。
+//!   不弹窗打断;点击动态菜单项 → 显示窗口 + 推卡片请求事件(upgrade-card-request
+//!   / update-card-request),前端按状态渲染对应升级卡片浮层(壳页常驻,无整窗
+//!   导航,#36;自动检测只亮徽标不弹卡片,#3 §1)。
 //! - 手动检查入口(#17 组合编排 on_check_update):dsh 层先答(dsh 新版 → dsh
 //!   对话框;检查失败 → 失败对话框),应用层兜底(应用新版 → 应用对话框;无新版
 //!   → 合并「已是最新」对话框附 dsh 版本);dsh 升级流水线在途时 no-op(#3 边界)。
@@ -48,7 +49,7 @@ use tauri::menu::{CheckMenuItem, Menu, MenuBuilder, MenuItem, SubmenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, Wry};
 
-use crate::{autostart, dsh, locales, navigation, theme, update, upgrade};
+use crate::{autostart, dsh, locales, theme, update, upgrade};
 use crate::theme::ThemeChoice;
 
 /// 托盘图标句柄(发现新版时换徽标变体 / 恢复,见 set_app_update/set_dsh_update)。
@@ -245,10 +246,17 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             }
             autostart::MENU_ID => on_autostart_toggled(app),
             "upgrade-dsh" | "upgrade-available" => {
-                // 被动通知入口(#3 §1,两层共用):显示窗口(若隐藏)→ 导航回
-                // 本地升级页;App 挂载时按优先级分发卡片(dsh 卡 → 应用卡)
-                log::info!("[tray] 菜单[升级] → 导航升级卡片");
-                navigation::navigate_to_shell(app);
+                // 被动通知入口(#3 §1,两层共用):显示窗口 + 推卡片请求事件,
+                // 前端按状态渲染对应卡片浮层(壳页常驻,无整窗导航,#36;
+                // available 态需此显式请求才弹卡片,自动检测只亮徽标)
+                let card = if event.id().as_ref() == "upgrade-dsh" {
+                    "upgrade-card-request"
+                } else {
+                    "update-card-request"
+                };
+                log::info!("[tray] 菜单[升级] → 显示窗口 + 推卡片请求 {card}");
+                show_main_window(app);
+                let _ = app.emit_to("main", card, ());
             }
             "check-update" => {
                 // #3 事件契约变更 + #17 组合编排:检查逻辑全在 Rust 侧,
@@ -343,6 +351,18 @@ fn on_check_update(app: &AppHandle) {
             })));
         }
     });
+}
+
+/// 显示并聚焦主窗口(取消最小化)。托盘动态升级菜单项与手动检查对话框
+/// [升级] 共用——壳页常驻后不再整窗导航,「看升级卡片」= 显示窗口 +
+/// 推卡片请求事件(或流水线状态自动弹卡)。
+pub(crate) fn show_main_window(app: &AppHandle) {
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+    let _ = win.unminimize();
+    let _ = win.show();
+    let _ = win.set_focus();
 }
 
 /// 显示/隐藏窗口。行为:窗口可见且已聚焦时隐藏,否则显示并聚焦。

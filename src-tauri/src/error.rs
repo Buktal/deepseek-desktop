@@ -75,8 +75,6 @@ pub enum DshError {
     DshExitedEarlyNoCode,
     /// 启动超时(未收到就绪信号)
     DshStartTimeout { seconds: u64 },
-    /// 无法导航窗口到 dsh 页面
-    NavigateFailed,
     /// 流水线内部 panic 等未知内部错误
     Internal { message: String },
 }

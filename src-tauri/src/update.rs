@@ -11,7 +11,8 @@
 //! 通知形态(#3 定稿,与 dsh 升级共用同一 Rust 侧机制):自动检测(启动/6h)发现新版
 //! → 托盘徽标图标变体 + 动态菜单项「升级到 vX」+ tooltip,不弹窗打断;托盘手动检查
 //! → 原生对话框直接回答(已是最新 / 发现新版本 [升级][稍后])。点击动态菜单项 →
-//! 显示窗口 → 导航回本地升级页(升级卡片)。
+//! 显示窗口 + 推 `update-card-request` 事件,前端按状态渲染升级卡片(壳页常驻,
+//! 卡片是浮层,#36;可见性规则见前端 isUpdateCardVisible)。
 //!
 //! 升级时序(#9 定稿):检查/下载期间 dsh 照常运行;下载完成且签名校验通过后、
 //! 安装器启动之前,必须先 `set_quitting()` + `kill_child()`——Windows NSIS
@@ -78,7 +79,8 @@ pub enum UpdateStateView {
     Failed { error: UpdateError },
 }
 
-/// 状态机事件。由 update.rs 各动作(检查/下载/安装)产生,经 `apply_event` 归约。
+/// 状态机事件。由 update.rs 各动作(检查/下载/安装/卡片关闭)产生,经
+/// `apply_event` 归约。
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdateEvent {
     CheckStarted,
@@ -97,6 +99,8 @@ pub enum UpdateEvent {
     },
     DownloadFinished,
     DownloadFailed { detail: String },
+    /// 卡片「稍后/关闭」(Available/Ready/Failed → Idle)
+    Dismissed,
 }
 
 /// 状态机归约:事件 → 新状态。纯函数,可测;
@@ -135,6 +139,14 @@ pub fn apply_event(state: &UpdateStateView, event: UpdateEvent) -> UpdateStateVi
         UpdateEvent::DownloadFinished => UpdateStateView::Ready,
         UpdateEvent::DownloadFailed { detail } => UpdateStateView::Failed {
             error: UpdateError::DownloadFailed { detail },
+        },
+        UpdateEvent::Dismissed => match state {
+            // 卡片可关闭态(有「稍后/关闭」按钮):Available / Ready / Failed;
+            // 下载中不可关闭(卡片无此按钮),异常时序不得污染状态
+            UpdateStateView::Available { .. }
+            | UpdateStateView::Ready
+            | UpdateStateView::Failed { .. } => UpdateStateView::Idle,
+            _ => state.clone(),
         },
     }
 }
@@ -347,13 +359,11 @@ impl UpdateManager {
         self.app.restart();
     }
 
-    /// 升级卡片「稍后/关闭」:导航回 dsh 页(#3 §7:dsh URL 在 boot 就绪时记录)。
-    pub fn dismiss(&self, dsh: &dsh::DshManager) {
-        let Some(url) = dsh::dsh_url(dsh) else {
-            log::warn!("[update] 无 dsh URL 可返回,留在升级页");
-            return;
-        };
-        crate::navigation::navigate_main_window(&self.app, &url);
+    /// 升级卡片「稍后/关闭」:关闭卡片(状态归 Idle)。
+    /// 壳页常驻(ADR 0001 / #36)后无窗口导航——dsh 由 iframe 呈现,不受应用
+    /// 升级影响,「关闭」只是收起浮层。
+    pub fn dismiss(&self) {
+        self.reduce(UpdateEvent::Dismissed);
     }
 }
 
@@ -370,7 +380,8 @@ pub enum ManualCheckResult {
 }
 
 /// 手动检查发现新版:原生对话框 [升级][稍后]。
-/// [升级] → 导航升级卡片并自动开始下载(#3:确认即授权,不二次确认)。
+/// [升级] → 显示窗口 + 自动开始下载(#3:确认即授权,不二次确认;
+/// 下载开始后升级卡片浮层自动出现,壳页常驻无需导航,#36)。
 pub(crate) fn show_update_found_dialog(app: &AppHandle, version: &str, current: &str) {
     let t = locales::shell_texts(locales::detect_lang());
     let app = app.clone();
@@ -385,10 +396,10 @@ pub(crate) fn show_update_found_dialog(app: &AppHandle, version: &str, current: 
         .show_with_result(move |res| {
             if let MessageDialogResult::Custom(s) = res {
                 if s == t.update_now {
-                    log::info!("[update] 对话框[升级] → 导航升级卡片 + 自动开始下载");
+                    log::info!("[update] 对话框[升级] → 显示窗口 + 自动开始下载");
+                    tray::show_main_window(&app);
                     let updater = app.state::<UpdateManager>().inner().clone();
                     let dsh = app.state::<dsh::DshManager>().inner().clone();
-                    crate::navigation::navigate_to_shell(&app);
                     updater.apply_now(&dsh);
                 }
             }
@@ -439,13 +450,10 @@ pub async fn update_restart(
     Ok(())
 }
 
-/// 升级卡片「稍后/关闭」:导航回 dsh 页(旧 dsh 仍在运行)。
+/// 升级卡片「稍后/关闭」:关闭卡片(状态归 Idle,壳页常驻后无导航,#36)。
 #[tauri::command]
-pub async fn update_dismiss(
-    state: tauri::State<'_, UpdateManager>,
-    dsh: tauri::State<'_, dsh::DshManager>,
-) -> Result<(), String> {
-    state.inner().dismiss(dsh.inner());
+pub async fn update_dismiss(state: tauri::State<'_, UpdateManager>) -> Result<(), String> {
+    state.inner().dismiss();
     Ok(())
 }
 
@@ -539,6 +547,29 @@ mod tests {
             },
         );
         assert_eq!(s2, s);
+    }
+
+    #[test]
+    fn dismissed_closes_card_from_closable_states() {
+        // 卡片「稍后/关闭」:Available / Ready / Failed → Idle(壳页常驻后
+        // 关闭卡片 = 状态归位,#36);下载中不可关闭,异常时序不得污染状态
+        assert_eq!(apply_event(&available(), UpdateEvent::Dismissed), UpdateStateView::Idle);
+        assert_eq!(
+            apply_event(&UpdateStateView::Ready, UpdateEvent::Dismissed),
+            UpdateStateView::Idle
+        );
+        assert_eq!(
+            apply_event(
+                &UpdateStateView::Failed {
+                    error: UpdateError::DownloadFailed { detail: "x".into() }
+                },
+                UpdateEvent::Dismissed
+            ),
+            UpdateStateView::Idle
+        );
+        let downloading = apply_event(&available(), UpdateEvent::DownloadStarted { total_bytes: 0 });
+        assert_eq!(apply_event(&downloading, UpdateEvent::Dismissed), downloading);
+        assert_eq!(apply_event(&UpdateStateView::Idle, UpdateEvent::Dismissed), UpdateStateView::Idle);
     }
 
     #[test]

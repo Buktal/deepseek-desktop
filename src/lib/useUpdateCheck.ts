@@ -13,8 +13,9 @@
 // 翻译(语言切换可重译,见 src/lib/error.ts 与 #12)。
 
 import { invoke } from "@tauri-apps/api/core"
+import { listen } from "@tauri-apps/api/event"
 import { openUrl } from "@tauri-apps/plugin-opener"
-import { useCallback, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 
 import { toStructuredError, type RustErrorPayload, type StructuredError } from "@/lib/error"
 import { useRustStateSync } from "@/lib/useRustStateSync"
@@ -42,17 +43,15 @@ export interface UpdateStateView {
 export const RELEASES_URL = "https://github.com/Buktal/deepseek-desktop/releases/latest"
 
 /**
- * 升级状态是否为「需要展示升级卡片」的活跃态。
- * App 挂载时用它决定先渲染 UpdateCard 还是走 boot 分发(#3 §5)。
- * 纯函数,可测。
+ * 升级卡片是否可见(纯函数,可测)。壳页常驻后(#36)卡片是浮层,可见性 =
+ * 流水线活跃态(downloading/ready/failed 必有卡片,流水线是用户动作触发的)
+ * + available 需显式请求(托盘「升级到 vX」菜单 → update-card-request 事件;
+ * 自动检测只亮托盘徽标,不弹卡片,#3 §1)。
  */
-export function isActiveUpdateStatus(status: UpdateStatus | undefined): boolean {
-  return (
-    status === "available" ||
-    status === "downloading" ||
-    status === "ready" ||
-    status === "failed"
-  )
+export function isUpdateCardVisible(status: UpdateStatus, requested: boolean): boolean {
+  return status === "available"
+    ? requested
+    : status === "downloading" || status === "ready" || status === "failed"
 }
 
 /** 下载进度百分比(0-100)。total 未知(<=0)时返回 null,卡片显示「请稍候」。纯函数,可测。 */
@@ -70,6 +69,25 @@ export function useUpdateCheck() {
   const [notes, setNotes] = useState<string | null>(null)
   const [downloadedBytes, setDownloadedBytes] = useState(0)
   const [totalBytes, setTotalBytes] = useState(0)
+  // 卡片显式请求:托盘「升级到 vX」点击(壳页常驻后无页面切换,available 态
+  // 需此请求才弹卡;状态离开 available 即复位,不跨轮残留)
+  const [requested, setRequested] = useState(false)
+
+  // 托盘「升级到 vX」菜单 → 显示升级卡片(事件由 tray.rs 推送)
+  useEffect(() => {
+    let alive = true
+    let stop: (() => void) | undefined
+    void listen("update-card-request", () => {
+      if (alive) setRequested(true)
+    }).then((un) => {
+      stop = un
+      if (!alive) un()
+    })
+    return () => {
+      alive = false
+      stop?.()
+    }
+  }, [])
 
   // 事件与快照来自同一 Rust 状态,后到者覆盖,无竞态
   const applyView = useCallback((view: UpdateStateView) => {
@@ -80,6 +98,9 @@ export function useUpdateCheck() {
     setDownloadedBytes(view.downloadedBytes ?? 0)
     setTotalBytes(view.totalBytes ?? 0)
     setError(toStructuredError(view.error ?? null))
+    // 请求只对 available 有意义:进入流水线/消费完毕(Idle)后复位,
+    // 避免旧请求在下一轮自动检测命中时误弹卡片
+    if (view.status !== "available") setRequested(false)
   }, [])
 
   useRustStateSync({
@@ -112,6 +133,7 @@ export function useUpdateCheck() {
     notes,
     downloadedBytes,
     totalBytes,
+    visible: isUpdateCardVisible(status, requested),
     applyUpdate,
     restartNow,
     dismiss,

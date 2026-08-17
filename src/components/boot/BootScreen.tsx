@@ -58,7 +58,7 @@ export function BootScreen({
   return (
     <main
       className={cn(
-        "flex h-screen w-screen flex-col items-center justify-center bg-background text-foreground",
+        "flex h-full w-full flex-col items-center justify-center bg-background text-foreground",
         exiting && "boot-exit",
       )}
       onAnimationEnd={

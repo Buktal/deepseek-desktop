@@ -23,14 +23,20 @@
 //!            install_progress_at / ProgressTicker,锚点 = 进程退出 + 校准 100%)
 //!          → verify(读全局 package.json version == pin 且 bin.js 完整)
 //!          → starting(spawn_dsh + wait_ready,新版 bin 路径不变)
-//!          → ready(导航窗口回 dsh 页,新端口 URL)
+//!          → ready(record_dsh_url 推新端口 URL 给壳页,iframe 自动切换,#36)
 //!
 //! 失败处理(#3 §3):失败保留旧版(npm 语义,#2 实测)+ 恢复服务——
 //! [返回 dsh] 经 upgrade_dismiss:Rust 侧检查 dsh 是否在运行,未运行则起当前
-//! 全局安装(失败时旧版保留/新版已装好,都是「当前全局版本」)→ 就绪 → 导航,
-//! 不能「只关卡片」。错误结构化:升级特有 kind(UpgradeKillFailed /
-//! UpgradeVerifyFailed)独立枚举,安装/启动类直接以 DshError 形态传播,
-//! 前端统一按 kind 翻译(errors.<kind> 键,零额外机制)。
+//! 全局安装(失败时旧版保留/新版已装好,都是「当前全局版本」)→ 就绪 →
+//! record_dsh_url 推 URL → 卡片关闭(Dismissed → Idle),不能「只关卡片」。
+//! 错误结构化:升级特有 kind(UpgradeKillFailed / UpgradeVerifyFailed)独立枚举,
+//! 安装/启动类直接以 DshError 形态传播,前端统一按 kind 翻译
+//! (errors.<kind> 键,零额外机制)。
+//!
+//! 壳页常驻(ADR 0001 / #36)后卡片是浮层:可见性由状态驱动(active/ready/
+//! failed 必显,available 需托盘显式请求,见前端 isUpgradeCardVisible);
+//! 托盘「升级 dsh 到 vX」菜单点击不再导航本地页,改为显示窗口 + 推
+//! `upgrade-card-request` 事件(tray.rs)。
 
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -43,7 +49,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
 
 use crate::error::{DshError, UpgradeError, UpgradeErrorKind};
-use crate::{dsh, locales, navigation, npm, tray, update};
+use crate::{dsh, locales, npm, tray, update};
 
 /// registry abbreviated packument(install-v1 Accept 头,23KB,#2 调研实测)。
 const REGISTRY_URL: &str = "https://registry.npmjs.org/@deepseek-ai/dsh";
@@ -232,8 +238,11 @@ pub(crate) enum UpgradeEvent {
     Succeeded,
     /// 流水线失败(→ Failed{version, error})
     Failed { version: String, error: UpgradeError },
-    /// 升级链消费完毕(导航成功后 → Idle)
+    /// 升级链消费完毕(Ready → Idle)
     Reset,
+    /// 卡片「稍后/返回 dsh」关闭卡片(Available/Failed → Idle;
+    /// 壳页常驻后卡片是浮层,关闭 = 状态归位,#36)
+    Dismissed,
 }
 
 /// 状态机归约:事件 → 新状态。纯函数,可测;
@@ -304,6 +313,12 @@ pub fn apply_event(state: &UpgradeStateView, event: UpgradeEvent) -> UpgradeStat
                 state.clone()
             }
         }
+        UpgradeEvent::Dismissed => match state {
+            UpgradeStateView::Available { .. } | UpgradeStateView::Failed { .. } => {
+                UpgradeStateView::Idle
+            }
+            _ => state.clone(),
+        },
     }
 }
 
@@ -418,26 +433,27 @@ impl UpgradeManager {
 
     /// 升级卡片「稍后/返回 dsh」(#3 §3):Rust 侧保证 dsh 在跑——未运行则起
     /// 当前全局安装(失败保留旧版 / 新版已装好,都是「当前全局版本」)→ 就绪 →
-    /// 导航回 dsh 页。不能「只关卡片」,否则用户回到打不开的页面。
+    /// record_dsh_url 推 URL 给壳页(iframe 自动切换)→ 卡片关闭(Dismissed)。
+    /// 不能「只关卡片」,否则用户回到打不开的页面。
+    /// 壳页常驻(ADR 0001 / #36):dsh 在跑时 iframe 仍指向它,无需任何动作,
+    /// 只关卡片。
     pub fn dismiss(&self, dsh: &dsh::DshManager) {
         if dsh::dsh_is_running(dsh) {
-            if let Some(url) = dsh::dsh_url(dsh) {
-                log::info!("[upgrade] 返回 dsh(dsh 仍在运行)→ {url}");
-                let _ = navigation::navigate_main_window(&self.app, &url);
-            }
+            log::info!("[upgrade] 返回 dsh(dsh 仍在运行),关闭升级卡片");
+            self.reduce(UpgradeEvent::Dismissed);
             return;
         }
-        let app = self.app.clone();
+        let up = self.clone();
         let dsh = dsh.clone();
         thread::spawn(move || {
             let Some(bin) = npm::global_dsh_bin() else {
-                log::error!("[upgrade] 返回 dsh:全局 dsh 不可用(可先重试升级),留在升级页");
+                log::error!("[upgrade] 返回 dsh:全局 dsh 不可用(可先重试升级),留在升级卡片");
                 return;
             };
             let rx = match dsh::spawn_dsh(&dsh, &bin) {
                 Ok(rx) => rx,
                 Err(e) => {
-                    log::error!("[upgrade] 返回 dsh:启动失败 {e:?},留在升级页");
+                    log::error!("[upgrade] 返回 dsh:启动失败 {e:?},留在升级卡片");
                     return;
                 }
             };
@@ -445,7 +461,7 @@ impl UpgradeManager {
                 Ok(p) => p,
                 Err(e) => {
                     dsh::kill_child(&dsh);
-                    log::error!("[upgrade] 返回 dsh:服务未就绪 {e:?},留在升级页");
+                    log::error!("[upgrade] 返回 dsh:服务未就绪 {e:?},留在升级卡片");
                     return;
                 }
             };
@@ -453,7 +469,7 @@ impl UpgradeManager {
             dsh.record_dsh_url(url.clone());
             dsh::spawn_reaper(dsh.clone(), rx);
             log::info!("[upgrade] 返回 dsh:服务已恢复 → {url}");
-            let _ = navigation::navigate_main_window(&app, &url);
+            up.reduce(UpgradeEvent::Dismissed);
         });
     }
 }
@@ -585,8 +601,9 @@ pub(crate) struct ManualCheckOutcome {
 }
 
 /// 手动检查发现新版:原生对话框 [升级][稍后]。
-/// [升级] → 导航升级卡片并自动开始流水线(#3 §1:确认即授权,不二次确认;
-/// #3 §4:文案明示中断语义)。
+/// [升级] → 显示窗口 + 自动开始流水线(#3 §1:确认即授权,不二次确认;
+/// #3 §4:文案明示中断语义;流水线进入 Active 后升级卡片浮层自动出现,
+/// 壳页常驻无需导航,#36)。
 fn show_found_dialog(app: &AppHandle, version: &str, current: &str) {
     let t = locales::shell_texts(locales::detect_lang());
     let app = app.clone();
@@ -601,10 +618,10 @@ fn show_found_dialog(app: &AppHandle, version: &str, current: &str) {
         .show_with_result(move |res| {
             if let MessageDialogResult::Custom(s) = res {
                 if s == t.update_now {
-                    log::info!("[upgrade] 对话框[升级] → 导航升级卡片 + 自动开始流水线");
+                    log::info!("[upgrade] 对话框[升级] → 显示窗口 + 自动开始流水线");
+                    tray::show_main_window(&app);
                     let up = app.state::<UpgradeManager>().inner().clone();
                     let dsh = app.state::<dsh::DshManager>().inner().clone();
-                    navigation::navigate_to_shell(&app);
                     up.confirm_start(&dsh);
                 }
             }
@@ -738,8 +755,9 @@ fn upgrade_pipeline(up: &UpgradeManager, dsh: &dsh::DshManager, pin: &str) {
         }
     };
 
-    // 5. ready:记录 URL → 清升级抑制标志(旧 dsh 的 reaper 在杀后早已过判定点,
-    //    此时清除安全,#3 §2)→ 导航窗口回 dsh 页(新端口 URL)
+    // 5. ready:record_dsh_url 推新端口 URL 给壳页(iframe 自动切换,ADR 0001)
+    //    → 清升级抑制标志(旧 dsh 的 reaper 在杀后早已过判定点,此时清除安全,
+    //    #3 §2)→ Ready 瞬态立即消费(壳页常驻后无窗口导航,卡片随 Idle 关闭)
     let url = dsh::dsh_url_for_port(port);
     dsh.record_dsh_url(url.clone());
     dsh::spawn_reaper(dsh.clone(), rx);
@@ -748,16 +766,8 @@ fn upgrade_pipeline(up: &UpgradeManager, dsh: &dsh::DshManager, pin: &str) {
     // 升级成功:清托盘徽标/菜单项(已是最新;下一次检查也会确认并清除,但
     // 不等 6h——用户此刻看到的「升级 dsh 到 vX」必须是新状态)
     tray::set_dsh_update(&up.app, None);
-    if navigation::navigate_main_window(&up.app, &url) {
-        log::info!("[upgrade] 升级完成 → {url}");
-        up.reduce(UpgradeEvent::Reset);
-    } else {
-        // 导航失败:dsh 服务在跑,不杀(返回 dsh 可再导航);错误留卡上可见
-        up.reduce(UpgradeEvent::Failed {
-            version: pin.to_string(),
-            error: UpgradeError::Dsh(DshError::NavigateFailed),
-        });
-    }
+    up.reduce(UpgradeEvent::Reset);
+    log::info!("[upgrade] 升级完成,已推 URL 给壳页 → {url}");
 }
 
 // ── Tauri commands(#3 §5:命令面 +3)────────────────────────────────
@@ -1003,6 +1013,27 @@ mod tests {
         );
         assert_eq!(apply_event(&s, UpgradeEvent::NoneFound), s);
         assert_eq!(apply_event(&s, UpgradeEvent::Reset), s); // 非 Ready 不清
+    }
+
+    #[test]
+    fn dismissed_closes_card_from_available_and_failed() {
+        // 卡片「稍后/返回 dsh」(壳页常驻后关闭卡片 = 状态归位,#36)
+        let s = apply_event(&available(), UpgradeEvent::Dismissed);
+        assert_eq!(s, UpgradeStateView::Idle);
+        let mut s = available();
+        s = apply_event(&s, UpgradeEvent::Started);
+        s = apply_event(&s, UpgradeEvent::Failed {
+            version: "0.1.0-rc.6".into(),
+            error: UpgradeError::Kind(UpgradeErrorKind::UpgradeVerifyFailed),
+        });
+        let s = apply_event(&s, UpgradeEvent::Dismissed);
+        assert_eq!(s, UpgradeStateView::Idle);
+        // 流水线在途 / Ready 不因 Dismissed 归位(Reset 负责 Ready 的消费)
+        let s = apply_event(&available(), UpgradeEvent::Started);
+        assert_eq!(apply_event(&s, UpgradeEvent::Dismissed), s);
+        let s = apply_event(&available(), UpgradeEvent::Started);
+        let s = apply_event(&s, UpgradeEvent::Succeeded);
+        assert_eq!(apply_event(&s, UpgradeEvent::Dismissed), s);
     }
 
     #[test]
