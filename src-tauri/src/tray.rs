@@ -177,12 +177,19 @@ fn collect_menu_state(app: &AppHandle) -> menu::MenuState {
     // 下载/就绪(#38 只有 dsh;本票 #39 按 #31「消除静默失败」补齐应用侧,
     // 与 on_check_update 的 toast 守卫同源:UI 先于点击诚实呈现)
     let upgrade_running = any_upgrade_running(app);
+    // dsh 流水线单独摘出:「升级 dsh」条目只被 dsh 流水线置灰(#40,
+    // 两层升级独立,应用流水线不置灰 dsh 条目)
+    let dsh_upgrade_running = app
+        .try_state::<upgrade::UpgradeManager>()
+        .map(|m| m.inner().is_pipeline_running())
+        .unwrap_or(false);
     menu::MenuState::new(
         theme::current_choice(),
         autostart::current(),
         app_version,
         dsh_version,
         upgrade_running,
+        dsh_upgrade_running,
         close::current(),
     )
 }

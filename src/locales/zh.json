@@ -16,6 +16,9 @@
   "common.close": "关闭",
   "common.quit": "退出",
   "common.retry": "重试",
+  "crash.message": "dsh 服务进程意外退出,页面已不可用。数据保存在本机,不受影响",
+  "crash.message.code": "dsh 服务进程意外退出(退出码 {{exitCode}}),页面已不可用。数据保存在本机,不受影响",
+  "crash.title": "dsh 意外退出",
   "error.title": "启动失败",
   "errors.BootListenFailed": "事件监听初始化失败,请重启应用。({{detail}})",
   "errors.BootRequestFailed": "启动请求失败:{{detail}}",
@@ -79,5 +82,9 @@
   "upgrade.installing.title": "正在升级 dsh…",
   "upgrade.later": "稍后",
   "upgrade.now": "立即升级",
-  "upgrade.restarting.title": "正在重启 dsh…"
+  "upgrade.restarting.title": "正在重启 dsh…",
+  "upgrade.stage.installing": "安装新版本",
+  "upgrade.stage.killing": "停止旧版服务",
+  "upgrade.stage.starting": "重启 dsh",
+  "upgrade.stage.verifying": "校验安装"
 }

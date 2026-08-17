@@ -1,22 +1,25 @@
 // Root app.壳页常驻(ADR 0001 / #36):单一 tauri WebView 窗口内是常驻壳页——
-// 菜单条占位区 + dsh iframe 容器 + 浮层挂载点;boot / 升级卡 / 更新卡 / 错误页
-// 全部作为浮层盖在 iframe 之上(浮层编排 M5 收口,本票 M1 只做骨架)。
-// 浮层互斥与优先级:升级卡 → 更新卡 → 错误页 → boot(升级卡优先,与原分发一致)。
-// dsh URL 单一事实来源在 Rust(record_dsh_url → dsh-url 事件/快照,useBoot 持有),
-// 壳页只负责 set iframe.src;dsh 就绪(URL 到达)后播放退出过渡动画溶解 boot
-// 浮层,揭示 iframe(useBootExit,fallback 兜底,动画不阻塞 dsh 呈现)。
-// 卡片可见性:升级/更新卡由状态 + 托盘显式请求驱动(isUpgradeCardVisible /
-// isUpdateCardVisible),不再依赖「页面挂载」信号(壳页不再重新挂载)。
+// 菜单条占位区 + dsh iframe 容器 + 全屏覆盖层挂载点。
+// M5(#40):覆盖层互斥由 deriveOverlay 纯函数编排(features/shell/derive.ts,
+// 优先级 Error > Upgrade > Boot;dsh 意外退出经 reaper 的 dsh-exited 事件 →
+// dshDown,升级流水线在途抑制误报)。boot / dsh 升级 / 意外退出三态 + 应用
+// 升级卡(决策面,不参与 derive 链,优先级最低)渲染在 ShellLayout 的浮层
+// 挂载点;菜单条不参与互斥,任何阶段常驻(ShellLayout 结构保证)。
+// dsh URL 单一事实来源在 Rust(record_dsh_url → dsh-url 事件/快照,useBoot
+// 持有),壳页只负责 set iframe.src;dsh 就绪(URL 到达)后播放退出过渡动画
+// 溶解 boot 覆盖层,揭示 iframe(useBootExit,fallback 兜底,动画不阻塞呈现)。
 // #39:shell-dialog 弹窗(AlertDialog/toast)与更新进度浮层(UpdateFloat)是
 // 非互斥层,不参与 overlay 链——浮层盖在 iframe 上但不阻止交互。
 import { BootScreen } from "@/components/boot/BootScreen"
 import { ErrorScreen } from "@/components/boot/ErrorScreen"
+import { CrashScreen } from "@/components/shell/CrashScreen"
 import { ShellDialogs } from "@/components/shell/ShellDialogs"
 import { ShellLayout } from "@/components/shell/ShellLayout"
 import { UpdateCard } from "@/components/update/UpdateCard"
 import { UpdateFloat } from "@/components/update/UpdateFloat"
 import { UpgradeScreen } from "@/components/upgrade/UpgradeScreen"
 import { Toaster } from "@/components/ui/sonner"
+import { deriveOverlay } from "@/features/shell/derive"
 import { useBoot } from "@/lib/useBoot"
 import { useBootExit } from "@/lib/useBootExit"
 import { useDshUpgrade } from "@/lib/useDshUpgrade"
@@ -34,6 +37,8 @@ export default function App() {
     nodeVersion,
     elapsedSecs,
     dshUrl,
+    dshDown,
+    dshExitCode,
     retry,
     quit,
   } = useBoot()
@@ -51,20 +56,26 @@ export default function App() {
     ready: phase === "ready" && dshUrl !== null,
   })
 
-  // 浮层可见性:升级卡优先(与 #3 §5 分发一致),其次更新卡,再次错误页,
-  // boot 兜底(idle 也显示 boot 页,避免挂载瞬间的空壳闪烁)。
-  const showBootOverlay =
-    phase === "idle" ||
-    phase === "error" ||
-    phase === "checking" ||
-    phase === "installing" ||
-    phase === "starting" ||
-    (phase === "ready" && !done)
+  // 覆盖层互斥(纯函数,derive.test.ts 守住三路状态组合):Error > Upgrade >
+  // Boot;bootRevealed(done)让就绪后的退出动画撑住 boot 覆盖层直到揭示
+  const overlayKind = deriveOverlay({
+    bootPhase: phase,
+    bootRevealed: done,
+    upgradeStatus: dshUpgrade.status,
+    upgradeVisible: dshUpgrade.visible,
+    dshDown,
+  })
+
   // 单一表达式(无浮层时传 null):ShellLayout 靠 children 真假切换浮层挂载点
   // 的 pointer-events——多个条件兄弟表达式会形成 [null,…] 数组,空浮层挡
   // 不住 iframe 点击,故这里只产出一个值。
-  const overlay =
-    dshUpgrade.visible ? (
+  // 顺序:derive 链三态(错误/升级/boot)优先;应用升级卡(决策面,不参与
+  // derive 链)兜底——升级卡只承载用户决策,不打断更紧急的覆盖层。
+  const overlay = overlayKind ? (
+    overlayKind.kind === "error" ? (
+      // dsh 意外退出:reaper → dsh-exited → 全屏错误覆盖层 + [重试](重跑 boot)
+      <CrashScreen exitCode={dshExitCode} retry={retry} quit={quit} />
+    ) : overlayKind.kind === "upgrade" ? (
       <UpgradeScreen
         status={dshUpgrade.status}
         version={dshUpgrade.version}
@@ -76,32 +87,33 @@ export default function App() {
         onConfirm={dshUpgrade.confirm}
         onDismiss={dshUpgrade.dismiss}
       />
-    ) : update.visible ? (
-      <UpdateCard
-        status={update.status}
-        version={update.version}
-        currentVersion={update.currentVersion}
-        notes={update.notes}
-        error={update.error}
-        onApply={update.applyUpdate}
-        onDismiss={update.dismiss}
-        onOpenReleases={update.openReleases}
+    ) : overlayKind.phase === "error" ? (
+      // boot 失败页(含 Node 引导页分支,ErrorScreen 内部判别)
+      <ErrorScreen error={error} logs={logs} retry={retry} quit={quit} />
+    ) : (
+      <BootScreen
+        // overlayKind.phase 已由上方判别收窄到非 error 阶段(与 phase 同值)
+        phase={overlayKind.phase}
+        progress={progress}
+        stage={stage}
+        nodeVersion={nodeVersion}
+        elapsedSecs={elapsedSecs}
+        exiting={exiting}
+        onExitAnimationEnd={onExitAnimationEnd}
       />
-    ) : showBootOverlay ? (
-      phase === "error" ? (
-        <ErrorScreen error={error} logs={logs} retry={retry} quit={quit} />
-      ) : (
-        <BootScreen
-          phase={phase}
-          progress={progress}
-          stage={stage}
-          nodeVersion={nodeVersion}
-          elapsedSecs={elapsedSecs}
-          exiting={exiting}
-          onExitAnimationEnd={onExitAnimationEnd}
-        />
-      )
-    ) : null
+    )
+  ) : update.visible ? (
+    <UpdateCard
+      status={update.status}
+      version={update.version}
+      currentVersion={update.currentVersion}
+      notes={update.notes}
+      error={update.error}
+      onApply={update.applyUpdate}
+      onDismiss={update.dismiss}
+      onOpenReleases={update.openReleases}
+    />
+  ) : null
 
   // 更新进度浮层(右下角非模态):downloading/ready 不参与互斥 overlay 链,
   // 独立渲染盖在 iframe 之上(fixed 定位,不阻止 dsh 交互,#31 拍板)

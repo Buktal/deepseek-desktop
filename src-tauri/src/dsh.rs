@@ -187,6 +187,17 @@ pub struct DshUrlView {
     pub url: String,
 }
 
+/// `dsh-exited` 事件载荷(reaper 推 dsh 意外退出给壳页,#31 场景 6 / #40)。
+/// 只有「非主动退出流程」的意外退出才推(退出流程 / 升级流水线在途被抑制,
+/// 见 spawn_reaper);壳页据此进入全屏错误覆盖层 + [重试]。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshExitedView {
+    /// 退出码(句柄异常等未知场景为 None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
 struct BootState {
     phase: Phase,
     error: Option<DshError>,
@@ -896,9 +907,13 @@ fn boot_pipeline(manager: &DshManager) {
 }
 
 /// 收割线程:排空 channel 直到读线程结束(进程退出或被杀),再 wait 回收。
-/// 若 dsh 意外退出(非主动退出流程),上报日志——弹窗提示已移除(#39:
-/// 意外退出呈现转 M5 全屏覆盖层,编排见 #32;本票先移除原生调用)。
-/// UPGRADE_ACTIVE / is_quitting 抑制标志仍保留(判定语义留给 M5)。
+/// dsh 意外退出(非主动退出流程)时推 `dsh-exited` 事件:壳页全屏错误覆盖层
+/// + [重试](重跑 boot)。原原生弹窗已在 #39 移除,呈现转本覆盖层(#31 场景 6 / #32 拍板 / #40 施工)。
+///
+/// 意外退出判定与 #32「以 upgrade pipeline 在途标志为准」一致。
+/// - is_quitting:程序化退出流程(quit_app / 托盘退出),不推
+/// - upgrade_active:升级流水线杀旧 dsh 是流水线的一部分(killing 阶段),不推
+/// - 其余(phase 仍为 Ready 而 dsh 进程退出)= 意外退出,推事件
 ///
 /// 竞态防护:只有 phase 仍为 Ready 时才取子进程句柄。若排空期间用户已重试
 /// (phase 进入 Checking),新 boot 的 child 已写入 manager——此时取走会令
@@ -914,14 +929,17 @@ pub(crate) fn spawn_reaper(manager: DshManager, rx: Receiver<(String, String)>) 
         let child = manager.take_child();
         if let Some(mut c) = child {
             let status = c.wait();
-            let ok = status.map(|s| s.success()).unwrap_or(false);
+            let exit_code = status.ok().and_then(|s| s.code());
+            let quitting = is_quitting();
+            let upgrade = upgrade_active();
             log::info!(
-                "[dsh] reaper: dsh 子进程退出, ok={ok}, quitting={}, upgrade_active={}",
-                is_quitting(),
-                upgrade_active()
+                "[dsh] reaper: dsh 子进程退出, exit_code={exit_code:?}, quitting={quitting}, upgrade_active={upgrade}"
             );
-            // 意外退出判定(非主动退出流程)已无 UI 消费方:#39 移除原生弹窗,
-            // 呈现转 M5 全屏覆盖层(#32 编排);UPGRADE_ACTIVE 抑制语义届时复用
+            if !quitting && !upgrade {
+                let _ = manager
+                    .app
+                    .emit_to("main", "dsh-exited", DshExitedView { exit_code });
+            }
         }
     });
 }
@@ -930,7 +948,9 @@ pub(crate) fn spawn_reaper(manager: DshManager, rx: Receiver<(String, String)>) 
 
 /// 触发(或重试)boot 流水线,并返回含最近日志的状态快照。
 /// 挂载/重试一调两用:触发 + 拉快照,命令面从 3 收窄到 2(boot/quit_app)。
-/// phase 守卫:非 Idle/Error 时 no-op(防 StrictMode 双 invoke),快照仍正常返回。
+/// phase 守卫:非 Idle/Error 且 dsh 在跑时 no-op(防 StrictMode 双 invoke /
+/// 正常态误触重启;Ready + dsh 已死的意外退出重试放行,见 boot_start),
+/// 快照仍正常返回。
 /// async + Result:不占用 IPC/主线程(tauri 2 要求含引用输入的 async command 返回 Result)。
 #[tauri::command]
 pub async fn boot(state: tauri::State<'_, DshManager>) -> Result<BootStateSnapshot, String> {
@@ -938,11 +958,16 @@ pub async fn boot(state: tauri::State<'_, DshManager>) -> Result<BootStateSnapsh
     Ok(state.inner().snapshot())
 }
 
-/// 在独立线程启动流水线;Idle(首启)/Error(重试)时才生效,其余阶段 no-op。
+/// 在独立线程启动流水线;Idle(首启)/ Error(重试)/ Ready 且 dsh 已死(意外
+/// 退出覆盖层的 [重试] 重跑 boot,#40)时才生效,其余阶段 no-op。
 /// BOOTING 标志防并发双流水线(StrictMode 双 invoke + setup 主动启动)。
 pub fn boot_start(manager: &DshManager) {
     let phase = manager.phase();
-    if !matches!(phase, Phase::Idle | Phase::Error) {
+    // Ready 的常规语义是「dsh 在跑」:正常态下 boot 命令 no-op,防误触重启;
+    // 意外退出后 reaper 已收割子进程(句柄为空),Ready + 无进程 = 需要重跑
+    let can_boot = matches!(phase, Phase::Idle | Phase::Error)
+        || (phase == Phase::Ready && !dsh_is_running(manager));
+    if !can_boot {
         return;
     }
     if BOOTING.swap(true, Ordering::SeqCst) {
@@ -1097,6 +1122,19 @@ mod tests {
                 "nodeVersion": "v22.19.0",
                 "elapsedSecs": 1
             })
+        );
+    }
+
+    #[test]
+    fn dsh_exited_view_serializes_exit_code() {
+        // 线上契约(dsh-exited 事件):camelCase;退出码未知时字段缺省不出现
+        assert_eq!(
+            serde_json::to_value(DshExitedView { exit_code: Some(1) }).unwrap(),
+            serde_json::json!({ "exitCode": 1 })
+        );
+        assert_eq!(
+            serde_json::to_value(DshExitedView { exit_code: None }).unwrap(),
+            serde_json::json!({})
         );
     }
 

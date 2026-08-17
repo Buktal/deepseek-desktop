@@ -16,6 +16,9 @@
   "common.close": "Close",
   "common.quit": "Quit",
   "common.retry": "Retry",
+  "crash.message": "The dsh service exited unexpectedly and the page is unavailable. Your data stays on this machine",
+  "crash.message.code": "The dsh service exited unexpectedly (exit code {{exitCode}}) and the page is unavailable. Your data stays on this machine",
+  "crash.title": "dsh quit unexpectedly",
   "error.title": "Startup failed",
   "errors.BootListenFailed": "Failed to initialize event listening; please restart the app. ({{detail}})",
   "errors.BootRequestFailed": "Startup request failed: {{detail}}",
@@ -79,5 +82,9 @@
   "upgrade.installing.title": "Upgrading dsh…",
   "upgrade.later": "Later",
   "upgrade.now": "Upgrade now",
-  "upgrade.restarting.title": "Restarting dsh…"
+  "upgrade.restarting.title": "Restarting dsh…",
+  "upgrade.stage.installing": "Installing new version",
+  "upgrade.stage.killing": "Stopping old service",
+  "upgrade.stage.starting": "Restarting dsh",
+  "upgrade.stage.verifying": "Verifying install"
 }

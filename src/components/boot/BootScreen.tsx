@@ -7,11 +7,12 @@
 // 阶段 + 百分比),其余阶段不确定进度(滑动指示,不显示假百分比);全程显示耗时
 // (boot.elapsed.* 键)作右下仪表读数,`aria-live="off"` 每秒不打扰读屏。
 // #13:checking 阶段携带 nodeVersion 时显示检测结果(「检测到 Node.js vX」)。
+// M5(#40):本组件是全屏覆盖层的 boot 状态面(deriveOverlay 编排),渲染在
+// ShellLayout 浮层挂载点,菜单条常驻。
 import { Check } from "lucide-react"
 import { useTranslation } from "react-i18next"
 
 import { InstallProgress } from "@/components/install/InstallProgress"
-import { ProgressRail } from "@/components/shell/ProgressRail"
 import { formatElapsed } from "@/lib/elapsed"
 import { cn } from "@/lib/utils"
 import type { Phase } from "@/lib/useBoot"
@@ -54,7 +55,6 @@ export function BootScreen({
         ? t("boot.elapsed.minSec", { m: minutes, s: seconds })
         : t("boot.elapsed.sec", { s: seconds })
   }
-  const installing = phase === "installing" && progress !== null
   return (
     <main
       className={cn(
@@ -94,13 +94,9 @@ export function BootScreen({
           </div>
 
           <div className="flex flex-col gap-1.5">
-            {installing ? (
-              /* 安装中:确定进度(阶段文案 + 百分比),boot 与升级链共用组件 */
-              <InstallProgress progress={progress} stage={stage} i18nPrefix="boot" />
-            ) : (
-              /* 不确定进度条(滑动指示,不显示假百分比) */
-              <ProgressRail value={null} />
-            )}
+            {/* 进度:安装中确定进度(阶段文案 + 百分比),其余阶段不确定进度
+                (滑动指示,不显示假百分比)——boot 与升级链共用 InstallProgress */}
+            <InstallProgress progress={progress} stage={stage} i18nPrefix="boot" />
             {/* 耗时读数:右对齐仪表读数;aria-live="off" 每秒更新不打扰读屏 */}
             {elapsedText && (
               <p className="text-right text-xs tabular-nums text-muted-foreground" aria-live="off">

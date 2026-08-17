@@ -1,7 +1,8 @@
 // boot 流水线前端接线:监听事件 + 触发/重试(触发命令同时返回状态快照,一调两用)。
 // 同步骨架(先注册监听、再拉快照、后到者覆盖)走共享的 useRustStateSync;
 // 本 hook 只负责 boot 特有的部分:applyView 字段映射、错误转结构化形态(fatal)、
-// 耗时锚点插值、quit/retry。
+// 耗时锚点插值、quit/retry、dsh 意外退出态(dsh-exited 事件 → dshDown,
+// deriveOverlay 的 Error 输入,#40)。
 import { invoke } from "@tauri-apps/api/core"
 import { listen } from "@tauri-apps/api/event"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
@@ -47,6 +48,12 @@ export interface DshUrlPayload {
   url: string
 }
 
+/** Rust 侧 dsh-exited 事件载荷(reaper 推 dsh 意外退出,见 dsh.rs;字段缺省
+ *  时 exitCode 为 null——句柄异常等未知场景) */
+export interface DshExitedPayload {
+  exitCode?: number | null
+}
+
 export function useBoot() {
   const [phase, setPhase] = useState<Phase>("idle")
   // 跨边界保持结构化形态,ErrorScreen 渲染时才翻译(语言切换不冻结旧文案)
@@ -67,12 +74,21 @@ export function useBoot() {
   // 快照携带 + dsh-url 事件两条来源,后到者覆盖(与 boot-state 同款竞态语义);
   // 只增不清——URL 记录后就一直有效,旧值在新 URL 到达前仍是当前呈现
   const [dshUrl, setDshUrl] = useState<string | null>(null)
+  // dsh 意外退出(reaper dsh-exited 事件置位 → deriveOverlay 出全屏错误覆盖层,
+  // #32/#40):升级流水线在途的杀进程由 Rust 侧抑制(不推事件),此处镜像判定
+  // 的输入只承载真实意外退出。清除时机 = dsh 重新变活:新 boot 开始(checking
+  // 阶段)与任何新 URL 推达(dsh-url,覆盖升级完成 / 返回 dsh 等恢复路径)
+  const [dshDown, setDshDown] = useState(false)
+  const [dshExitCode, setDshExitCode] = useState<number | null>(null)
 
   /** 应用一份状态视图(事件或快照):阶段/错误/进度/耗时统一入口。
    *  logs 只有快照携带(事件载荷是快照子集,经 source 区分)。 */
   const applyView = useCallback((view: BootStateSnapshot, source: "event" | "snapshot") => {
     if (view.phase === "checking") {
       setLogs([]) // 全新一次 boot 的语义边界(Rust 侧同步清空缓冲)
+      // 意外退出覆盖层的 [重试] = 重跑 boot:新 boot 开始即清除退出态
+      setDshDown(false)
+      setDshExitCode(null)
     }
     setPhase(view.phase)
     setError(toStructuredError(view.error ?? null))
@@ -108,7 +124,33 @@ export function useBoot() {
     let alive = true
     let stop: (() => void) | undefined
     void listen<DshUrlPayload>("dsh-url", (e) => {
-      if (alive && typeof e.payload?.url === "string") setDshUrl(e.payload.url)
+      if (!alive) return
+      if (typeof e.payload?.url === "string") {
+        setDshUrl(e.payload.url)
+        // 任何恢复路径(升级完成 / 返回 dsh / 重试就绪)推达新 URL = dsh
+        // 重新变活,意外退出态清除(否则覆盖层在恢复后仍占屏)
+        setDshDown(false)
+        setDshExitCode(null)
+      }
+    }).then((un) => {
+      stop = un
+      if (!alive) un()
+    })
+    return () => {
+      alive = false
+      stop?.()
+    }
+  }, [])
+
+  // dsh-exited 事件:reaper 推 dsh 意外退出(Rust 侧已排除退出流程 / 升级
+  // 流水线在途)→ 置位 dshDown,deriveOverlay 出全屏错误覆盖层(#32/#40)
+  useEffect(() => {
+    let alive = true
+    let stop: (() => void) | undefined
+    void listen<DshExitedPayload>("dsh-exited", (e) => {
+      if (!alive) return
+      setDshDown(true)
+      setDshExitCode(typeof e.payload?.exitCode === "number" ? e.payload.exitCode : null)
     }).then((un) => {
       stop = un
       if (!alive) un()
@@ -173,6 +215,8 @@ export function useBoot() {
     nodeVersion,
     elapsedSecs: displayElapsedSecs,
     dshUrl,
+    dshDown,
+    dshExitCode,
     retry,
     quit,
   }

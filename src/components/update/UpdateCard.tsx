@@ -2,9 +2,9 @@
 // 常驻,#36)。形态定稿(#3 §1):升级主交互 = 卡片收容面板,不用 Popover——
 // 本外壳窗口没有可锚定 Popover 的常驻页面;不用模态弹窗——升级流程含分钟级
 // 安装进度,卡片提供「稍后」,不强制决策。
-// 视觉(#20 审核定稿):决策面 = 收容卡片(bg-card + border),与 boot 流程的
-// 开放画布区分——升级是用户可执行的动作面板,不是状态仪表。外壳与 dsh 升级卡
-// 共用 FullScreenCard。
+// 视觉(#20 审核定稿):决策面 = 收容卡片(shadcn Card,M5 迁移后 FullScreenCard
+// 退役),与 boot 流程的开放画布区分——升级是用户可执行的动作面板,不是状态
+// 仪表。
 //
 // #39(#31 拍板):下载中/完成不再用整屏卡片打断——下载进度改为右下角非模态
 // 浮层 UpdateFloat(下载不打断使用 dsh),本卡片只承载 available(发现新版
@@ -18,8 +18,8 @@
 import { CircleArrowUp, ExternalLink } from "lucide-react"
 import { useTranslation } from "react-i18next"
 
-import { FullScreenCard } from "@/components/shell/FullScreenCard"
 import { Button } from "@/components/ui/button"
+import { Card } from "@/components/ui/card"
 import { localizeStructuredError, type StructuredError } from "@/lib/error"
 import { summarizeReleaseNotes } from "@/lib/releaseNotes"
 import type { UpdateStatus } from "@/lib/useUpdateCheck"
@@ -46,7 +46,8 @@ export function UpdateCard({
   const { t } = useTranslation()
 
   return (
-    <FullScreenCard>
+    <main className="flex h-full w-full items-center justify-center bg-background p-10 text-foreground">
+      <Card className="flex w-full max-w-md flex-col items-center gap-5 rounded-2xl p-10 text-center shadow-sm">
       {status === "available" && (
         <>
           <CircleArrowUp className="size-9 text-primary" />
@@ -98,6 +99,7 @@ export function UpdateCard({
           </div>
         </>
       )}
-    </FullScreenCard>
+      </Card>
+    </main>
   )
 }

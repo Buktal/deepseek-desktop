@@ -29,7 +29,8 @@
 //! 开机自启       id="autostart"     (勾选,默认关,#14)
 //! ───────────────
 //! 升级到 vX      id="upgrade-available"(仅发现新版时存在,动态,#3 §1,badge)
-//! 升级 dsh 到 vX id="upgrade-dsh"    (仅发现新版时存在,动态,#3 §1,badge)
+//! 升级 dsh 到 vX id="upgrade-dsh"    (仅发现新版时存在,动态,#3 §1,badge;
+//!                                       dsh 升级流水线在途时 disabled,#40)
 //! 检查更新       id="check-update"   (任一升级流水线在途时 disabled)
 //! ───────────────
 //! 退出           id="quit"
@@ -98,16 +99,21 @@ pub struct MenuState {
     /// 更新」disabled 的依据,与 tray 动作层的 no-op 守卫同源——行为先有
     /// 守卫,快照只是让 UI 先于点击诚实呈现)
     pub upgrade_running: bool,
+    /// dsh 升级流水线在途(「升级 dsh」动态条目 disabled 的依据,#40;
+    /// 与 upgrade_running 分离:两层升级独立,应用流水线不置灰 dsh 条目)
+    pub dsh_upgrade_running: bool,
     pub close_behavior: CloseBehavior,
 }
 
 impl MenuState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         theme_choice: ThemeChoice,
         autostart: bool,
         app_update: Option<String>,
         dsh_update: Option<String>,
         upgrade_running: bool,
+        dsh_upgrade_running: bool,
         close_behavior: CloseBehavior,
     ) -> Self {
         Self {
@@ -116,6 +122,7 @@ impl MenuState {
             app_update,
             dsh_update,
             upgrade_running,
+            dsh_upgrade_running,
             close_behavior,
         }
     }
@@ -228,7 +235,14 @@ pub fn build_snapshot(t: &ShellTexts, s: &MenuState) -> MenuSnapshot {
     // 动态升级项:先 dsh 后应用(任一存在即插入对应项,不存在则不占位,#3 §1);
     // badge 承载待升级版本(前端菜单按钮徽标点)
     if let Some(v) = &s.dsh_update {
-        items.push(upgrade_item("upgrade-dsh", t.tray_upgrade_dsh_label(v), v));
+        let mut item = upgrade_item("upgrade-dsh", t.tray_upgrade_dsh_label(v), v);
+        // #40:升级流水线在途时「升级 dsh」置灰(快照机制;升级会重杀 dsh,
+        // 与「检查更新」的 disabled 同款「UI 先于点击诚实呈现」——点击侧本
+        // 就无意义:覆盖层已在升级中,再弹请求无效果)
+        if s.dsh_upgrade_running {
+            item.disabled = Some(true);
+        }
+        items.push(item);
     }
     if let Some(v) = &s.app_update {
         items.push(upgrade_item("upgrade-available", t.tray_upgrade_label(v), v));
@@ -274,7 +288,15 @@ mod tests {
 
     /// 默认状态:跟随系统 / 自启关 / 无升级 / 流水线空闲 / 每次询问。
     fn default_state() -> MenuState {
-        MenuState::new(ThemeChoice::System, false, None, None, false, CloseBehavior::Ask)
+        MenuState::new(
+            ThemeChoice::System,
+            false,
+            None,
+            None,
+            false,
+            false,
+            CloseBehavior::Ask,
+        )
     }
 
     #[test]
@@ -390,6 +412,40 @@ mod tests {
         // 无升级槽位:动态项不占位
         let snap = build_snapshot(&zh(), &default_state());
         assert!(snap.items.iter().all(|i| i.id != "upgrade-dsh" && i.id != "upgrade-available"));
+    }
+
+    #[test]
+    fn dsh_upgrade_pipeline_disables_upgrade_dsh_item() {
+        // #40:「升级 dsh」动态条目在 dsh 升级流水线在途时置灰(快照机制);
+        // 应用流水线在途不置灰(两层升级独立)
+        let s = MenuState {
+            dsh_update: Some("0.1.0-rc.9".into()),
+            dsh_upgrade_running: true,
+            ..default_state()
+        };
+        let snap = build_snapshot(&zh(), &s);
+        let item = snap.items.iter().find(|i| i.id == "upgrade-dsh").unwrap();
+        assert_eq!(item.disabled, Some(true));
+        // badge 保留(通知形态与置灰不冲突)
+        assert_eq!(item.badge.as_deref(), Some("0.1.0-rc.9"));
+        // 应用流水线在途:dsh 条目保持可点
+        let s = MenuState {
+            dsh_update: Some("0.1.0-rc.9".into()),
+            upgrade_running: true, // 应用升级下载/就绪
+            dsh_upgrade_running: false,
+            ..default_state()
+        };
+        let snap = build_snapshot(&zh(), &s);
+        let item = snap.items.iter().find(|i| i.id == "upgrade-dsh").unwrap();
+        assert_eq!(item.disabled, None);
+        // 流水线结束后恢复可点
+        let s = MenuState {
+            dsh_update: Some("0.1.0-rc.9".into()),
+            ..default_state()
+        };
+        let snap = build_snapshot(&zh(), &s);
+        let item = snap.items.iter().find(|i| i.id == "upgrade-dsh").unwrap();
+        assert_eq!(item.disabled, None);
     }
 
     #[test]
