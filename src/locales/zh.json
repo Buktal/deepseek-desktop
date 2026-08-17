@@ -47,6 +47,7 @@
   "errors.ReadyPortUnavailable": "dsh 已打印就绪地址但端口 {{port}} 未监听",
   "errors.UpgradeKillFailed": "无法停止当前 dsh 服务:{{detail}}",
   "errors.UpgradeVerifyFailed": "升级后版本校验失败,请重试",
+  "errors.UpgradeFrameBlocked": "新版 dsh 的页面响应带帧嵌入限制头({{header}}),壳的 iframe 架构无法显示它。回退预案:从 git 历史恢复整窗互斥导航(ADR 0001);如需继续使用旧版,可手动执行 npm install -g @deepseek-ai/dsh@旧版本号",
   "errors.UpdateDownloadFailed": "下载更新失败: {{detail}}",
   "errors.unknown": "未知错误",
   "guide.afterInstallHint": "安装完成后点击「重试」重新检测",

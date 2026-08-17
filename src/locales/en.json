@@ -47,6 +47,7 @@
   "errors.ReadyPortUnavailable": "dsh printed a ready address but port {{port}} is not listening",
   "errors.UpgradeKillFailed": "Could not stop the current dsh service: {{detail}}",
   "errors.UpgradeVerifyFailed": "Version verification failed after upgrade, please retry",
+  "errors.UpgradeFrameBlocked": "The new dsh version serves a frame-blocking response header ({{header}}), which the shell's iframe architecture cannot display. Rollback plan: restore the full-window navigation from git history (ADR 0001); to keep using the old version, run npm install -g @deepseek-ai/dsh@<old-version> manually",
   "errors.UpdateDownloadFailed": "Update download failed: {{detail}}",
   "errors.unknown": "Unknown error",
   "guide.afterInstallHint": "After installing, click \"Retry\" to check again",

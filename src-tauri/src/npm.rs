@@ -282,6 +282,19 @@ fn stderr_tail_has_permission(stderr_tail: &[String]) -> bool {
     })
 }
 
+/// 判定 stderr 尾部是否 npm ETARGET 错误(纯函数,可测试)。
+/// ETARGET = npm 按手头 packument 判定「请求的版本不存在」
+/// ("No matching version found for <pkg>@<ver>",code ETARGET/notarget)。
+/// 在升级链场景这几乎必然是内置离线缓存 packument 早于目标版本造成的
+/// 假阴性(registry 直查刚确认过该版本存在)——调用方据此回退无缓存重试
+/// (根治方案,见 dsh.rs npm_install_global 的 ETARGET 注释)。
+pub(crate) fn stderr_has_etarget(stderr_tail: &[String]) -> bool {
+    stderr_tail.iter().any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.contains("etarget") || l.contains("notarget")
+    })
+}
+
 // ── 安装进度模拟(#7,单一事实来源:boot 与升级链共用)────────────────
 
 /// 安装模拟进度的子阶段。npm 安装期**没有真实百分比**(管道非 TTY + `--no-progress`,
@@ -589,6 +602,32 @@ mod tests {
                 stderr_tail: String::new(),
             }
         );
+    }
+
+    #[test]
+    fn stderr_has_etarget_detects_npm_notarget_output() {
+        // npm 实测 ETARGET 输出形态:code ETARGET + notarget 解释行
+        let tail = vec![
+            "npm error code ETARGET".to_string(),
+            "npm error notarget No matching version found for @deepseek-ai/dsh@0.1.0-rc.7.".to_string(),
+            "npm error notarget In most cases you or one of your dependencies are requesting".to_string(),
+        ];
+        assert!(stderr_has_etarget(&tail));
+        // 单行命中(截断只留尾部时的形态)
+        assert!(stderr_has_etarget(&["npm error notarget No matching version found for @deepseek-ai/dsh@0.1.0-rc.7.".to_string()]));
+        assert!(stderr_has_etarget(&["npm error code ETARGET".to_string()]));
+        // 大小写变体
+        assert!(stderr_has_etarget(&["npm error code etarget".to_string()]));
+    }
+
+    #[test]
+    fn stderr_has_etarget_ignores_other_failures() {
+        // 权限 / 网络 / 空输出都不是 ETARGET(不回退重试)
+        assert!(!stderr_has_etarget(&["npm error code EPERM".to_string()]));
+        assert!(!stderr_has_etarget(&["npm error code ENOTFOUND".to_string()]));
+        assert!(!stderr_has_etarget(&["npm error code EACCES".to_string()]));
+        assert!(!stderr_has_etarget(&[]));
+        assert!(!stderr_has_etarget(&["npm error code ETIMEDOUT".to_string()])); // 与 ETARGET 不同码
     }
 
     #[test]

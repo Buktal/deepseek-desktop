@@ -90,13 +90,24 @@ pub enum UpdateError {
 
 /// 升级特有错误(kind 与 dsh 生命周期错误不重名)。文案模板在 locale JSON
 /// 的 `errors.<kind>` 键,数据只携带运行时事实。
+/// `Upgrade` 前缀是刻意的命名空间:kind 与 DshError 共用前端 `errors.*`
+/// 翻译命名空间(升级错误以 DshError 形态透传,零额外机制),前缀保证
+/// 不重名(如 UpgradeKillFailed ≠ 任何 DshError kind)——clippy
+/// enum_variant_names 的改名建议会破坏线上契约,压制。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "data", rename_all = "PascalCase", rename_all_fields = "camelCase")]
+#[allow(clippy::enum_variant_names)]
 pub enum UpgradeErrorKind {
     /// 无法停止当前 dsh 服务(杀后超时仍存活)
     UpgradeKillFailed { detail: String },
     /// 升级后版本校验失败(全局 version ≠ pin 或 bin.js 缺失)
     UpgradeVerifyFailed,
+    /// 上游耦合防线(ADR 0001 / #29,#41):新版 dsh 的响应带帧嵌入限制头
+    /// (X-Frame-Options / CSP frame-ancestors),壳的 iframe 架构无法呈现它。
+    /// header = 命中的头原文(如 `X-Frame-Options: DENY`),前端按
+    /// errors.UpgradeFrameBlocked 键翻译并指引回退预案(恢复整窗互斥导航,
+    /// git 历史可回)。
+    UpgradeFrameBlocked { header: String },
 }
 
 /// dsh 升级失败的结构化原因:升级特有错误 + 与 dsh 生命周期共用的安装/启动类
@@ -158,6 +169,16 @@ mod tests {
         assert_eq!(
             serde_json::to_value(UpgradeError::Kind(UpgradeErrorKind::UpgradeVerifyFailed)).unwrap(),
             serde_json::json!({ "kind": "UpgradeVerifyFailed" })
+        );
+        assert_eq!(
+            serde_json::to_value(UpgradeError::Kind(UpgradeErrorKind::UpgradeFrameBlocked {
+                header: "X-Frame-Options: DENY".into()
+            }))
+            .unwrap(),
+            serde_json::json!({
+                "kind": "UpgradeFrameBlocked",
+                "data": { "header": "X-Frame-Options: DENY" }
+            })
         );
         // DshError 形态透传:untagged 序列化与 DshError 自身一致,前端零额外机制
         assert_eq!(

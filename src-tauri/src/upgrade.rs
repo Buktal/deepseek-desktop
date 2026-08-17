@@ -54,6 +54,8 @@ use crate::{dsh, npm, tray, update};
 const REGISTRY_URL: &str = "https://registry.npmjs.org/@deepseek-ai/dsh";
 /// 直查超时(#2 定稿 3-5s):超时/任何异常静默按无新版,不影响启动。
 const CHECK_TIMEOUT: Duration = Duration::from_secs(4);
+/// 帧嵌入回归检查超时(本地 127.0.0.1 服务,3s 足够)。
+const FRAME_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ── 全局守卫(跨线程)────────────────────────────────────────────────
 
@@ -559,6 +561,74 @@ fn ensure_tls_provider() {
     }
 }
 
+// ── 上游耦合防线:帧嵌入回归检查(ADR 0001 / #29,#41)────────────────
+
+/// CSP 头是否含 frame-ancestors 指令(纯函数,可测)。
+/// 按指令解析(分号分段,取每段首 token 与指令名比对,大小写不敏感)——
+/// 不按子串匹配,避免 nonce/值里恰好出现同名串的误报。
+fn csp_blocks_framing(csp_value: &str) -> bool {
+    csp_value.split(';').any(|directive| {
+        let mut parts = directive.split_whitespace();
+        parts
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("frame-ancestors"))
+    })
+}
+
+/// 判定响应头是否禁止跨源 iframe 嵌入(纯函数,可测)。命中返回头原文
+/// (供错误展示,前端模板插值);未命中返回 None。
+///
+/// 判据(壳页是本地 origin、dsh 是 127.0.0.1 动态端口,必然跨源):
+/// - 任意 X-Frame-Options 头即禁止——DENY 自不必说,SAMEORIGIN 对跨源
+///   同样拦截(HeaderMap 取值大小写不敏感);
+/// - CSP 含 frame-ancestors 指令即禁止——dsh 服务无从枚举壳页 origin,
+///   出现即几乎必然不含壳页、必拦。
+fn frame_blocking_header(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    if let Some(xfo) = headers.get(reqwest::header::X_FRAME_OPTIONS) {
+        let value = String::from_utf8_lossy(xfo.as_bytes()).to_string();
+        return Some(format!("X-Frame-Options: {value}"));
+    }
+    for csp in headers.get_all(reqwest::header::CONTENT_SECURITY_POLICY) {
+        let value = String::from_utf8_lossy(csp.as_bytes());
+        if csp_blocks_framing(&value) {
+            return Some(format!("Content-Security-Policy: {value}"));
+        }
+    }
+    None
+}
+
+/// 对运行中的 dsh 服务做帧嵌入回归检查(GET 根路径,读响应头)。
+/// 命中 XFO / frame-ancestors → Err(UpgradeFrameBlocked,升级流水线失败,
+/// 前端按 errors.UpgradeFrameBlocked 翻译并指引回退预案)。
+/// 请求失败/超时/客户端构造失败 → 记日志放行:探测不确定不等于「被禁止」,
+/// 不为不确定的探测拦掉升级(防御检查是找「已确认的上游耦合」,不是网络
+/// 可用性检查;wait_ready 已确认服务在监听)。
+async fn check_frame_blocking(url: &str) -> Result<(), UpgradeError> {
+    ensure_tls_provider(); // 与 fetch_latest_version 同款:本地请求也经 rustls 客户端
+    let client = reqwest::Client::builder()
+        .timeout(FRAME_CHECK_TIMEOUT)
+        .build()
+        .ok();
+    let Some(client) = client else {
+        return Ok(());
+    };
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("[upgrade] 帧嵌入回归检查:请求失败(按未命中放行) {url}: {e}");
+            return Ok(());
+        }
+    };
+    if let Some(header) = frame_blocking_header(resp.headers()) {
+        log::error!("[upgrade] 帧嵌入回归检查:命中 {header} → 升级失败");
+        return Err(UpgradeError::Kind(UpgradeErrorKind::UpgradeFrameBlocked {
+            header,
+        }));
+    }
+    log::info!("[upgrade] 帧嵌入回归检查通过(无 XFO / frame-ancestors) {url}");
+    Ok(())
+}
+
 /// 托盘「检查更新」手动入口的 dsh 层(组合编排与弹窗/toast 呈现全在
 /// tray::on_check_update,#39):检查 → 结果。boot 未就绪的判定由编排方做
 /// (tray 读 DshManager phase)——本模块只负责「检查」职责,UI 决策不内嵌。
@@ -681,6 +751,23 @@ fn upgrade_pipeline(up: &UpgradeManager, dsh: &dsh::DshManager, pin: &str) {
             return;
         }
     };
+
+    // 4.5 上游耦合防线(ADR 0001 / #29,#41):回归检查新版 dsh 的响应头——
+    // XFO / CSP frame-ancestors 命中 = iframe 架构无法呈现它,升级报明确错误
+    // (指引回退预案 = 恢复整窗互斥导航,git 历史可回)。注意此失败模式
+    // npm install 已成功、旧版已被替换(与「保留旧版」的安装失败语义不同),
+    // 错误文案由前端按 kind 翻译,不在此拼装。
+    if let Err(e) = tauri::async_runtime::block_on(check_frame_blocking(
+        &dsh::dsh_url_for_port(port),
+    )) {
+        dsh::kill_child(dsh);
+        dsh::set_upgrade_active(false);
+        up.reduce(UpgradeEvent::Failed {
+            version: pin.to_string(),
+            error: e,
+        });
+        return;
+    }
 
     // 5. ready:record_dsh_url 推新端口 URL 给壳页(iframe 自动切换,ADR 0001)
     //    → 清升级抑制标志(旧 dsh 的 reaper 在杀后早已过判定点,此时清除安全,
@@ -810,6 +897,127 @@ mod tests {
         assert!(version_eq(" 0.1.0-rc.6 ", "0.1.0-rc.6"));
         assert!(!version_eq("0.1.0-rc.6", "0.1.0-rc.5"));
         assert!(!version_eq("0.1.0-rc.6", "0.1.0"));
+    }
+
+    // ── 帧嵌入回归检查(上游耦合防线,ADR 0001 / #41)──────────────
+
+    fn headers(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {
+        let mut m = reqwest::header::HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn frame_blocking_header_detects_xfo() {
+        // X-Frame-Options 任一取值都拦(SAMEORIGIN 对跨源同样拦截)
+        for v in ["DENY", "SAMEORIGIN"] {
+            let h = headers(&[("x-frame-options", v)]); // 头名大小写不敏感
+            assert_eq!(
+                frame_blocking_header(&h),
+                Some(format!("X-Frame-Options: {v}")),
+                "XFO={v} 必须命中"
+            );
+        }
+        // 无帧头 → None
+        assert_eq!(frame_blocking_header(&headers(&[])), None);
+        assert_eq!(
+            frame_blocking_header(&headers(&[("content-type", "text/html")])),
+            None
+        );
+    }
+
+    #[test]
+    fn frame_blocking_header_detects_csp_frame_ancestors() {
+        // frame-ancestors 指令(大小写不敏感)命中
+        let h = headers(&[("content-security-policy", "default-src 'self'; frame-ancestors 'none'")]);
+        assert_eq!(
+            frame_blocking_header(&h),
+            Some("Content-Security-Policy: default-src 'self'; frame-ancestors 'none'".to_string())
+        );
+        // 指令名大小写变体
+        assert!(csp_blocks_framing("default-src 'self'; Frame-Ancestors https://x.com"));
+        // 无 frame-ancestors 的 CSP 不命中(含其它安全指令)
+        let h = headers(&[(
+            "content-security-policy",
+            "default-src 'self'; script-src 'nonce-frame-ancestors-x'",
+        )]);
+        assert_eq!(frame_blocking_header(&h), None);
+        // 值里恰好出现同名串不误报(按指令解析,不按子串)
+        assert!(!csp_blocks_framing("script-src 'nonce-frame-ancestors'"));
+        // 多 CSP 头:任一命中即命中
+        let h = headers(&[
+            ("content-security-policy", "default-src 'self'"),
+            ("content-security-policy", "frame-ancestors 'none'"),
+        ]);
+        assert_eq!(frame_blocking_header(&h).unwrap(), "Content-Security-Policy: frame-ancestors 'none'");
+        // 空值/畸形值不 panic 不命中
+        assert!(!csp_blocks_framing(""));
+        assert!(!csp_blocks_framing(";;;"));
+    }
+
+    #[test]
+    fn frame_blocking_header_prefers_xfo() {
+        // 两者都命中时报告 XFO(先到先报告,判据一致性)
+        let h = headers(&[
+            ("x-frame-options", "DENY"),
+            ("content-security-policy", "frame-ancestors 'none'"),
+        ]);
+        assert_eq!(frame_blocking_header(&h).unwrap(), "X-Frame-Options: DENY");
+    }
+
+    #[test]
+    fn check_frame_blocking_roundtrip_with_local_server() {
+        // 验收(issue #41):本地起一个带 XFO 头的假 dsh 服务,升级检查能报错。
+        // 用 std TcpListener 起一次性 HTTP 响应(无外部依赖,单测内闭环)。
+        fn serve_once(resp: String) -> (String, std::thread::JoinHandle<()>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut s, _)) = listener.accept() {
+                    // 标准 HTTP 顺序:先读请求再回响应;响应发完保持连接片刻,
+                    // 让客户端完整读完(读请求后立即回包 + 马上关会有 RST 竞态)
+                    let mut buf = [0u8; 1024];
+                    let _ = std::io::Read::read(&mut s, &mut buf);
+                    let _ = std::io::Write::write_all(&mut s, resp.as_bytes());
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+            (format!("http://{addr}"), handle)
+        }
+
+        // 带 X-Frame-Options: DENY 的假服务 → 检查报 UpgradeFrameBlocked
+        let (url, h) = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Frame-Options: DENY\r\nContent-Length: 4\r\n\r\n<h1>x</h1>"
+                .to_string(),
+        );
+        let err = tauri::async_runtime::block_on(check_frame_blocking(&url)).unwrap_err();
+        assert_eq!(
+            err,
+            UpgradeError::Kind(UpgradeErrorKind::UpgradeFrameBlocked {
+                header: "X-Frame-Options: DENY".into()
+            })
+        );
+        h.join().unwrap();
+
+        // 无帧头的假服务 → 放行
+        let (url, h) = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 4\r\n\r\n<h1>x</h1>"
+                .to_string(),
+        );
+        tauri::async_runtime::block_on(check_frame_blocking(&url)).unwrap();
+        h.join().unwrap();
+
+        // 服务不存在(连接拒绝)→ 探测不确定,放行
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        tauri::async_runtime::block_on(check_frame_blocking(&format!("http://127.0.0.1:{port}")))
+            .unwrap();
     }
 
     // ── 状态机 ─────────────────────────────────────────────────────

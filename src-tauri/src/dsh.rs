@@ -614,31 +614,40 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// npm 全局安装 dsh(boot 传 "@latest" 跟随 latest;dsh 升级链传 "@<pin>" 精确版本,#3 §7),
-/// stdout/stderr 逐行转发为日志事件。install_pid 登记:升级期间用户退出时随退出收敛一并杀。
-/// 命令构造 / 参数 / 错误分类 / 离线缓存判定的单一事实来源在 npm.rs(Windows 的
-/// cmd.exe /c 包装亦在其中,npm_command)。带 NPM_INSTALL_TIMEOUT 超时;
-/// 超时 / 句柄异常按进程树杀并报可读错误。安装包内置离线缓存存在时优先离线安装。
-pub(crate) fn npm_install_global(manager: &DshManager, version_spec: &str) -> Result<(), DshError> {
-    let cache_dir = manager
-        .app
-        .path()
-        .resource_dir()
-        .ok()
-        .as_deref()
-        .and_then(npm::bundle_cache_dir);
-    let args = npm::npm_install_args(cache_dir.as_deref(), version_spec);
-    if let Some(dir) = &cache_dir {
+/// 单次 npm 安装尝试的结果(ETARGET 回退的判定数据源,见 npm_install_global)。
+enum InstallAttemptFailure {
+    /// 进程非零退出:未分类,携带退出码与 stderr 尾部原文(供 ETARGET 判定与
+    /// install_failure_error 分类);安装失败保留旧版(npm 语义,#2 实测)
+    Exit {
+        exit_code: Option<i32>,
+        stderr_tail: Vec<String>,
+    },
+    /// 超时 / 句柄异常:已分类 DshError(非「缓存数据过旧」症状,不做重试)
+    Dsh(DshError),
+}
+
+/// 执行一次 npm install 尝试(boot 与升级链共用;ETARGET 回退编排在
+/// npm_install_global)。stdout/stderr 逐行转发为日志事件,stderr 尾部捕获
+/// 供失败分类;install_pid 登记:升级期间用户退出时随退出收敛一并杀。
+/// 命令构造 / 参数 / 错误分类 / 离线缓存判定的单一事实来源在 npm.rs
+/// (Windows 的 cmd.exe /c 包装亦在其中,npm_command)。带 NPM_INSTALL_TIMEOUT
+/// 超时;超时 / 句柄异常按进程树杀并报可读错误。
+fn npm_install_attempt(
+    manager: &DshManager,
+    cache_dir: Option<&Path>,
+    version_spec: &str,
+) -> Result<(), InstallAttemptFailure> {
+    if let Some(dir) = cache_dir {
         log::info!("[dsh] 使用安装包内置离线缓存: {}", dir.display());
     }
-
+    let args = npm::npm_install_args(cache_dir, version_spec);
     let mut cmd = npm::npm_command();
     cmd.args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| DshError::NpmSpawnFailed { detail: e.to_string() })?;
+    let mut child = cmd.spawn().map_err(|e| {
+        InstallAttemptFailure::Dsh(DshError::NpmSpawnFailed { detail: e.to_string() })
+    })?;
     // 登记安装中进程,退出收敛时一并杀(quit_app/托盘退出)
     manager.set_install_pid(child.id());
 
@@ -682,7 +691,10 @@ pub(crate) fn npm_install_global(manager: &DshManager, version_spec: &str) -> Re
             if out.status.success() {
                 Ok(())
             } else {
-                Err(npm::install_failure_error(out.status.code(), &tail))
+                Err(InstallAttemptFailure::Exit {
+                    exit_code: out.status.code(),
+                    stderr_tail: tail,
+                })
             }
         }
         Err(ChildWaitError::Timeout(_)) => {
@@ -690,9 +702,9 @@ pub(crate) fn npm_install_global(manager: &DshManager, version_spec: &str) -> Re
             kill_and_reap(&mut child);
             let _ = out_thread.join();
             let _ = err_thread.join();
-            Err(DshError::InstallTimeout {
+            Err(InstallAttemptFailure::Dsh(DshError::InstallTimeout {
                 seconds: npm::NPM_INSTALL_TIMEOUT.as_secs(),
-            })
+            }))
         }
         Err(ChildWaitError::Io(e)) => {
             // 句柄异常也按进程树杀并回收(与 Timeout 同语义):否则 npm 安装进程
@@ -700,7 +712,55 @@ pub(crate) fn npm_install_global(manager: &DshManager, version_spec: &str) -> Re
             kill_and_reap(&mut child);
             let _ = out_thread.join();
             let _ = err_thread.join();
-            Err(DshError::NpmInstallIoFailed { detail: e })
+            Err(InstallAttemptFailure::Dsh(DshError::NpmInstallIoFailed { detail: e }))
+        }
+    }
+}
+
+/// npm 全局安装 dsh(boot 传 "@latest" 跟随 latest;dsh 升级链传 "@<pin>" 精确版本,#3 §7),
+/// stdout/stderr 逐行转发为日志事件。install_pid 登记:升级期间用户退出时随退出收敛一并杀。
+/// 带 NPM_INSTALL_TIMEOUT 超时;超时 / 句柄异常按进程树杀并报可读错误。
+/// 安装包内置离线缓存存在时优先离线安装(命中秒级完成、缺失回退网络)。
+///
+/// ETARGET 根治(#41,M1 遗留):内置离线缓存是发版时点打包的,其 packument
+/// 可能早于升级目标版本(registry 直查刚确认过该版本存在),--prefer-offline
+/// 跳过新鲜度检查会让 npm 按旧 packument 误报「版本不存在」(ETARGET,假阴性)。
+/// 处置:带缓存安装失败且 stderr 判定为 ETARGET → 回退无缓存网络重试一次
+/// (registry 数据恒新鲜,命中真因——数据过旧——而非擦症状);其余失败直接
+/// 分类返回。boot 的 @latest 安装不需要比缓存更新的版本,不会命中 ETARGET,
+/// 此回退只会在升级链触发;回退后再次失败按常规错误呈现(不循环重试)。
+/// ETARGET 回退判定(纯函数,可测):带缓存 + stderr 报 ETARGET = 缓存
+/// packument 过旧的确定性症状(数据过旧是唯一成因),回退无缓存重试;
+/// 其余失败直接分类返回。
+fn should_retry_without_cache(used_cache: bool, stderr_tail: &[String]) -> bool {
+    used_cache && npm::stderr_has_etarget(stderr_tail)
+}
+
+pub(crate) fn npm_install_global(manager: &DshManager, version_spec: &str) -> Result<(), DshError> {
+    let cache_dir = manager
+        .app
+        .path()
+        .resource_dir()
+        .ok()
+        .as_deref()
+        .and_then(npm::bundle_cache_dir);
+    let mut cache = cache_dir;
+    loop {
+        match npm_install_attempt(manager, cache.as_deref(), version_spec) {
+            Ok(()) => return Ok(()),
+            Err(InstallAttemptFailure::Dsh(e)) => return Err(e),
+            Err(InstallAttemptFailure::Exit { exit_code, stderr_tail }) => {
+                // 命中即回退无缓存(cache 置 None 后循环至多再走一轮:
+                // ETARGET 分支条件不再成立,不会无限重试)
+                if should_retry_without_cache(cache.is_some(), &stderr_tail) {
+                    log::warn!(
+                        "[dsh] npm 安装报 ETARGET(内置缓存 packument 早于目标版本),回退无缓存网络重试"
+                    );
+                    cache = None;
+                    continue;
+                }
+                return Err(npm::install_failure_error(exit_code, &stderr_tail));
+            }
         }
     }
 }
@@ -1056,6 +1116,18 @@ mod tests {
         assert_eq!(strip_ansi("\u{1b}[2Kclear"), "clear");
         assert_eq!(strip_ansi("\u{1b}[38;5;196mcolor256\u{1b}[0m"), "color256");
         assert_eq!(strip_ansi("中文\u{1b}[1m加粗\u{1b}[0m保留"), "中文加粗保留");
+    }
+
+    #[test]
+    fn should_retry_without_cache_requires_cache_and_etarget() {
+        // ETARGET 回退判定(生产路径见 npm_install_global):
+        // 带缓存 + ETARGET → 回退;缺任一条件 → 直接分类返回
+        let etarget = vec!["npm error code ETARGET".to_string()];
+        let network = vec!["npm error code ENOTFOUND".to_string()];
+        assert!(should_retry_without_cache(true, &etarget));
+        assert!(!should_retry_without_cache(false, &etarget)); // 没带缓存,无从回退
+        assert!(!should_retry_without_cache(true, &network)); // 非 ETARGET 不回退
+        assert!(!should_retry_without_cache(true, &[]));
     }
 
     #[test]

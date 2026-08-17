@@ -61,6 +61,11 @@ export function UpgradeScreen({
   // 安装类阶段(killing/installing/verifying)共用「正在升级 dsh…」;
   // starting 显示「正在重启 dsh…」(key 缺省时 defaultValue 兜底)
   const installing = phase === "killing" || phase === "installing" || phase === "verifying"
+  // #41 上游耦合防线:帧嵌入被新版 dsh 禁止——安装已成功、旧版已被替换,
+  // 「当前版本仍可使用/重试」不成立,keepOld 行让位给 errors.UpgradeFrameBlocked
+  // 的引导文案(回退预案 = 恢复整窗互斥导航,git 历史可回)
+  const frameBlocked =
+    error?.kind === "app" && error?.type === "UpgradeFrameBlocked"
   const title = installing
     ? t("upgrade.installing.title")
     : phase === "starting"
@@ -103,10 +108,15 @@ export function UpgradeScreen({
                   {localizeStructuredError(error, t) || t("errors.unknown")}
                 </p>
               ) : null}
-              {/* 失败语义(#3 §3):旧版保留(npm 语义)+ 恢复服务([返回 dsh] 先起旧版再导航) */}
-              <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
-                {t("upgrade.failed.keepOld")}
-              </p>
+              {/* 失败语义(#3 §3):旧版保留(npm 语义)+ 恢复服务([返回 dsh] 先起旧版再导航)。
+                   UpgradeFrameBlocked(#41 上游耦合防线)例外:npm 安装已成功、旧版已被替换,
+                   「当前版本仍可使用/重试」不成立——引导文案在 errors.UpgradeFrameBlocked
+                   (回退预案 = 恢复整窗互斥导航),不再叠加误导性的 keepOld 行 */}
+              {!frameBlocked && (
+                <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
+                  {t("upgrade.failed.keepOld")}
+                </p>
+              )}
               <div className="flex items-center gap-3">
                 <Button size="lg" onClick={onConfirm}>
                   <RotateCw />
