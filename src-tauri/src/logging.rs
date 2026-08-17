@@ -1,7 +1,8 @@
 //! 生产日志基建。
 //!
 //! - 常规日志(boot 流水线各阶段/错误/dsh 输出)经 `log` crate 宏 → tauri-plugin-log,
-//!   落盘到 `<app_data_dir>/logs/app.log`(5MB 轮转,KeepOne),同时输出到 stdout。
+//!   落盘到系统临时目录 `<temp>/deepseek-desktop/logs/app.log`(5MB 轮转,KeepOne),
+//!   同时输出到 stdout。
 //! - panic hook:把 panic 消息 + 位置 + backtrace 也走 log::error 写入同一日志文件,
 //!   发布后无需复现即可从日志文件定位崩溃点。
 //!
@@ -9,15 +10,10 @@
 
 use std::fs;
 
-use tauri::Manager;
-
 /// 初始化日志插件与 panic hook。须在 setup 中、任何业务线程启动前调用一次。
 pub fn init(app: &tauri::AppHandle) -> Result<(), String> {
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("无法定位应用数据目录: {e}"))?;
-    let log_dir = data_dir.join("logs");
+    // 日志是临时诊断信息:放系统 Temp 而非应用数据目录,不随应用数据持久化、易清理
+    let log_dir = std::env::temp_dir().join("deepseek-desktop").join("logs");
     fs::create_dir_all(&log_dir)
         .map_err(|e| format!("无法创建日志目录 {}: {e}", log_dir.display()))?;
 
