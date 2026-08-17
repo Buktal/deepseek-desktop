@@ -7,6 +7,18 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-17
+
+### Added
+
+- **跨平台发布**(#24):发布流水线从 Windows 单平台扩展为三平台矩阵(macOS Apple Silicon / Linux x64 / Windows x64,照搬 cc-one 已验证配置)——各平台 runner 独立构建安装包 + Ed25519 签名(.sig)并合并到同一 Release 的 latest.json 更新清单,应用内「检查更新」按平台检测对应安装包;npm 离线缓存(#16 约定)由每平台 runner 按构建平台解析原生可选依赖(如 esbuild),三平台缓存各得其所。
+- **Unix 进程树杀**(#24):子进程 spawn 时统一放入新进程组,杀进程树与 Windows taskkill /T 对齐(macOS/Linux 下按进程组 SIGKILL),不再残留孤儿进程;npm 检测 / 安装 / dsh 启动全部覆盖。
+
+### Changed
+
+- **bundle.targets 改 all**(#24):tauri.conf.json 从 nsis 单目标扩展为三平台默认目标集——Windows 产出 NSIS(更新经 updaterJsonPreferNsis 走 NSIS,MSI 为附带产物)、macOS 产出 dmg + app、Linux 产出 deb + rpm + AppImage;updater 的 installMode 仍仅 Windows(passive NSIS),macOS/Linux 走 updater 插件默认形态。
+- **macOS 托盘图标改 template 渲染**(#24,#3 遗留):菜单栏图标按 template(黑白,深浅菜单栏自动适配),Windows/Linux 维持彩色图标。
+
 ## [0.3.0] - 2026-08-14
 
 ### Changed
@@ -48,6 +60,7 @@
 - **界面 i18n**:zh / en 双语,跟随系统语言(中文系统默认中文)。
 - **CI 发布流水线**:打 tag 自动构建、签名并发布 Release(含 latest.json 更新清单)。
 
+[0.4.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v0.1.0

@@ -57,8 +57,23 @@ pub(crate) fn no_window(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+/// Unix 上把子进程放进新进程组(进程组 id = 子进程 pid),让 kill_pid_tree 能按
+/// 整棵进程树杀(与 Windows taskkill /T 对齐;仅杀单进程时 node 拉起的孙进程
+/// 会残留成孤儿);其余平台 no-op。须在 spawn 前调用。
+#[cfg(unix)]
+pub(crate) fn new_process_group(cmd: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn new_process_group(cmd: &mut Command) -> &mut Command {
+    cmd
+}
+
 /// 按进程树杀:Windows 用 taskkill /T /F(CreateProcess 只杀直接子进程,node 拉起的
-/// 孙进程会成孤儿);Unix 用 kill 命令。幂等:进程已退出时静默失败。
+/// 孙进程会成孤儿);Unix 杀子进程所在进程组(负 pid,spawn 时经 new_process_group
+/// 放入新组,SIGKILL 与 taskkill /F 的强制语义对齐)。幂等:进程已退出时静默失败。
 pub(crate) fn kill_pid_tree(pid: u32) {
     #[cfg(windows)]
     {
@@ -69,7 +84,9 @@ pub(crate) fn kill_pid_tree(pid: u32) {
     }
     #[cfg(not(windows))]
     {
-        let _ = Command::new("kill").arg(pid.to_string()).status();
+        let _ = Command::new("kill")
+            .args(["-s", "KILL", &format!("-{pid}")])
+            .status();
     }
 }
 

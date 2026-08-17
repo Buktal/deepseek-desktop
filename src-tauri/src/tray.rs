@@ -177,6 +177,9 @@ fn refresh_menu(app: &AppHandle) {
     };
     if let Some(tray) = TRAY.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
         let _ = tray.set_icon(Some(if badge { badge_icon() } else { normal_icon() }));
+        // macOS:菜单栏图标按 template 渲染(黑+透明,深浅菜单栏自动适配);
+        // set_icon 后须同步 template 状态(两方法均跨平台可调用,内部按平台生效)
+        let _ = tray.set_icon_as_template(cfg!(target_os = "macos"));
         let _ = tray.set_tooltip(Some(tooltip));
     }
 }
@@ -226,6 +229,8 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let menu = build_menu(app, None, None)?;
     let tray = TrayIconBuilder::with_id("main-tray")
         .icon(normal_icon())
+        // macOS 菜单栏惯例:图标按 template 渲染(黑白自适应深浅菜单栏)
+        .icon_as_template(cfg!(target_os = "macos"))
         .menu(&menu)
         // 左键不弹菜单,留给"切换显隐";右键仍弹菜单
         .show_menu_on_left_click(false)

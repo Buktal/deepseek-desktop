@@ -49,7 +49,9 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 use crate::error::DshError;
 use crate::npm::{self, InstallStage};
-use crate::proc::{kill_and_reap, kill_pid_tree, no_window, wait_with_timeout, ChildWaitError};
+use crate::proc::{
+    kill_and_reap, kill_pid_tree, new_process_group, no_window, wait_with_timeout, ChildWaitError,
+};
 
 /// dsh 源码注释明确:"This URL line is a readiness signal" —— stdout 打印即服务就绪
 const READY_PREFIX: &str = "dsh web: http://";
@@ -735,7 +737,7 @@ pub(crate) fn spawn_dsh(
     bin: &Path,
 ) -> Result<Receiver<(String, String)>, DshError> {
     let mut binding = Command::new("node");
-    let cmd = no_window(&mut binding)
+    let cmd = new_process_group(no_window(&mut binding))
         .arg(bin)
         .args(["web", "--port", "0"])
         .env("DSH_TELEMETRY_DISABLED", "1")

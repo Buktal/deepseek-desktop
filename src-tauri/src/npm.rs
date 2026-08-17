@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::error::DshError;
-use crate::proc::{kill_and_reap, no_window, wait_with_timeout, ChildWaitError};
+use crate::proc::{
+    kill_and_reap, new_process_group, no_window, wait_with_timeout, ChildWaitError,
+};
 
 /// dsh 要求的 Node 版本(仓库根 package.json engines):^22.19 || >=24。
 /// 作为 NodeVersionUnmet 的结构化数据传给前端(版本规格是技术串,语言中立,
@@ -40,13 +42,15 @@ const NPM_ROOT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// npm 命令构造(单一事实来源,检测与安装共用):
 /// Windows 上 CreateProcess 不能直接执行 .cmd/.bat(npm 是 .cmd shim),
-/// 须经 cmd.exe /c 包装;同时隐藏控制台窗口。
+/// 须经 cmd.exe /c 包装;同时隐藏控制台窗口。Unix 上放入新进程组——
+/// kill_pid_tree 按组杀(npm 会再拉起 node 子进程,须整组回收,见 proc.rs)。
 pub(crate) fn npm_command() -> Command {
     let mut cmd = Command::new(if cfg!(windows) { "cmd.exe" } else { "npm" });
     if cfg!(windows) {
         cmd.args(["/c", "npm.cmd"]);
     }
     no_window(&mut cmd);
+    new_process_group(&mut cmd);
     cmd
 }
 
@@ -90,7 +94,7 @@ fn check_node_version(ver: &str) -> Result<(), DshError> {
 /// boot 流水线的 checking 阶段调用。
 pub(crate) fn check_node() -> Result<String, DshError> {
     let mut binding = Command::new("node");
-    let mut child = no_window(&mut binding)
+    let mut child = new_process_group(no_window(&mut binding))
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
