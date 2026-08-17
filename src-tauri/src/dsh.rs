@@ -49,7 +49,6 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 use crate::error::DshError;
 use crate::npm::{self, InstallStage};
@@ -897,7 +896,9 @@ fn boot_pipeline(manager: &DshManager) {
 }
 
 /// 收割线程:排空 channel 直到读线程结束(进程退出或被杀),再 wait 回收。
-/// 若 dsh 意外退出(非主动退出流程)则弹原生提示。
+/// 若 dsh 意外退出(非主动退出流程),上报日志——弹窗提示已移除(#39:
+/// 意外退出呈现转 M5 全屏覆盖层,编排见 #32;本票先移除原生调用)。
+/// UPGRADE_ACTIVE / is_quitting 抑制标志仍保留(判定语义留给 M5)。
 ///
 /// 竞态防护:只有 phase 仍为 Ready 时才取子进程句柄。若排空期间用户已重试
 /// (phase 进入 Checking),新 boot 的 child 已写入 manager——此时取走会令
@@ -919,19 +920,8 @@ pub(crate) fn spawn_reaper(manager: DshManager, rx: Receiver<(String, String)>) 
                 is_quitting(),
                 upgrade_active()
             );
-            // 升级链主动杀旧 dsh 也是非零退出:UPGRADE_ACTIVE 抑制误报弹窗
-            // (独立于 is_quitting——升级不退出应用,关闭三选对话框保持有效,#3 §2)
-            if !ok && !is_quitting() && !upgrade_active() {
-                // 原生对话框文案跟随系统语言(与托盘/关闭对话框同源,见 locales.rs)
-                let texts = crate::locales::shell_texts(crate::locales::detect_lang());
-                manager
-                    .app
-                    .dialog()
-                    .message(texts.dsh_crashed)
-                    .title("DeepSeek Desktop")
-                    .kind(MessageDialogKind::Warning)
-                    .show(|_| {});
-            }
+            // 意外退出判定(非主动退出流程)已无 UI 消费方:#39 移除原生弹窗,
+            // 呈现转 M5 全屏覆盖层(#32 编排);UPGRADE_ACTIVE 抑制语义届时复用
         }
     });
 }

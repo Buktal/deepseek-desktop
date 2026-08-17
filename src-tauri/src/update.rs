@@ -31,12 +31,11 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tauri::Emitter;
-use tauri::{AppHandle, Manager};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
+use tauri::AppHandle;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::error::UpdateError;
-use crate::{dsh, locales, tray};
+use crate::{dsh, tray};
 
 /// 6h 轮询间隔(#1 定稿:启动 + 定时 6h + 托盘手动,两层升级共用)。
 /// upgrade.rs(dsh 升级链)复用同一常量,保证两层触发时机一致(单一事实来源)。
@@ -186,8 +185,9 @@ impl UpdateManager {
         let _ = self.app.emit_to("main", "update-state", next);
     }
 
-    /// 流水线在途(下载/已就绪)时拒绝新检查(#3:流水线运行中手动入口 no-op)。
-    fn is_active(&self) -> bool {
+    /// 流水线在途(下载/已就绪)时拒绝新检查(#3:流水线运行中手动入口 no-op;
+    /// tray.rs 菜单 disabled 与 toast 守卫同源读取,#39)。
+    pub(crate) fn is_active(&self) -> bool {
         matches!(
             self.snapshot(),
             UpdateStateView::Downloading { .. } | UpdateStateView::Ready
@@ -256,6 +256,9 @@ impl UpdateManager {
                             f(ManualCheckResult::Found {
                                 version: update.version,
                                 current_version: update.current_version,
+                                // notes 随结果携带(tray.rs 编排弹窗时下发原文,
+                                // 前端 summarizeReleaseNotes 复用,#39)
+                                notes: update.body.clone(),
                             });
                         }
                     }
@@ -367,56 +370,18 @@ impl UpdateManager {
     }
 }
 
-// ── 原生对话框(托盘手动检查的直接回答,#3 §1)────────────────────────
+// ── 手动检查结果(供组合入口使用:tray::on_check_update 编排两层回答,
+// 弹窗/toast 由 dialog.rs 呈现,#39)──────────────────────────────────
 
-/// 手动检查的结果(供组合入口使用:tray::on_check_update 编排两层回答)。
+/// 手动检查的结果。Found 携带 notes(弹窗正文摘要的原文来源)。
 pub enum ManualCheckResult {
     Found {
         version: String,
         current_version: String,
+        notes: Option<String>,
     },
     None,
     Failed,
-}
-
-/// 手动检查发现新版:原生对话框 [升级][稍后]。
-/// [升级] → 显示窗口 + 自动开始下载(#3:确认即授权,不二次确认;
-/// 下载开始后升级卡片浮层自动出现,壳页常驻无需导航,#36)。
-pub(crate) fn show_update_found_dialog(app: &AppHandle, version: &str, current: &str) {
-    let t = locales::shell_texts(locales::detect_lang());
-    let app = app.clone();
-    app.dialog()
-        .message(t.update_found_message(version, current))
-        .title("DeepSeek Desktop")
-        .kind(MessageDialogKind::Info)
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            t.update_now.into(),
-            t.update_later.into(),
-        ))
-        .show_with_result(move |res| {
-            if let MessageDialogResult::Custom(s) = res {
-                if s == t.update_now {
-                    log::info!("[update] 对话框[升级] → 显示窗口 + 自动开始下载");
-                    tray::show_main_window(&app);
-                    let updater = app.state::<UpdateManager>().inner().clone();
-                    let dsh = app.state::<dsh::DshManager>().inner().clone();
-                    updater.apply_now(&dsh);
-                }
-            }
-        });
-}
-
-/// 手动检查无新版:原生对话框「已是最新版本」(应用版本;dsh 版本已知时
-/// 合并报告——组合入口一次回答两层,#17)。
-pub(crate) fn show_up_to_date_dialog(app: &AppHandle, dsh_version: Option<&str>) {
-    let current = app.package_info().version.to_string();
-    let t = locales::shell_texts(locales::detect_lang());
-    app.dialog()
-        .message(t.update_up_to_date_message(&current, dsh_version))
-        .title("DeepSeek Desktop")
-        .kind(MessageDialogKind::Info)
-        .buttons(MessageDialogButtons::Ok)
-        .show(|_| {});
 }
 
 // ── Tauri commands ─────────────────────────────────────────────────

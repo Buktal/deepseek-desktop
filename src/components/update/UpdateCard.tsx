@@ -6,48 +6,23 @@
 // 开放画布区分——升级是用户可执行的动作面板,不是状态仪表。外壳与 dsh 升级卡
 // 共用 FullScreenCard。
 //
+// #39(#31 拍板):下载中/完成不再用整屏卡片打断——下载进度改为右下角非模态
+// 浮层 UpdateFloat(下载不打断使用 dsh),本卡片只承载 available(发现新版
+// [立即更新])与 failed(失败降级 GitHub 手动下载)两个决策面。
+//
 // 状态机(available/downloading/ready/failed)由 Rust 侧持有(update.rs 单一
 // 事实源),本组件只按 `update-state` 快照/事件渲染对应卡片体;错误经
 // localizeStructuredError 渲染时翻译,失败降级 GitHub 手动下载(O_CC_One 同款)。
 // 文案键归 `update.*`(locale JSON,zh/en 键集一致性由单测守住)。
 
-import {
-  CircleArrowUp,
-  ExternalLink,
-  Loader2,
-  PartyPopper,
-  RotateCw,
-} from "lucide-react"
+import { CircleArrowUp, ExternalLink } from "lucide-react"
 import { useTranslation } from "react-i18next"
 
 import { FullScreenCard } from "@/components/shell/FullScreenCard"
-import { ProgressRail } from "@/components/shell/ProgressRail"
 import { Button } from "@/components/ui/button"
 import { localizeStructuredError, type StructuredError } from "@/lib/error"
 import { summarizeReleaseNotes } from "@/lib/releaseNotes"
-import { updatePercent, type UpdateStatus } from "@/lib/useUpdateCheck"
-
-/** 下载中卡片体:确定进度(percent 非 null)或不确定进度(total 未知,「请稍候」)。 */
-function DownloadingBody({
-  downloadedBytes,
-  totalBytes,
-}: {
-  downloadedBytes: number
-  totalBytes: number
-}) {
-  const { t } = useTranslation()
-  const pct = updatePercent(downloadedBytes, totalBytes)
-  return (
-    <>
-      <Loader2 className="size-9 animate-spin text-primary" />
-      <h1 className="text-lg font-medium">{t("update.downloading")}</h1>
-      <p className="text-sm text-muted-foreground">
-        {pct !== null ? t("update.downloaded", { pct }) : t("update.pleaseWait")}
-      </p>
-      <ProgressRail value={pct} />
-    </>
-  )
-}
+import type { UpdateStatus } from "@/lib/useUpdateCheck"
 
 export function UpdateCard({
   status,
@@ -55,10 +30,7 @@ export function UpdateCard({
   currentVersion,
   notes,
   error,
-  downloadedBytes,
-  totalBytes,
   onApply,
-  onRestart,
   onDismiss,
   onOpenReleases,
 }: {
@@ -67,10 +39,7 @@ export function UpdateCard({
   currentVersion: string | null
   notes: string | null
   error: StructuredError | null
-  downloadedBytes: number
-  totalBytes: number
   onApply: () => void
-  onRestart: () => void
   onDismiss: () => void
   onOpenReleases: () => void
 }) {
@@ -98,30 +67,6 @@ export function UpdateCard({
             <Button size="lg" onClick={onApply}>
               <CircleArrowUp />
               {t("update.updateNow")}
-            </Button>
-            <Button variant="ghost" size="lg" onClick={onDismiss}>
-              {t("update.later")}
-            </Button>
-          </div>
-        </>
-      )}
-
-      {status === "downloading" && (
-        <DownloadingBody downloadedBytes={downloadedBytes} totalBytes={totalBytes} />
-      )}
-
-      {status === "ready" && (
-        <>
-          <PartyPopper className="size-9 text-primary" />
-          <h1 className="text-lg font-medium">{t("update.ready")}</h1>
-          {/* 中断影响明示(#3 §4):重启按钮即授权点,文案必须说清语义 */}
-          <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
-            {t("update.restartToInstall")}
-          </p>
-          <div className="flex items-center gap-3">
-            <Button size="lg" onClick={onRestart}>
-              <RotateCw />
-              {t("update.restartNow")}
             </Button>
             <Button variant="ghost" size="lg" onClick={onDismiss}>
               {t("update.later")}

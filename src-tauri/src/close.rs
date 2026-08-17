@@ -17,6 +17,8 @@ use std::sync::Mutex;
 use serde_json::json;
 use tauri::{AppHandle, Manager};
 
+use crate::dsh;
+
 /// 关闭行为:点窗口关闭按钮时的去向(单一事实源)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseBehavior {
@@ -121,6 +123,27 @@ pub fn set(app: &AppHandle, behavior: CloseBehavior) {
             }
         }
         None => log::warn!("[close] 无法定位配置目录,关闭行为不持久化"),
+    }
+}
+
+/// 执行关闭去向(#39:窗口关闭 handler 与关闭三选弹窗 respond 共用,消除两份
+/// 实现漂移;Ask 无执行语义 = no-op)。Quit:程序化退出流程(set_quitting 放行
+/// CloseRequested)+ 杀 dsh 子进程 + exit;Minimize:隐藏主窗口。
+pub fn execute(app: &AppHandle, behavior: CloseBehavior) {
+    match behavior {
+        CloseBehavior::Quit => {
+            dsh::set_quitting();
+            if let Some(m) = app.try_state::<dsh::DshManager>() {
+                dsh::kill_child(m.inner());
+            }
+            app.exit(0);
+        }
+        CloseBehavior::Minimize => {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.hide();
+            }
+        }
+        CloseBehavior::Ask => {}
     }
 }
 

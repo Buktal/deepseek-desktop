@@ -2,17 +2,15 @@
 // 生产路径即 App.tsx / useUpdateCheck.ts 的渲染决策)
 import { describe, expect, it } from "vitest"
 
-import {
-  isUpdateCardVisible,
-  updatePercent,
-  type UpdateStatus,
-} from "@/lib/useUpdateCheck"
+import { isUpdateCardVisible, updatePercent } from "@/lib/useUpdateCheck"
 
 describe("isUpdateCardVisible", () => {
-  it("always shows card while pipeline is active-ish", () => {
-    for (const s of ["downloading", "ready", "failed"] as const) {
-      expect(isUpdateCardVisible(s satisfies UpdateStatus, false)).toBe(true)
-    }
+  it("shows card only on the two decision surfaces", () => {
+    // #39 起卡片只承载 available(需显式请求)与 failed(失败降级 GitHub);
+    // downloading/ready 由右下角非模态浮层 UpdateFloat 呈现,不渲染卡片
+    expect(isUpdateCardVisible("failed", false)).toBe(true)
+    expect(isUpdateCardVisible("downloading", false)).toBe(false)
+    expect(isUpdateCardVisible("ready", false)).toBe(false)
   })
 
   it("shows available card only when explicitly requested", () => {

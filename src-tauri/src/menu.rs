@@ -30,7 +30,7 @@
 //! ───────────────
 //! 升级到 vX      id="upgrade-available"(仅发现新版时存在,动态,#3 §1,badge)
 //! 升级 dsh 到 vX id="upgrade-dsh"    (仅发现新版时存在,动态,#3 §1,badge)
-//! 检查更新       id="check-update"   (dsh 升级流水线在途时 disabled)
+//! 检查更新       id="check-update"   (任一升级流水线在途时 disabled)
 //! ───────────────
 //! 退出           id="quit"
 //! ```
@@ -94,8 +94,9 @@ pub struct MenuState {
     pub app_update: Option<String>,
     /// dsh 升级槽位(Some = 发现新版,待升级版本)
     pub dsh_update: Option<String>,
-    /// dsh 升级流水线在途(「检查更新」disabled 的依据,与 tray 动作层的
-    /// no-op 守卫同源——行为先有守卫,快照只是让 UI 先于点击诚实呈现)
+    /// 任一升级流水线在途(dsh 升级 Active 或应用升级下载/就绪;#39「检查
+    /// 更新」disabled 的依据,与 tray 动作层的 no-op 守卫同源——行为先有
+    /// 守卫,快照只是让 UI 先于点击诚实呈现)
     pub upgrade_running: bool,
     pub close_behavior: CloseBehavior,
 }

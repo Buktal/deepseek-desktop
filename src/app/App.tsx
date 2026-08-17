@@ -7,11 +7,16 @@
 // 浮层,揭示 iframe(useBootExit,fallback 兜底,动画不阻塞 dsh 呈现)。
 // 卡片可见性:升级/更新卡由状态 + 托盘显式请求驱动(isUpgradeCardVisible /
 // isUpdateCardVisible),不再依赖「页面挂载」信号(壳页不再重新挂载)。
+// #39:shell-dialog 弹窗(AlertDialog/toast)与更新进度浮层(UpdateFloat)是
+// 非互斥层,不参与 overlay 链——浮层盖在 iframe 上但不阻止交互。
 import { BootScreen } from "@/components/boot/BootScreen"
 import { ErrorScreen } from "@/components/boot/ErrorScreen"
+import { ShellDialogs } from "@/components/shell/ShellDialogs"
 import { ShellLayout } from "@/components/shell/ShellLayout"
 import { UpdateCard } from "@/components/update/UpdateCard"
+import { UpdateFloat } from "@/components/update/UpdateFloat"
 import { UpgradeScreen } from "@/components/upgrade/UpgradeScreen"
+import { Toaster } from "@/components/ui/sonner"
 import { useBoot } from "@/lib/useBoot"
 import { useBootExit } from "@/lib/useBootExit"
 import { useDshUpgrade } from "@/lib/useDshUpgrade"
@@ -78,10 +83,7 @@ export default function App() {
         currentVersion={update.currentVersion}
         notes={update.notes}
         error={update.error}
-        downloadedBytes={update.downloadedBytes}
-        totalBytes={update.totalBytes}
         onApply={update.applyUpdate}
-        onRestart={update.restartNow}
         onDismiss={update.dismiss}
         onOpenReleases={update.openReleases}
       />
@@ -101,5 +103,27 @@ export default function App() {
       )
     ) : null
 
-  return <ShellLayout dshUrl={dshUrl}>{overlay}</ShellLayout>
+  // 更新进度浮层(右下角非模态):downloading/ready 不参与互斥 overlay 链,
+  // 独立渲染盖在 iframe 之上(fixed 定位,不阻止 dsh 交互,#31 拍板)
+  const updateFloat =
+    update.status === "downloading" || update.status === "ready" ? (
+      <UpdateFloat
+        status={update.status}
+        downloadedBytes={update.downloadedBytes}
+        totalBytes={update.totalBytes}
+        onRestart={update.restartNow}
+        onDismiss={update.dismiss}
+      />
+    ) : null
+
+  return (
+    <>
+      <ShellLayout dshUrl={dshUrl}>{overlay}</ShellLayout>
+      {updateFloat}
+      {/* 壳页弹窗(AlertDialog/toast):Rust shell-dialog 事件驱动 */}
+      <ShellDialogs />
+      {/* Sonner toast 容器:右下角(与更新浮层同角,疑点 8 结论:接受叠放) */}
+      <Toaster position="bottom-right" />
+    </>
+  )
 }

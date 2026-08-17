@@ -43,15 +43,14 @@ export interface UpdateStateView {
 export const RELEASES_URL = "https://github.com/Buktal/deepseek-desktop/releases/latest"
 
 /**
- * 升级卡片是否可见(纯函数,可测)。壳页常驻后(#36)卡片是浮层,可见性 =
- * 流水线活跃态(downloading/ready/failed 必有卡片,流水线是用户动作触发的)
- * + available 需显式请求(托盘「升级到 vX」菜单 → update-card-request 事件;
- * 自动检测只亮托盘徽标,不弹卡片,#3 §1)。
+ * 升级卡片是否可见(纯函数,可测)。#39 起卡片只承载两个决策面:
+ * available 需显式请求(托盘「升级到 vX」菜单 → update-card-request 事件;
+ * 自动检测只亮托盘徽标,不弹卡片,#3 §1);failed(失败降级 GitHub)必显。
+ * downloading/ready 不渲染卡片——下载进度改由右下角非模态浮层 UpdateFloat
+ * 呈现(下载不打断使用 dsh,#31 拍板)。
  */
 export function isUpdateCardVisible(status: UpdateStatus, requested: boolean): boolean {
-  return status === "available"
-    ? requested
-    : status === "downloading" || status === "ready" || status === "failed"
+  return status === "available" ? requested : status === "failed"
 }
 
 /** 下载进度百分比(0-100)。total 未知(<=0)时返回 null,卡片显示「请稍候」。纯函数,可测。 */

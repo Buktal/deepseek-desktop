@@ -46,10 +46,9 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult};
 
 use crate::error::{DshError, UpgradeError, UpgradeErrorKind};
-use crate::{dsh, locales, npm, tray, update};
+use crate::{dsh, npm, tray, update};
 
 /// registry abbreviated packument(install-v1 Accept 头,23KB,#2 调研实测)。
 const REGISTRY_URL: &str = "https://registry.npmjs.org/@deepseek-ai/dsh";
@@ -560,90 +559,11 @@ fn ensure_tls_provider() {
     }
 }
 
-/// 托盘「检查更新」手动入口的 dsh 层(组合编排见 tray::on_check_update):
-/// - boot 未就绪:只亮徽标,不弹对话框(#3 §2:启动未完成不升级,检测照常)
-/// - 发现新版 → 徽标 + 对话框 [升级][稍后]
-/// - 检查失败 → 「检查更新失败,请稍后重试」对话框
-/// - 无新版 → 徽标清除,不弹框(由应用层合并报告「已是最新」)
-pub(crate) fn manual_check(app: &AppHandle) -> ManualCheckOutcome {
-    let boot_ready = app
-        .try_state::<dsh::DshManager>()
-        .map(|m| m.inner().phase() == dsh::Phase::Ready)
-        .unwrap_or(false);
-    let result = tauri::async_runtime::block_on(run_check(app));
-    match result {
-        CheckResult::Found { version, current_version } if boot_ready => {
-            show_found_dialog(app, &version, &current_version);
-            ManualCheckOutcome {
-                answered: true,
-                installed_version: Some(current_version),
-            }
-        }
-        CheckResult::Found { .. } => {
-            // boot 进行中:发现新版只亮徽标(不弹对话框,确认也会被守卫拒绝)
-            ManualCheckOutcome {
-                answered: false,
-                installed_version: None,
-            }
-        }
-        CheckResult::Failed => {
-            show_check_failed_dialog(app);
-            ManualCheckOutcome {
-                answered: true,
-                installed_version: None,
-            }
-        }
-        CheckResult::None { current_version } => ManualCheckOutcome {
-            answered: false,
-            installed_version: current_version,
-        },
-    }
-}
-
-pub(crate) struct ManualCheckOutcome {
-    /// true = 已用对话框回答(组合入口结束);false = 未弹框(继续应用层检查)
-    pub(crate) answered: bool,
-    /// 已装 dsh 版本(供合并「已是最新」对话框;未装/未知 = None)
-    pub(crate) installed_version: Option<String>,
-}
-
-/// 手动检查发现新版:原生对话框 [升级][稍后]。
-/// [升级] → 显示窗口 + 自动开始流水线(#3 §1:确认即授权,不二次确认;
-/// #3 §4:文案明示中断语义;流水线进入 Active 后升级卡片浮层自动出现,
-/// 壳页常驻无需导航,#36)。
-fn show_found_dialog(app: &AppHandle, version: &str, current: &str) {
-    let t = locales::shell_texts(locales::detect_lang());
-    let app = app.clone();
-    app.dialog()
-        .message(t.upgrade_found_message(version, current))
-        .title("DeepSeek Desktop")
-        .kind(MessageDialogKind::Info)
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            t.update_now.into(),
-            t.update_later.into(),
-        ))
-        .show_with_result(move |res| {
-            if let MessageDialogResult::Custom(s) = res {
-                if s == t.update_now {
-                    log::info!("[upgrade] 对话框[升级] → 显示窗口 + 自动开始流水线");
-                    tray::show_main_window(&app);
-                    let up = app.state::<UpgradeManager>().inner().clone();
-                    let dsh = app.state::<dsh::DshManager>().inner().clone();
-                    up.confirm_start(&dsh);
-                }
-            }
-        });
-}
-
-/// 手动检查失败:原生对话框「检查更新失败,请稍后重试」。
-fn show_check_failed_dialog(app: &AppHandle) {
-    let t = locales::shell_texts(locales::detect_lang());
-    app.dialog()
-        .message(t.check_update_failed_message())
-        .title("DeepSeek Desktop")
-        .kind(MessageDialogKind::Info)
-        .buttons(MessageDialogButtons::Ok)
-        .show(|_| {});
+/// 托盘「检查更新」手动入口的 dsh 层(组合编排与弹窗/toast 呈现全在
+/// tray::on_check_update,#39):检查 → 结果。boot 未就绪的判定由编排方做
+/// (tray 读 DshManager phase)——本模块只负责「检查」职责,UI 决策不内嵌。
+pub(crate) fn manual_check(app: &AppHandle) -> CheckResult {
+    tauri::async_runtime::block_on(run_check(app))
 }
 
 // ── 升级流水线(#3 §2 定稿)──────────────────────────────────────────

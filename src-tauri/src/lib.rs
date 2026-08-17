@@ -1,10 +1,11 @@
 //! DeepSeek Desktop Tauri backend.
 //!
-//! 组装:dsh 生命周期管理 + 应用自身升级 + 托盘 + 关闭三选对话框 + 退出收敛(杀子进程)
-//! + 生产日志 + 窗口状态记忆 + 开机自启。
+//! 组装:dsh 生命周期管理 + 应用自身升级 + 托盘 + 关闭三选(壳页 AlertDialog,
+//! #39)+ 退出收敛(杀子进程)+ 生产日志 + 窗口状态记忆 + 开机自启。
 
 mod autostart;
 mod close;
+mod dialog;
 mod dsh;
 mod error;
 mod locales;
@@ -19,9 +20,6 @@ mod update;
 mod upgrade;
 
 use tauri::{LogicalSize, Manager, PhysicalSize, WindowEvent};
-use tauri_plugin_dialog::{
-    DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
-};
 
 use crate::close::CloseBehavior;
 
@@ -37,7 +35,6 @@ pub fn run() {
                 let _ = win.set_focus();
             }
         }))
-        .plugin(tauri_plugin_dialog::init())
         // 应用自身升级:check/download/install 全在 Rust(update.rs,照搬
         // O_CC_One 的插件组合——updater 检查下载 + process/opener 配套能力)
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -119,8 +116,8 @@ pub fn run() {
             // 托盘
             tray::setup_tray(app.handle())?;
 
-            // 关闭按钮:原生三选对话框(退出应用/最小化到托盘/取消)
-            setup_close_handler(app.handle(), manager.clone());
+            // 关闭按钮:壳页 AlertDialog 三选(退出应用/最小化到托盘/取消,#39)
+            setup_close_handler(app.handle());
 
             // 立即启动 boot 流水线(窗口显示前就开始安装,前端挂载后拉快照)
             dsh::boot_start(&manager);
@@ -138,7 +135,8 @@ pub fn run() {
             upgrade::upgrade_confirm,
             upgrade::upgrade_dismiss,
             tray::menu_snapshot,
-            tray::menu_action
+            tray::menu_action,
+            dialog::shell_dialog_respond
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -152,20 +150,19 @@ pub fn run() {
         });
 }
 
-/// 窗口 CloseRequested → 原生三选对话框。
-/// 注意:CloseRequested 在 webview 与 window 层可能各触发一次,用 DIALOG_SHOWN 守卫防重复弹。
-/// 按钮顺序定稿(#9):[最小化到托盘, 退出应用, 取消]。rfd(Windows)用 TaskDialog 且
-/// 不设默认按钮,默认按钮即第一个——把"最小化到托盘"放首位,Enter 只收起窗口、
-/// 不退出应用(原顺序首按钮是"退出应用",回车直接杀进程,是误触隐患)。
-fn setup_close_handler(app: &tauri::AppHandle, manager: dsh::DshManager) {
+/// 窗口 CloseRequested → 壳页 AlertDialog 三选(#31 场景 5 / #39 施工:
+/// 原生阻塞式 dialog 退役,改 emit `shell-dialog` close-ask,用户选择经
+/// shell_dialog_respond 回流到 tray.rs 统一动作分发)。
+///
+/// 注意:CloseRequested 在 webview 与 window 层可能各触发一次,用 DIALOG_SHOWN
+/// 守卫防重复弹(弹窗回答时在 dispatch_dialog_response 复位)。
+/// 按钮次序定稿(#31 拍板):[最小化到托盘(默认), 退出应用, 取消]——默认动作
+/// 是收起窗口而非退出应用,回车不误触杀进程。
+fn setup_close_handler(app: &tauri::AppHandle) {
     let Some(win) = app.get_webview_window("main") else {
         return;
     };
     let app = app.clone();
-    // 关闭对话框文案跟随系统语言(启动时检测一次,与托盘同源)
-    let t = locales::shell_texts(locales::detect_lang());
-    // receiver 与闭包捕获使用不同绑定,避免 move/借用冲突
-    let handler_win = win.clone();
     win.on_window_event(move |event| {
         if let WindowEvent::CloseRequested { api, .. } = event {
             // 程序化退出(托盘"退出"/quit_app)放行,不弹对话框
@@ -173,49 +170,18 @@ fn setup_close_handler(app: &tauri::AppHandle, manager: dsh::DshManager) {
                 return;
             }
             api.prevent_close();
-            // 关闭行为(#38):非 Ask 直接执行;Ask 期间暂维持原生三选弹窗
-            // (M4 换 UI,见 #31)。行为的内存事实源在 close.rs,菜单勾选同源。
+            // 关闭行为(#38):非 Ask 直接执行(close::execute 统一执行路径,#39);
+            // 行为的内存事实源在 close.rs,菜单勾选同源。
             match close::current() {
-                CloseBehavior::Quit => {
-                    dsh::set_quitting();
-                    dsh::kill_child(&manager);
-                    app.exit(0);
-                }
-                CloseBehavior::Minimize => {
-                    let _ = handler_win.hide();
-                }
+                CloseBehavior::Quit => close::execute(&app, CloseBehavior::Quit),
+                CloseBehavior::Minimize => close::execute(&app, CloseBehavior::Minimize),
                 CloseBehavior::Ask => {
+                    // Ask 期间:壳页 AlertDialog 三选(带「记住我的选择」勾选);
+                    // 记住后 close::set 持久化,下次直接执行不再弹(#31)
                     if !dsh::try_show_dialog() {
                         return;
                     }
-
-                    let win = handler_win.clone();
-                    let app = app.clone();
-                    let manager = manager.clone();
-                    app.dialog()
-                .message(t.close_message)
-                .title("DeepSeek Desktop")
-                // Info:关闭确认不是错误/警告,图标用中性信息样式
-                .kind(MessageDialogKind::Info)
-                .buttons(MessageDialogButtons::YesNoCancelCustom(
-                    t.close_minimize.into(),
-                    t.close_quit.into(),
-                    t.close_cancel.into(),
-                ))
-                .show_with_result(move |res| {
-                    dsh::reset_dialog_flag();
-                    match res {
-                        MessageDialogResult::Custom(s) if s == t.close_quit => {
-                            dsh::set_quitting();
-                            dsh::kill_child(&manager);
-                            app.exit(0);
-                        }
-                        MessageDialogResult::Custom(s) if s == t.close_minimize => {
-                            let _ = win.hide();
-                        }
-                        _ => {} // 取消:保持现状
-                    }
-                });
+                    dialog::show_close_ask(&app);
                 }
             }
         }

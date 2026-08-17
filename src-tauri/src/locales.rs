@@ -1,7 +1,8 @@
-//! Rust 侧外壳文案(原生界面):托盘菜单、关闭三选对话框、dsh 意外退出提示。
+//! Rust 侧外壳文案(原生界面与壳页弹窗):托盘菜单、壳页弹窗/toast
+//! (dialog.rs 从本表解析文案随 `shell-dialog` 事件下发)。
 //!
 //! 跟随系统语言,启动时检测一次(sys-locale)。前端文案走 react-i18next
-//! (src/i18n + src/locales/*.json),但原生对话框/托盘无法消费前端 locale JSON,
+//! (src/i18n + src/locales/*.json),但托盘/弹窗请求无法消费前端 locale JSON,
 //! 故本模块独立维护一份 zh/en 文案选择。
 //! 目前无语言偏好设置页,启动检测即终局;将来若加语言设置,由该设置为单一事实
 //! 来源,设置变更时重建托盘/对话框文案,前端经事件跟随(O_CC_One 的 LanguageSync 模式)。
@@ -50,14 +51,28 @@ pub struct ShellTexts {
     pub close_quit: &'static str,
     pub close_minimize: &'static str,
     pub close_cancel: &'static str,
-    pub dsh_crashed: &'static str,
     /// 手动检查发现新版对话框的按钮(升级 / 稍后,见 update.rs)
     pub update_now: &'static str,
     pub update_later: &'static str,
+    /// 发现应用新版弹窗标题(dialog.rs;#31 场景 1「发现新版 vX」)
+    pub upgrade_found_title: &'static str,
+    /// 「记住我的选择」勾选标签(关闭三选弹窗,dialog.rs;#31 场景 5)
+    pub remember_choice: &'static str,
+    /// 「升级正在进行中」toast(升级流水线在途时手动检查被拒的可见反馈,
+    /// dialog.rs;#31 行为修正:消除静默 no-op)
+    pub update_running: &'static str,
     lang: Lang,
 }
 
 impl ShellTexts {
+    /// 手动检查发现应用新版:弹窗标题「发现新版 vX」(dialog.rs,#31 场景 1)。
+    pub fn update_found_title(&self, version: &str) -> String {
+        match self.lang {
+            Lang::Zh => format!("发现新版 v{version}"),
+            Lang::En => format!("New version v{version} available"),
+        }
+    }
+
     /// 手动检查发现新版:对话框正文(含中断影响明示,#3 §4)。
     pub fn update_found_message(&self, version: &str, current: &str) -> String {
         match self.lang {
@@ -157,9 +172,11 @@ pub fn shell_texts(lang: Lang) -> ShellTexts {
             close_quit: "退出应用",
             close_minimize: "最小化到托盘",
             close_cancel: "取消",
-            dsh_crashed: "dsh 进程意外退出,请重新启动应用",
             update_now: "升级",
             update_later: "稍后",
+            upgrade_found_title: "发现 dsh 新版本",
+            remember_choice: "记住我的选择",
+            update_running: "升级正在进行中",
             lang: Lang::Zh,
         },
         Lang::En => ShellTexts {
@@ -181,9 +198,11 @@ pub fn shell_texts(lang: Lang) -> ShellTexts {
             close_quit: "Quit app",
             close_minimize: "Minimize to tray",
             close_cancel: "Cancel",
-            dsh_crashed: "dsh exited unexpectedly; please restart the app",
             update_now: "Upgrade",
             update_later: "Later",
+            upgrade_found_title: "New dsh version available",
+            remember_choice: "Remember my choice",
+            update_running: "An upgrade is in progress",
             lang: Lang::En,
         },
     }
