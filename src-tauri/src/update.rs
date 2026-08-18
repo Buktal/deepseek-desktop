@@ -175,7 +175,7 @@ impl UpdateManager {
 
     /// 状态归约 + 下发(生产路径唯一入口,测试的 apply_event 即此处的归约)。
     fn reduce(&self, event: UpdateEvent) {
-        let was_available = self.has_available_version();
+        let was_available = self.notify_version().is_some();
         let next = {
             let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
             let next = apply_event(&s, event);
@@ -188,14 +188,19 @@ impl UpdateManager {
         // 刷新徽标/动态「升级到 vX」项(取代旧 set_app_update 的间接触发;
         // Downloading/Ready/Failed 时升级卡片必显,托盘项不占位——只认
         // Available)
-        if was_available != self.has_available_version() {
+        if was_available != self.notify_version().is_some() {
             tray::refresh_menu(&self.app);
         }
     }
 
-    /// 是否有可升级版本(菜单徽标/动态项的呈现依据):仅 Available 携带版本。
-    fn has_available_version(&self) -> bool {
-        matches!(self.snapshot(), UpdateStateView::Available { .. })
+    /// 托盘通知版本(徽标/动态「升级到 vX」项的呈现依据,规则单一事实来源:
+    /// 菜单直读本谓词,reduce 的刷新跨界判据同源):仅 Available 携带——
+    /// Downloading/Ready 期间升级卡片必显,托盘项不占位;Failed 归 Idle。
+    pub(crate) fn notify_version(&self) -> Option<String> {
+        match self.snapshot() {
+            UpdateStateView::Available { version, .. } => Some(version),
+            _ => None,
+        }
     }
 
     /// 流水线在途(下载/已就绪)时拒绝新检查(#3:流水线运行中手动入口 no-op;

@@ -1113,29 +1113,34 @@ mod tests {
     }
 
     #[test]
-    fn boot_ready_semantics_match_phase_ready() {
-        // 不变量:升级确认守卫与手动检查 boot 就绪判定用的「Ready 生死两态」,
-        // 与旧 phase()==Ready 的判定等价(Ready 的两种 ServiceStatus 恰是
-        // 它按子进程死活二分的结果)
-        let ready_like = [ServiceStatus::Running, ServiceStatus::DeadAfterCrash];
-        let not_ready_like = [
-            ServiceStatus::NotReady,
-            ServiceStatus::Booting,
-            ServiceStatus::Error,
-        ];
-        for s in ready_like {
-            assert!(matches!(s, ServiceStatus::Running | ServiceStatus::DeadAfterCrash));
-        }
-        for s in not_ready_like {
-            assert!(!matches!(s, ServiceStatus::Running | ServiceStatus::DeadAfterCrash));
-        }
-        // can_boot 的补集:NotReady/Error/DeadAfterCrash 三态可重跑,
-        // Running/Booting 一律 no-op
-        for s in [ServiceStatus::NotReady, ServiceStatus::Error, ServiceStatus::DeadAfterCrash] {
-            assert!(matches!(s, ServiceStatus::NotReady | ServiceStatus::Error | ServiceStatus::DeadAfterCrash));
-        }
-        for s in [ServiceStatus::Running, ServiceStatus::Booting] {
-            assert!(!matches!(s, ServiceStatus::NotReady | ServiceStatus::Error | ServiceStatus::DeadAfterCrash));
+    fn service_status_ready_gate_matches_phase_ready() {
+        // 不变量:消费点(升级确认守卫/手动检查 boot 就绪判定)的「就绪」判据
+        // matches!(status, Running | DeadAfterCrash) 必须与 phase == Ready 精确
+        // 等价——Ready 按子进程死活恰好二分为这两态,其余 phase 一律不落入。
+        // can_boot(NotReady|Error|DeadAfterCrash)与就绪判据在 DeadAfterCrash
+        // 刻意重叠:就绪后意外退出正是「可重跑」的入口。经 derive_status 全组合
+        // 验证,防两套判据漂移。
+        for phase in [
+            Phase::Idle,
+            Phase::Checking,
+            Phase::Installing,
+            Phase::Starting,
+            Phase::Ready,
+            Phase::Error,
+        ] {
+            for alive in [false, true] {
+                let s = derive_status(phase, alive);
+                let ready_gate =
+                    matches!(s, ServiceStatus::Running | ServiceStatus::DeadAfterCrash);
+                assert_eq!(ready_gate, phase == Phase::Ready, "{phase:?}/alive={alive}");
+                let can_boot = matches!(
+                    s,
+                    ServiceStatus::NotReady | ServiceStatus::Error | ServiceStatus::DeadAfterCrash
+                );
+                let expected_can_boot =
+                    phase == Phase::Idle || phase == Phase::Error || (phase == Phase::Ready && !alive);
+                assert_eq!(can_boot, expected_can_boot, "{phase:?}/alive={alive}");
+            }
         }
     }
 

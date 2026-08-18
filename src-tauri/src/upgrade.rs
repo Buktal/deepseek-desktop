@@ -347,7 +347,7 @@ impl UpgradeManager {
     /// 状态归约 + 下发(生产路径唯一入口,测试的 apply_event 即此处的归约)。
     fn reduce(&self, event: UpgradeEvent) {
         let was_running = self.is_pipeline_running();
-        let was_available = self.has_available_version();
+        let was_available = self.notify_version().is_some();
         let next = {
             let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
             let next = apply_event(&s, event);
@@ -363,19 +363,22 @@ impl UpgradeManager {
         // - 可用版本有无跨界:徽标/动态「升级 dsh 到 vX」项随状态机落定
         //   (Found/NoneFound/Dismissed/Succeeded 的 Available↔非 Available 翻转)
         if was_running != self.is_pipeline_running()
-            || was_available != self.has_available_version()
+            || was_available != self.notify_version().is_some()
         {
             tray::refresh_menu(&self.app);
         }
     }
 
-    /// 是否有可升级版本(菜单徽标/动态项的呈现依据):
-    /// Available / Failed 都算——失败保留托盘重试入口(重试仍从同一 pin 继续)。
-    fn has_available_version(&self) -> bool {
-        matches!(
-            self.snapshot(),
-            UpgradeStateView::Available { .. } | UpgradeStateView::Failed { .. }
-        )
+    /// 托盘通知版本(徽标/动态「升级 dsh 到 vX」项的呈现依据,规则单一事实
+    /// 来源:菜单直读本谓词,reduce 的刷新跨界判据同源):Available / Failed
+    /// 都携带——失败保留托盘重试入口(重试仍从同一 pin 继续);Active 期间
+    /// 覆盖层全屏呈现升级进度,托盘项不占位。
+    pub(crate) fn notify_version(&self) -> Option<String> {
+        match self.snapshot() {
+            UpgradeStateView::Available { version, .. }
+            | UpgradeStateView::Failed { version, .. } => Some(version),
+            _ => None,
+        }
     }
 
     /// 流水线在途(检查与手动入口的 no-op 守卫,#3 边界)。

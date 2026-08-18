@@ -189,29 +189,16 @@ fn collect_menu_state(app: &AppHandle) -> menu::MenuState {
     )
 }
 
-/// 应用升级通知版本(菜单徽标/动态「升级到 vX」项的呈现依据):
-/// 仅 Available 携带版本(Downloading/Ready/Failed 时升级卡片必显,
-/// 托盘项不占位)。
+/// 应用升级通知版本(菜单徽标/动态「升级到 vX」项):「哪些状态携带版本」
+/// 的规则单一事实来源在 UpdateManager::notify_version,此处只做装配反查。
 fn available_app_update(app: &AppHandle) -> Option<String> {
-    app.try_state::<update::UpdateManager>().and_then(|m| {
-        match m.inner().snapshot() {
-            update::UpdateStateView::Available { version, .. } => Some(version),
-            _ => None,
-        }
-    })
+    app.try_state::<update::UpdateManager>().and_then(|m| m.inner().notify_version())
 }
 
-/// dsh 升级通知版本(菜单徽标/动态「升级 dsh 到 vX」项的呈现依据):
-/// Available / Failed 都携带版本——失败保留托盘重试入口(与旧槽位语义一致:
-/// 升级失败不清除通知,重试仍从同一 pin 继续)。
+/// dsh 升级通知版本(菜单徽标/动态「升级 dsh 到 vX」项):规则单一事实来源
+/// 在 UpgradeManager::notify_version,此处只做装配反查。
 fn available_dsh_upgrade(app: &AppHandle) -> Option<String> {
-    app.try_state::<upgrade::UpgradeManager>().and_then(|m| {
-        match m.inner().snapshot() {
-            upgrade::UpgradeStateView::Available { version, .. }
-            | upgrade::UpgradeStateView::Failed { version, .. } => Some(version),
-            _ => None,
-        }
-    })
+    app.try_state::<upgrade::UpgradeManager>().and_then(|m| m.inner().notify_version())
 }
 
 /// 任一升级流水线在途(dsh 升级 Active / 应用升级下载或就绪)。

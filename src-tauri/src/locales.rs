@@ -57,7 +57,8 @@ pub struct ShellTexts {
     /// 手动检查发现新版对话框的按钮(升级 / 稍后,见 update.rs)
     pub update_now: &'static str,
     pub update_later: &'static str,
-    /// 发现应用新版弹窗标题(dialog.rs;#31 场景 1「发现新版 vX」)
+    /// 发现 dsh 新版弹窗标题(dialog.rs show_upgrade_found;#31 场景 3。
+    /// 应用新版标题是插值方法 update_found_title,不是本字段)
     pub upgrade_found_title: &'static str,
     /// 「记住我的选择」勾选标签(关闭弹窗,dialog.rs;#31 场景 5)
     pub remember_choice: &'static str,
@@ -193,7 +194,7 @@ const TEXT_ROWS: [(&str, &str); 20] = [
     // update_now / update_later(手动检查发现新版对话框的按钮)
     ("升级", "Upgrade"),
     ("稍后", "Later"),
-    // upgrade_found_title(发现应用新版弹窗标题,dialog.rs;#31 场景 1)
+    // upgrade_found_title(发现 dsh 新版弹窗标题,dialog.rs show_upgrade_found;#31 场景 3)
     ("发现 dsh 新版本", "New dsh version available"),
     // remember_choice(「记住我的选择」勾选标签,关闭弹窗,dialog.rs;#31 场景 5)
     ("记住我的选择", "Remember my choice"),
