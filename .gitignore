@@ -23,24 +23,27 @@ dist-ssr
 *.sln
 *.sw?
 
+# Vite cache
+.vite/
+
+# Yarn runtime state
+.yarn/
+
 # Tauri
 /.tauri/
 /src-tauri/target/
-
 # 安装包内置 npm 离线缓存(beforeBuildCommand 生成,不入库)
 /src-tauri/resources/npm-cache/
 
 # Local
 .claude/
 .agents/
+docs/adr/
 docs/agents/
+docs/plans/
 docs/prototype
 docs/research
+AGENTS.md
 CLAUDE.md
 CONTEXT.md
-
-# Vite cache
-.vite/
-
-# Yarn runtime state
-.yarn/
+skills-lock.json
