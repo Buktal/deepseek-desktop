@@ -1,6 +1,6 @@
 // 壳页骨架(M1,#36 + M2,#37):壳菜单条 + dsh iframe 容器 + 浮层挂载点。
-// - 壳菜单条:同一组件三平台变体(macOS 28px 拖拽条 / Win+Linux 内容区
-//   第一行,ADR 0002,#37);菜单快照与下拉由 M3 填充。
+// - 壳菜单条:三平台同行(macOS 28px 拖拽条与红绿灯 / Win+Linux 无边框
+//   一行含自绘窗口控制,ADR 0003,#42);菜单快照与下拉由 M3 填充。
 // - iframe:dsh 跨源嵌入(ADR 0001),src 由 Rust 推送的 dsh URL 设置;
 //   allow 放行全屏与剪贴板 API(跨源 iframe 的 Web 能力需显式授权)。
 // - 浮层挂载点:盖在 iframe 之上(z-20),boot / dsh 升级 / 意外退出覆盖层
@@ -24,7 +24,7 @@ export function ShellLayout({
 }) {
   return (
     <div className="flex h-screen w-screen flex-col bg-background text-foreground">
-      {/* 壳菜单条(M2 三平台布局:macOS 28px 拖拽条 / Win+Linux 内容区第一行) */}
+      {/* 壳菜单条(三平台同行:macOS 拖拽条 / Win+Linux 一行含自绘控制) */}
       <MenuBar />
       {/* iframe 容器 + 浮层挂载点 */}
       <div className="relative min-h-0 flex-1">

@@ -134,7 +134,7 @@ pub fn create_main_window(app: &AppHandle) -> tauri::Result<()> {
         .find(|w| w.label == "main")
         .expect("tauri.conf.json 必须定义 main 窗口(#15 导航拦截需要 builder 挂回调)");
     let nav_app = app.clone();
-    let win = WebviewWindowBuilder::from_config(app, conf)?
+    let builder = WebviewWindowBuilder::from_config(app, conf)?
         // 页面层外链拦截(#29/#36):注入所有帧,子帧外链经 postMessage 回壳页
         // (Windows 上 on_navigation / on_new_window 对 iframe 不触发,wry#1593)
         .initialization_script_for_all_frames(EXTERNAL_LINK_SCRIPT)
@@ -160,9 +160,14 @@ pub fn create_main_window(app: &AppHandle) -> tauri::Result<()> {
             log::info!("[navigation] 拦截新窗口请求 → 系统浏览器: {url}");
             open_external(url.as_str());
             NewWindowResponse::Deny
-        })
-        .build()?;
-    let _ = win;
+        });
+    // 三平台同行(#42,ADR 0003):Windows/Linux 关系统装饰、全自绘窗口控制
+    // (菜单条一行内的拖拽区 + 自绘三按钮);macOS 保持 Overlay(config 定义,
+    // 系统红绿灯)。不走平台 conf 文件:其合并是 json-patch(RFC 7396),
+    // windows 数组整体替换,会丢基础 conf 的窗口几何。
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let builder = builder.decorations(false);
+    builder.build()?;
     Ok(())
 }
 

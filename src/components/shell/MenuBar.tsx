@@ -1,10 +1,10 @@
-// 壳菜单条(M2,#37 布局 + M3,#38 菜单):同一组件三平台变体(ADR 0002 / 拍板 #28)。
+// 壳菜单条(M2,#37 布局 + M3,#38 菜单;#42 三平台同行,ADR 0003)。
 // - macOS:28px 拖拽条与系统红绿灯同行——data-tauri-drag-region 整行可拖
 //   (drag.js 对 BUTTON 等可点击元素自动豁免,单击/双击最大化随 drag 内建),
 //   左侧 84px 避让红绿灯(trafficLightPosition 已在 tauri.conf.json 定位);
 //   无背景色块与分隔线(Overlay 下系统标题栏为透明覆盖,画了即双层视觉)。
-// - Windows/Linux:系统标题栏下方内容区第一行,无 drag region(平台模块
-//   返回 undefined,完全不渲染属性——wry 是属性存在性检测)。
+// - Windows/Linux:无边框窗口一行——行本身为拖拽区(同上豁免与内建),
+//   左侧菜单按钮,右侧自绘窗口控制贴右缘(WindowControls,#42)。
 // - 菜单按钮(M3):快照渲染的 shadcn DropdownMenu——与托盘同源(useMenuSnapshot
 //   镜像 Rust 的 MenuSnapshot),items 纯映射(check 勾选列 / disabled 禁用 /
 //   submenu 嵌套 / separator 分隔),动作点击全部 invoke menu_action 回流
@@ -31,6 +31,7 @@ import {
   useMenuSnapshot,
   type MenuItemView,
 } from "@/lib/useMenuSnapshot"
+import { WindowControls } from "@/components/shell/WindowControls"
 
 /** 快照 → DropdownMenu 纯映射(递归渲染子菜单)。 */
 function MenuItems({
@@ -93,7 +94,7 @@ export function MenuBar() {
   const hasBadge = menuHasBadge(snapshot.items)
   return (
     <div
-      {...dragRegionProps(platform)}
+      {...dragRegionProps()}
       className={cn(
         "flex shrink-0 items-center",
         layout.heightClass,
@@ -128,6 +129,8 @@ export function MenuBar() {
           </DropdownMenuContent>
         ) : null}
       </DropdownMenu>
+      {/* 自绘窗口控制(#42):仅 Windows/Linux,贴行右缘 */}
+      {layout.windowControls ? <WindowControls /> : null}
     </div>
   )
 }
