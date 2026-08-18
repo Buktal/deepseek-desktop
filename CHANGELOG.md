@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-18
+
+### Fixed
+
+- **菜单勾选标记与文字对齐**(0.5.0 回归):开机自启 / 主题 / 关闭行为的勾选标记移行尾,所有菜单文字统一左对齐。
+
 ## [0.5.0] - 2026-08-18
 
 ### Added
@@ -75,6 +81,7 @@
 - **界面 i18n**:zh / en 双语,跟随系统语言(中文系统默认中文)。
 - **CI 发布流水线**:打 tag 自动构建、签名并发布 Release(含 latest.json 更新清单)。
 
+[1.0.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v1.0.0
 [0.5.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v0.3.0

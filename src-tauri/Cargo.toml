@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-desktop"
-version = "0.5.0"
+version = "1.0.0"
 description = "DeepSeek Desktop — minimal Tauri shell."
 authors = ["deepseek desktop"]
 edition = "2021"
