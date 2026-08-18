@@ -1,23 +1,23 @@
-//! npm 工具链域:node 环境检测、全局 dsh 检测/安装、安装进度模拟与错误分类。
+//! npm 工具链域:node 环境检测、全局 dsh 检测、**安装执行全流程**(命令构造 →
+//! 超时/孤儿回收 → ETARGET 回退 → 错误分类)、安装进度模拟。
 //!
 //! boot 流水线(dsh.rs)与 dsh 升级链(upgrade.rs)共用(单一事实来源);
-//! 纯函数均可测,进程型函数只依赖 crate::proc 的子进程工具,不依赖 DshManager。
-//! 唯一的例外是安装执行本身 npm_install_global——它需要登记安装中 pid / 推日志
-//! (DshManager 私有状态),留在 dsh.rs;参数组装与错误分类等纯函数在此。
+//! 纯函数均可测,进程型函数只依赖 crate::proc 的子进程工具。安装执行与调用方
+//! 状态相关的两个副作用(pid 登记 / 日志行转发)经 [`InstallObserver`] seam
+//! 注入,生产实现是 DshManager——本模块不依赖 DshManager。
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::error::DshError;
-use crate::proc::{
-    kill_and_reap, new_process_group, no_window, wait_with_timeout, ChildWaitError,
-};
+use crate::proc::{new_process_group, no_window, run_with_timeout};
 
 /// dsh 要求的 Node 版本(仓库根 package.json engines):^22.19 || >=24。
 /// 作为 NodeVersionUnmet 的结构化数据传给前端(版本规格是技术串,语言中立,
@@ -27,7 +27,7 @@ const NODE_REQ: &str = "Node.js ^22.19 or >=24";
 /// checking 会永久卡住,必须设上限(超时后杀进程并报可读错误)。
 const CHECK_NODE_TIMEOUT: Duration = Duration::from_secs(10);
 /// npm 安装超时。冷缓存首次安装可能要几分钟,给足 10 分钟;超时视为失败并报可读错误。
-/// 秒数/常量被 dsh.rs 的 npm_install_global(安装执行本体)复用。
+/// 安装执行本体(install_global)在本文件,直接消费此常量。
 pub(crate) const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 /// 安装包内置 npm 离线缓存的相对目录名(位于 Tauri 资源目录下)。
 /// 约定由本文件与 #6(CI 发版打包)共同持有:CI 把发版时的 dsh 依赖树提前
@@ -90,7 +90,8 @@ fn check_node_version(ver: &str) -> Result<(), DshError> {
 }
 
 /// 检查 node 是否可用且满足版本要求。`node --version` 带超时:
-/// node 被 shim/杀软/网络盘挂起时同步 output() 会永久阻塞,超时后杀进程并报可读错误。
+/// node 被 shim/杀软/网络盘挂起时同步 output() 会永久阻塞;超时/IO 失败由
+/// run_with_timeout 自动杀进程回收(执行器不变量,不泄漏孤儿)。
 /// boot 流水线的 checking 阶段调用。
 pub(crate) fn check_node() -> Result<String, DshError> {
     let mut binding = Command::new("node");
@@ -102,20 +103,12 @@ pub(crate) fn check_node() -> Result<String, DshError> {
         .map_err(|_| DshError::NodeMissing {
             required: NODE_REQ.to_string(),
         })?;
-    let out = match wait_with_timeout(&mut child, CHECK_NODE_TIMEOUT) {
-        Ok(out) => out,
-        Err(ChildWaitError::Timeout(_)) => {
-            kill_and_reap(&mut child);
-            return Err(DshError::NodeCheckTimeout {
-                seconds: CHECK_NODE_TIMEOUT.as_secs(),
-            });
-        }
-        Err(ChildWaitError::Io(e)) => {
-            // 句柄异常也要按进程树杀,否则留下孤儿 node 进程(与 Timeout 同语义)
-            kill_and_reap(&mut child);
-            return Err(DshError::NodeCheckFailed { detail: e });
-        }
-    };
+    let out = run_with_timeout(&mut child, CHECK_NODE_TIMEOUT, |e| match e {
+        crate::proc::RunError::Timeout(_) => DshError::NodeCheckTimeout {
+            seconds: CHECK_NODE_TIMEOUT.as_secs(),
+        },
+        crate::proc::RunError::Io(detail) => DshError::NodeCheckFailed { detail },
+    })?;
     if !out.status.success() {
         return Err(DshError::NodeVersionCheckFailed {
             exit_code: out.status.code().unwrap_or(-1),
@@ -136,19 +129,12 @@ fn global_node_modules() -> Result<PathBuf, DshError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|_| DshError::NpmRootSpawnFailed)?;
-    let out = match wait_with_timeout(&mut child, NPM_ROOT_TIMEOUT) {
-        Ok(out) => out,
-        Err(ChildWaitError::Timeout(_)) => {
-            kill_and_reap(&mut child);
-            return Err(DshError::NpmRootTimeout {
-                seconds: NPM_ROOT_TIMEOUT.as_secs(),
-            });
-        }
-        Err(ChildWaitError::Io(e)) => {
-            kill_and_reap(&mut child);
-            return Err(DshError::NpmRootIoFailed { detail: e });
-        }
-    };
+    let out = run_with_timeout(&mut child, NPM_ROOT_TIMEOUT, |e| match e {
+        crate::proc::RunError::Timeout(_) => DshError::NpmRootTimeout {
+            seconds: NPM_ROOT_TIMEOUT.as_secs(),
+        },
+        crate::proc::RunError::Io(detail) => DshError::NpmRootIoFailed { detail },
+    })?;
     if !out.status.success() {
         return Err(DshError::NpmRootExitFailed {
             exit_code: out.status.code().unwrap_or(-1),
@@ -293,6 +279,162 @@ pub(crate) fn stderr_has_etarget(stderr_tail: &[String]) -> bool {
         let l = l.to_ascii_lowercase();
         l.contains("etarget") || l.contains("notarget")
     })
+}
+
+// ── 安装执行(boot 与升级链共用,单一事实来源)──────────────────────
+
+/// 安装过程观察者:安装流程中与调用方状态相关的两个副作用经此 seam 注入,
+/// 安装本体(命令构造/超时/孤儿回收/ETARGET 回退/错误分类)不依赖具体调用方。
+/// 生产实现:DshManager(pid 供退出收敛随树杀;日志入环形缓冲)。
+pub(crate) trait InstallObserver: Send + 'static {
+    /// 登记安装中进程 pid(Some;退出收敛时按树杀, npm 会再拉起 node 子进程) /
+    /// 清除登记(None;进程已退出,自然退出或被超时回收)。
+    fn install_pid(&self, pid: Option<u32>);
+    /// 转发安装过程日志行(stream = "stdout" | "stderr")。
+    fn install_log(&self, stream: &str, line: &str);
+}
+
+/// 单次 npm 安装尝试的结果(ETARGET 回退的判定数据源,见 install_global)。
+enum InstallAttemptFailure {
+    /// 进程非零退出:未分类,携带退出码与 stderr 尾部原文(供 ETARGET 判定与
+    /// install_failure_error 分类);安装失败保留旧版(npm 语义,#2 实测)
+    Exit {
+        exit_code: Option<i32>,
+        stderr_tail: Vec<String>,
+    },
+    /// 超时 / 句柄异常:已分类 DshError(非「缓存数据过旧」症状,不做重试)
+    Dsh(DshError),
+}
+
+/// 执行一次 npm install 尝试(boot 与升级链共用;ETARGET 回退编排在
+/// install_global)。stdout/stderr 逐行转发给观察者,stderr 尾部捕获供失败
+/// 分类;pid 经观察者登记:升级期间用户退出时随退出收敛一并杀。
+/// 超时 / 句柄异常由 run_with_timeout 自动按进程树杀回收(执行器不变量,
+/// 不泄漏孤儿)。
+fn install_attempt<O>(
+    obs: &O,
+    cache_dir: Option<&Path>,
+    version_spec: &str,
+) -> Result<(), InstallAttemptFailure>
+where
+    O: InstallObserver + Clone,
+{
+    if let Some(dir) = cache_dir {
+        log::info!("[npm] 使用安装包内置离线缓存: {}", dir.display());
+    }
+    let args = npm_install_args(cache_dir, version_spec);
+    let mut cmd = npm_command();
+    cmd.args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| {
+        InstallAttemptFailure::Dsh(DshError::NpmSpawnFailed { detail: e.to_string() })
+    })?;
+    obs.install_pid(Some(child.id()));
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let o = obs.clone();
+    let out_thread = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            o.install_log("stdout", &line);
+        }
+    });
+
+    let stderr = child.stderr.take().expect("piped stderr");
+    let o = obs.clone();
+    // stderr 尾部捕获:失败时拼进可读错误信息(EPERM 权限引导等),与日志流并行
+    let stderr_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let tail = stderr_tail.clone();
+    let err_thread = thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            o.install_log("stderr", &line);
+            let mut t = tail.lock().unwrap_or_else(|p| p.into_inner());
+            t.push(line);
+            while t.len() > 8 {
+                t.remove(0);
+            }
+        }
+    });
+
+    let result = run_with_timeout(&mut child, NPM_INSTALL_TIMEOUT, |e| {
+        InstallAttemptFailure::Dsh(match e {
+            crate::proc::RunError::Timeout(_) => DshError::InstallTimeout {
+                seconds: NPM_INSTALL_TIMEOUT.as_secs(),
+            },
+            crate::proc::RunError::Io(detail) => DshError::NpmInstallIoFailed { detail },
+        })
+    });
+    obs.install_pid(None);
+    // 无论成败进程已退出(自然退出 / 超时被杀回收)→ 管道 EOF → 读线程自然
+    // 结束,join 防线程泄漏;stderr 尾部在 err_thread 结束前收全
+    let _ = out_thread.join();
+    let _ = err_thread.join();
+    match result {
+        Ok(out) => {
+            let tail: Vec<String> = stderr_tail
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            if out.status.success() {
+                Ok(())
+            } else {
+                Err(InstallAttemptFailure::Exit {
+                    exit_code: out.status.code(),
+                    stderr_tail: tail,
+                })
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// ETARGET 回退判定(纯函数,可测):带缓存 + stderr 报 ETARGET = 缓存
+/// packument 过旧的确定性症状(数据过旧是唯一成因),回退无缓存重试;
+/// 其余失败直接分类返回。
+fn should_retry_without_cache(used_cache: bool, stderr_tail: &[String]) -> bool {
+    used_cache && stderr_has_etarget(stderr_tail)
+}
+
+/// npm 全局安装 dsh(boot 传 "@latest" 跟随 latest;dsh 升级链传 "@<pin>" 精确
+/// 版本,#3 §7),stdout/stderr 逐行转发给观察者。安装包内置离线缓存存在时优先
+/// 离线安装(命中秒级完成、缺失回退网络)。
+///
+/// ETARGET 根治(#41,M1 遗留):内置离线缓存是发版时点打包的,其 packument
+/// 可能早于升级目标版本(registry 直查刚确认过该版本存在),--prefer-offline
+/// 跳过新鲜度检查会让 npm 按旧 packument 误报「版本不存在」(ETARGET,假阴性)。
+/// 处置:带缓存安装失败且 stderr 判定为 ETARGET → 回退无缓存网络重试一次
+/// (registry 数据恒新鲜,命中真因——数据过旧——而非擦症状);其余失败直接
+/// 分类返回。boot 的 @latest 安装不需要比缓存更新的版本,不会命中 ETARGET,
+/// 此回退只会在升级链触发;回退后再次失败按常规错误呈现(不循环重试)。
+pub(crate) fn install_global<O>(
+    obs: &O,
+    cache_dir: Option<&Path>,
+    version_spec: &str,
+) -> Result<(), DshError>
+where
+    O: InstallObserver + Clone,
+{
+    let mut cache = cache_dir;
+    loop {
+        match install_attempt(obs, cache, version_spec) {
+            Ok(()) => return Ok(()),
+            Err(InstallAttemptFailure::Dsh(e)) => return Err(e),
+            Err(InstallAttemptFailure::Exit { exit_code, stderr_tail }) => {
+                // 命中即回退无缓存(cache 置 None 后循环至多再走一轮:
+                // ETARGET 分支条件不再成立,不会无限重试)
+                if should_retry_without_cache(cache.is_some(), &stderr_tail) {
+                    log::warn!(
+                        "[npm] 安装报 ETARGET(内置缓存 packument 早于目标版本),回退无缓存网络重试"
+                    );
+                    cache = None;
+                    continue;
+                }
+                return Err(install_failure_error(exit_code, &stderr_tail));
+            }
+        }
+    }
 }
 
 // ── 安装进度模拟(#7,单一事实来源:boot 与升级链共用)────────────────
@@ -628,6 +770,18 @@ mod tests {
         assert!(!stderr_has_etarget(&["npm error code EACCES".to_string()]));
         assert!(!stderr_has_etarget(&[]));
         assert!(!stderr_has_etarget(&["npm error code ETIMEDOUT".to_string()])); // 与 ETARGET 不同码
+    }
+
+    #[test]
+    fn should_retry_without_cache_requires_cache_and_etarget() {
+        // ETARGET 回退判定(生产路径见 install_global):
+        // 带缓存 + ETARGET → 回退;缺任一条件 → 直接分类返回
+        let etarget = vec!["npm error code ETARGET".to_string()];
+        let network = vec!["npm error code ENOTFOUND".to_string()];
+        assert!(should_retry_without_cache(true, &etarget));
+        assert!(!should_retry_without_cache(false, &etarget)); // 没带缓存,无从回退
+        assert!(!should_retry_without_cache(true, &network)); // 非 ETARGET 不回退
+        assert!(!should_retry_without_cache(true, &[]));
     }
 
     #[test]

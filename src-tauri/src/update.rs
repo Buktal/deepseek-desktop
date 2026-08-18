@@ -175,6 +175,7 @@ impl UpdateManager {
 
     /// 状态归约 + 下发(生产路径唯一入口,测试的 apply_event 即此处的归约)。
     fn reduce(&self, event: UpdateEvent) {
+        let was_available = self.has_available_version();
         let next = {
             let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
             let next = apply_event(&s, event);
@@ -183,6 +184,18 @@ impl UpdateManager {
         };
         log::info!("[update] state → {next:?}");
         let _ = self.app.emit_to("main", "update-state", next);
+        // 菜单刷新时机(状态迁移 → 刷菜单,副作用显式化):可用版本有无跨界时
+        // 刷新徽标/动态「升级到 vX」项(取代旧 set_app_update 的间接触发;
+        // Downloading/Ready/Failed 时升级卡片必显,托盘项不占位——只认
+        // Available)
+        if was_available != self.has_available_version() {
+            tray::refresh_menu(&self.app);
+        }
+    }
+
+    /// 是否有可升级版本(菜单徽标/动态项的呈现依据):仅 Available 携带版本。
+    fn has_available_version(&self) -> bool {
+        matches!(self.snapshot(), UpdateStateView::Available { .. })
     }
 
     /// 流水线在途(下载/已就绪)时拒绝新检查(#3:流水线运行中手动入口 no-op;
@@ -197,27 +210,53 @@ impl UpdateManager {
     /// 常驻检查(setup 调用一次):启动探测 + 6h 轮询。
     /// 探测失败静默(按无新版),不影响启动。
     pub fn start_resident_checks(&self) {
-        self.check_now(false, None);
+        self.start_silent_check();
         let m = self.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(POLL_INTERVAL);
-            m.check_now(false, None);
+            m.start_silent_check();
         });
     }
 
-    /// 检查更新。manual=true(托盘「检查更新」组合入口,#17)时结果经 on_done
-    /// 回调送出(对话框决策在编排方 tray::on_check_update 统一进行,避免两层
-    /// 升级各自弹框叠加);自动检测静默。并发保护:CHECKING 防重入;流水线在途
-    /// 时 no-op(注意:CHECKING 在途时提前返回,on_done 不会被调用)。
-    pub fn check_now(&self, manual: bool, on_done: Option<Box<dyn FnOnce(ManualCheckResult) + Send>>) {
+    /// 手动检查(托盘「检查更新」组合入口,#17):守卫先行、拒绝以返回值显式
+    /// 表达(此前「回调有时不被调用」的三条隐规则收敛于此);准入后结果必经
+    /// on_done 送出恰好一次(含 updater 不可用/失败路径,按 Failed 送出)。
+    /// 弹窗/toast 决策在编排方 tray::on_check_update 统一进行,避免两层升级
+    /// 各自弹框叠加。
+    pub fn start_manual_check(
+        &self,
+        on_done: Box<dyn FnOnce(ManualCheckResult) + Send>,
+    ) -> ManualCheckAdmission {
+        let admission = self.admit();
+        if admission == ManualCheckAdmission::Admitted {
+            self.run_check(Some(on_done));
+        }
+        admission
+    }
+
+    /// 自动检查(启动探测/6h 轮询):静默,守卫拒绝时不产生任何呈现。
+    pub fn start_silent_check(&self) {
+        if self.admit() == ManualCheckAdmission::Admitted {
+            self.run_check(None);
+        }
+    }
+
+    /// 准入守卫:升级流水线在途(下载/就绪)拒绝;CHECKING 防重入
+    /// (启动探测与手动点击撞车时后者拒绝,占位语义——准入即占)。
+    fn admit(&self) -> ManualCheckAdmission {
         if self.is_active() {
-            log::info!("[update] 升级流水线在途,跳过检查");
-            return;
+            log::info!("[update] 升级流水线在途,拒绝检查");
+            return ManualCheckAdmission::UpgradeActive;
         }
         if CHECKING.swap(true, Ordering::SeqCst) {
-            log::info!("[update] 检查已在进行,跳过");
-            return;
+            log::info!("[update] 检查已在进行,拒绝");
+            return ManualCheckAdmission::AlreadyChecking;
         }
+        ManualCheckAdmission::Admitted
+    }
+
+    /// 检查本体(异步):仅准入后调用;on_done 存在时必然被调用恰好一次。
+    fn run_check(&self, on_done: Option<Box<dyn FnOnce(ManualCheckResult) + Send>>) {
         let m = self.clone();
         tauri::async_runtime::spawn(async move {
             m.reduce(UpdateEvent::CheckStarted);
@@ -227,10 +266,8 @@ impl UpdateManager {
                     log::warn!("[update] updater 不可用(静默): {e}");
                     CHECKING.store(false, Ordering::SeqCst);
                     m.reduce(UpdateEvent::CheckNone);
-                    if manual {
-                        if let Some(f) = on_done {
-                            f(ManualCheckResult::Failed);
-                        }
+                    if let Some(f) = on_done {
+                        f(ManualCheckResult::Failed);
                     }
                     return;
                 }
@@ -250,38 +287,29 @@ impl UpdateManager {
                         current_version: update.current_version.clone(),
                         notes: update.body.clone(),
                     });
-                    tray::set_app_update(&m.app, Some(&update.version));
-                    if manual {
-                        if let Some(f) = on_done {
-                            f(ManualCheckResult::Found {
-                                version: update.version,
-                                current_version: update.current_version,
-                                // notes 随结果携带(tray.rs 编排弹窗时下发原文,
-                                // 前端 summarizeReleaseNotes 复用,#39)
-                                notes: update.body.clone(),
-                            });
-                        }
+                    if let Some(f) = on_done {
+                        f(ManualCheckResult::Found {
+                            version: update.version,
+                            current_version: update.current_version,
+                            // notes 随结果携带(tray.rs 编排弹窗时下发原文,
+                            // 前端 summarizeReleaseNotes 复用,#39)
+                            notes: update.body.clone(),
+                        });
                     }
                 }
                 Ok(None) => {
                     log::info!("[update] 已是最新版本");
                     m.reduce(UpdateEvent::CheckNone);
-                    tray::set_app_update(&m.app, None);
-                    if manual {
-                        if let Some(f) = on_done {
-                            f(ManualCheckResult::None);
-                        }
+                    if let Some(f) = on_done {
+                        f(ManualCheckResult::None);
                     }
                 }
                 Err(e) => {
                     // 检测失败静默(#1):不进错误态、不弹窗,等下一次触发
                     log::warn!("[update] 检查失败(静默): {e}");
                     m.reduce(UpdateEvent::CheckNone);
-                    tray::set_app_update(&m.app, None);
-                    if manual {
-                        if let Some(f) = on_done {
-                            f(ManualCheckResult::Failed);
-                        }
+                    if let Some(f) = on_done {
+                        f(ManualCheckResult::Failed);
                     }
                 }
             }
@@ -372,6 +400,19 @@ impl UpdateManager {
 
 // ── 手动检查结果(供组合入口使用:tray::on_check_update 编排两层回答,
 // 弹窗/toast 由 dialog.rs 呈现,#39)──────────────────────────────────
+
+/// 手动检查的准入结果(守卫显式化):此前「回调有时不被调用」的三条隐规则
+/// (流水线在途 / 检查在途 / 自动模式)收敛为一个返回值;Admitted 时 on_done
+/// 必然被调用恰好一次。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManualCheckAdmission {
+    /// 已启动,结果稍后经 on_done 送出(检查失败也按 Failed 送出,不静默吞掉)
+    Admitted,
+    /// 升级流水线在途(下载/就绪),拒绝
+    UpgradeActive,
+    /// 已有检查在途(启动探测与手动点击撞车),拒绝
+    AlreadyChecking,
+}
 
 /// 手动检查的结果。Found 携带 notes(弹窗正文摘要的原文来源)。
 pub enum ManualCheckResult {

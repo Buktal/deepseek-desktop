@@ -52,9 +52,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::error::DshError;
 use crate::npm::{self, InstallStage};
-use crate::proc::{
-    kill_and_reap, kill_pid_tree, new_process_group, no_window, wait_with_timeout, ChildWaitError,
-};
+use crate::proc::{kill_pid_tree, new_process_group, no_window, wait_with_timeout};
 
 /// dsh 源码注释明确:"This URL line is a readiness signal" —— stdout 打印即服务就绪
 const READY_PREFIX: &str = "dsh web: http://";
@@ -62,17 +60,18 @@ const READY_PREFIX: &str = "dsh web: http://";
 /// 实测:首次运行 dsh 需初始化 ~/.dsh profile + 加载 100+ 插件,约 65s 才打印就绪行。
 /// 留足余量用 180s;二次启动(profile 已存在)通常 < 10s。
 const START_TIMEOUT: Duration = Duration::from_secs(180);
+/// 帧嵌入回归检查超时(本地 127.0.0.1 服务,3s 足够)。
+const FRAME_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 /// 日志环形缓冲容量(仅供异常时附上下文,不推流)
 const LOG_CAP: usize = 200;
 
 // ── 全局守卫(跨线程)────────────────────────────────────────────────
 
 static QUITTING: AtomicBool = AtomicBool::new(false);
-static DIALOG_SHOWN: AtomicBool = AtomicBool::new(false);
 /// 流水线运行中标志:防 StrictMode 双 invoke / setup 与前端同时触发导致双流水线竞态
 static BOOTING: AtomicBool = AtomicBool::new(false);
 /// dsh 升级链主动杀旧 dsh 时的抑制标志(#3 §2):独立于 set_quitting——
-/// 升级不退出应用、不要求放行 CloseRequested(关闭三选对话框整个会话保持有效),
+/// 升级不退出应用、不要求放行 CloseRequested(关闭弹窗整个会话保持有效),
 /// 只是不让 reaper 把「升级主动杀的旧 dsh」误判为「意外退出」弹窗。
 /// 杀旧进程前置位、新 dsh 就绪(或升级失败收敛)后清除;清除时机安全:
 /// 旧进程的 reaper 在进程退出(杀后即刻)时早已过判定点。
@@ -91,15 +90,6 @@ pub fn set_upgrade_active(v: bool) {
 }
 pub fn upgrade_active() -> bool {
     UPGRADE_ACTIVE.load(Ordering::SeqCst)
-}
-/// 关闭对话框防双触发(CloseRequested 在 webview 与 window 层各触发一次)
-pub fn try_show_dialog() -> bool {
-    DIALOG_SHOWN
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-}
-pub fn reset_dialog_flag() {
-    DIALOG_SHOWN.store(false, Ordering::SeqCst);
 }
 
 // ── 状态与视图 ─────────────────────────────────────────────────────
@@ -123,6 +113,44 @@ pub enum Phase {
     Starting,
     Ready,
     Error,
+}
+
+/// dsh 服务运行状态(service_status 的组合判定结果,见 derive_status)。
+/// 五个调用点(boot_start 守卫 / 升级确认守卫 / 升级卡恢复判断 / 手动检查
+/// boot 就绪判定 / reaper 之外的状态消费)统一经此谓词,不再各自拼
+/// phase×child×try_wait。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServiceStatus {
+    /// 尚未启动(Idle)
+    NotReady,
+    /// 流水线运行中(Checking/Installing/Starting)
+    Booting,
+    /// 就绪且进程存活
+    Running,
+    /// 就绪但进程已退出或句柄缺失(意外退出,待重跑 boot)
+    DeadAfterCrash,
+    /// 错误态(Error)
+    Error,
+}
+
+/// 由阶段与子进程存活两事实推导服务状态(纯函数,可穷举单测)。
+/// 组合语义内化:只有 Ready 关注子进程死活——「Ready + 句柄空 = 意外退出
+/// 待重跑」(reaper 已收割)、「try_wait 出错按已退出」(不干等 180s 超时);
+/// 流水线在途一律 Booting(无论子进程是否已 spawn)。
+fn derive_status(phase: Phase, child_alive: bool) -> ServiceStatus {
+    match phase {
+        Phase::Idle => ServiceStatus::NotReady,
+        Phase::Error => ServiceStatus::Error,
+        Phase::Ready => {
+            if child_alive {
+                ServiceStatus::Running
+            } else {
+                ServiceStatus::DeadAfterCrash
+            }
+        }
+        // Checking / Installing / Starting
+        _ => ServiceStatus::Booting,
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -254,9 +282,16 @@ impl DshManager {
         let _ = self.app.emit_to("main", "dsh-url", DshUrlView { url });
     }
 
-    /// 当前 boot 流水线阶段(升级链确认守卫用:boot 未就绪不升级,#3 §2)。
-    pub(crate) fn phase(&self) -> Phase {
+    /// 当前 boot 流水线阶段(service_status 的输入事实;reaper 的意外退出判定用)。
+    fn phase(&self) -> Phase {
         self.state.lock().map(|s| s.phase).unwrap_or(Phase::Error)
+    }
+
+    /// 服务运行状态:阶段 × 子进程存活两事实的组合判定(语义见 derive_status)。
+    /// boot_start 守卫 / 升级确认 / 升级卡恢复判断 / 手动检查 boot 就绪判定
+    /// 统一经此谓词。
+    pub(crate) fn service_status(&self) -> ServiceStatus {
+        derive_status(self.phase(), self.child_alive())
     }
 
     fn snapshot(&self) -> BootStateSnapshot {
@@ -470,6 +505,18 @@ impl DshManager {
         self.child.lock().ok().and_then(|mut g| g.take())
     }
 
+    /// dsh 子进程是否存活:句柄在且 try_wait 未退出。try_wait 出错(句柄异常/
+    /// 已被他处收割)按已退出处理(保守,允许重跑);锁不可用(中毒)按不存活。
+    fn child_alive(&self) -> bool {
+        let Ok(mut guard) = self.child.lock() else {
+            return false;
+        };
+        let Some(child) = guard.as_mut() else {
+            return false;
+        };
+        matches!(child.try_wait(), Ok(None))
+    }
+
     fn set_install_pid(&self, pid: u32) {
         if let Ok(mut g) = self.install_pid.lock() {
             *g = Some(pid);
@@ -484,6 +531,21 @@ impl DshManager {
 
     fn take_install_pid(&self) -> Option<u32> {
         self.install_pid.lock().ok().and_then(|mut g| g.take())
+    }
+}
+
+/// 安装过程观察者实现(npm::install_global 的 seam):pid 登记随退出收敛
+/// 按树杀;日志行入环形缓冲(boot 阶段落盘,见 push_log)。
+impl npm::InstallObserver for DshManager {
+    fn install_pid(&self, pid: Option<u32>) {
+        match pid {
+            Some(p) => self.set_install_pid(p),
+            None => self.clear_install_pid(),
+        }
+    }
+
+    fn install_log(&self, stream: &str, line: &str) {
+        self.push_log(stream, line.to_string());
     }
 }
 
@@ -566,18 +628,6 @@ fn kill_child_inner(manager: &DshManager) -> ConfirmResult {
 pub const KILL_CONFIRM_TIMEOUT_SECS: u64 = 3;
 const KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(KILL_CONFIRM_TIMEOUT_SECS);
 
-/// dsh 服务是否在运行(升级卡「稍后/返回」的恢复判断):句柄在且进程未退出。
-/// try_wait 出错(句柄异常/已被他处收割)按未运行处理。
-pub fn dsh_is_running(manager: &DshManager) -> bool {
-    let Ok(mut guard) = manager.child.lock() else {
-        return false;
-    };
-    let Some(child) = guard.as_mut() else {
-        return false;
-    };
-    matches!(child.try_wait(), Ok(None))
-}
-
 /// 当前 dsh 子进程的退出码。None = 仍在运行/句柄丢失。
 /// try_wait 出错(句柄异常/已被他处收割)按已退出处理:立即报「进程提前退出」进错误页,
 /// 不干等 180s 超时(半残安装 + 秒崩场景 5s 内到错误页)。
@@ -614,128 +664,11 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// 单次 npm 安装尝试的结果(ETARGET 回退的判定数据源,见 npm_install_global)。
-enum InstallAttemptFailure {
-    /// 进程非零退出:未分类,携带退出码与 stderr 尾部原文(供 ETARGET 判定与
-    /// install_failure_error 分类);安装失败保留旧版(npm 语义,#2 实测)
-    Exit {
-        exit_code: Option<i32>,
-        stderr_tail: Vec<String>,
-    },
-    /// 超时 / 句柄异常:已分类 DshError(非「缓存数据过旧」症状,不做重试)
-    Dsh(DshError),
-}
-
-/// 执行一次 npm install 尝试(boot 与升级链共用;ETARGET 回退编排在
-/// npm_install_global)。stdout/stderr 逐行转发为日志事件,stderr 尾部捕获
-/// 供失败分类;install_pid 登记:升级期间用户退出时随退出收敛一并杀。
-/// 命令构造 / 参数 / 错误分类 / 离线缓存判定的单一事实来源在 npm.rs
-/// (Windows 的 cmd.exe /c 包装亦在其中,npm_command)。带 NPM_INSTALL_TIMEOUT
-/// 超时;超时 / 句柄异常按进程树杀并报可读错误。
-fn npm_install_attempt(
-    manager: &DshManager,
-    cache_dir: Option<&Path>,
-    version_spec: &str,
-) -> Result<(), InstallAttemptFailure> {
-    if let Some(dir) = cache_dir {
-        log::info!("[dsh] 使用安装包内置离线缓存: {}", dir.display());
-    }
-    let args = npm::npm_install_args(cache_dir, version_spec);
-    let mut cmd = npm::npm_command();
-    cmd.args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| {
-        InstallAttemptFailure::Dsh(DshError::NpmSpawnFailed { detail: e.to_string() })
-    })?;
-    // 登记安装中进程,退出收敛时一并杀(quit_app/托盘退出)
-    manager.set_install_pid(child.id());
-
-    let stdout = child.stdout.take().expect("piped stdout");
-    let m = manager.clone();
-    let out_thread = thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            m.push_log("stdout", line);
-        }
-    });
-
-    let stderr = child.stderr.take().expect("piped stderr");
-    let m = manager.clone();
-    // stderr 尾部捕获:失败时拼进可读错误信息(EPERM 权限引导等),与日志流并行
-    let stderr_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let tail = stderr_tail.clone();
-    let err_thread = thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            m.push_log("stderr", line.clone());
-            let mut t = tail.lock().unwrap_or_else(|p| p.into_inner());
-            t.push(line);
-            while t.len() > 8 {
-                t.remove(0);
-            }
-        }
-    });
-
-    let result = wait_with_timeout(&mut child, npm::NPM_INSTALL_TIMEOUT);
-    manager.clear_install_pid();
-    match result {
-        Ok(out) => {
-            // 进程已退出 → 管道 EOF → 读线程自然结束,join 确保 stderr 尾部收全
-            let _ = out_thread.join();
-            let _ = err_thread.join();
-            let tail: Vec<String> = stderr_tail
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone();
-            if out.status.success() {
-                Ok(())
-            } else {
-                Err(InstallAttemptFailure::Exit {
-                    exit_code: out.status.code(),
-                    stderr_tail: tail,
-                })
-            }
-        }
-        Err(ChildWaitError::Timeout(_)) => {
-            // 杀进程后管道 EOF,join 防读线程泄漏
-            kill_and_reap(&mut child);
-            let _ = out_thread.join();
-            let _ = err_thread.join();
-            Err(InstallAttemptFailure::Dsh(DshError::InstallTimeout {
-                seconds: npm::NPM_INSTALL_TIMEOUT.as_secs(),
-            }))
-        }
-        Err(ChildWaitError::Io(e)) => {
-            // 句柄异常也按进程树杀并回收(与 Timeout 同语义):否则 npm 安装进程
-            // 成孤儿,且 install_pid 已清除、退出收敛也杀不到;管道 EOF 后 join 读线程
-            kill_and_reap(&mut child);
-            let _ = out_thread.join();
-            let _ = err_thread.join();
-            Err(InstallAttemptFailure::Dsh(DshError::NpmInstallIoFailed { detail: e }))
-        }
-    }
-}
-
-/// npm 全局安装 dsh(boot 传 "@latest" 跟随 latest;dsh 升级链传 "@<pin>" 精确版本,#3 §7),
-/// stdout/stderr 逐行转发为日志事件。install_pid 登记:升级期间用户退出时随退出收敛一并杀。
-/// 带 NPM_INSTALL_TIMEOUT 超时;超时 / 句柄异常按进程树杀并报可读错误。
-/// 安装包内置离线缓存存在时优先离线安装(命中秒级完成、缺失回退网络)。
-///
-/// ETARGET 根治(#41,M1 遗留):内置离线缓存是发版时点打包的,其 packument
-/// 可能早于升级目标版本(registry 直查刚确认过该版本存在),--prefer-offline
-/// 跳过新鲜度检查会让 npm 按旧 packument 误报「版本不存在」(ETARGET,假阴性)。
-/// 处置:带缓存安装失败且 stderr 判定为 ETARGET → 回退无缓存网络重试一次
-/// (registry 数据恒新鲜,命中真因——数据过旧——而非擦症状);其余失败直接
-/// 分类返回。boot 的 @latest 安装不需要比缓存更新的版本,不会命中 ETARGET,
-/// 此回退只会在升级链触发;回退后再次失败按常规错误呈现(不循环重试)。
-/// ETARGET 回退判定(纯函数,可测):带缓存 + stderr 报 ETARGET = 缓存
-/// packument 过旧的确定性症状(数据过旧是唯一成因),回退无缓存重试;
-/// 其余失败直接分类返回。
-fn should_retry_without_cache(used_cache: bool, stderr_tail: &[String]) -> bool {
-    used_cache && npm::stderr_has_etarget(stderr_tail)
-}
-
+/// npm 全局安装 dsh(boot 传 "@latest" 跟随 latest;dsh 升级链传 "@<pin>" 精确版本,#3 §7)。
+/// 安装流程本体(执行/超时/孤儿回收/ETARGET 回退/错误分类)在 npm::install_global
+/// (npm 域单一事实来源);本类型实现 npm::InstallObserver——pid 登记(升级期间
+/// 用户退出时随退出收敛一并杀)与日志行入环形缓冲。安装包内置离线缓存存在时
+/// 优先离线安装(命中秒级完成、缺失回退网络)。
 pub(crate) fn npm_install_global(manager: &DshManager, version_spec: &str) -> Result<(), DshError> {
     let cache_dir = manager
         .app
@@ -744,25 +677,7 @@ pub(crate) fn npm_install_global(manager: &DshManager, version_spec: &str) -> Re
         .ok()
         .as_deref()
         .and_then(npm::bundle_cache_dir);
-    let mut cache = cache_dir;
-    loop {
-        match npm_install_attempt(manager, cache.as_deref(), version_spec) {
-            Ok(()) => return Ok(()),
-            Err(InstallAttemptFailure::Dsh(e)) => return Err(e),
-            Err(InstallAttemptFailure::Exit { exit_code, stderr_tail }) => {
-                // 命中即回退无缓存(cache 置 None 后循环至多再走一轮:
-                // ETARGET 分支条件不再成立,不会无限重试)
-                if should_retry_without_cache(cache.is_some(), &stderr_tail) {
-                    log::warn!(
-                        "[dsh] npm 安装报 ETARGET(内置缓存 packument 早于目标版本),回退无缓存网络重试"
-                    );
-                    cache = None;
-                    continue;
-                }
-                return Err(npm::install_failure_error(exit_code, &stderr_tail));
-            }
-        }
-    }
+    npm::install_global(manager, cache_dir.as_deref(), version_spec)
 }
 
 /// 启动 `node <bin.js> web --port 0`,返回 stdout/stderr 合流后的行接收端
@@ -883,6 +798,118 @@ pub(crate) fn wait_ready(
     }
 }
 
+// ── 启动 dsh 服务的六步时序(单一事实来源)─────────────────────────
+
+/// 启动 dsh 服务并等待就绪(boot / 升级链 / 升级卡「稍后/返回」共用,时序单点持有):
+/// spawn → wait_ready(就绪信号 = stdout 打印 READY_PREFIX)→ 帧嵌入防御检查
+/// (ADR 0001 核心假设)→ record_dsh_url(URL 单一事实来源,推给壳页)→ 交 reaper
+/// (持续排空输出流,防 64KB 管道阻塞挂死)。任一步失败:按进程树 kill 清理后返回
+/// 错误,不残留半启动进程。
+/// `suppress_exit_report`:升级链传 true——成功后清除 UPGRADE_ACTIVE 抑制标志
+/// (旧 dsh 的 reaper 判定点早已过,清除安全;#3 §2);boot / 恢复服务传 false。
+/// 返回已就绪端口(调用方仅用于日志/呈现)。
+pub(crate) fn start_service(
+    manager: &DshManager,
+    bin: &Path,
+    suppress_exit_report: bool,
+) -> Result<u16, DshError> {
+    let rx = spawn_dsh(manager, bin)?;
+    let (port, rx) = match wait_ready(manager, rx) {
+        Ok(p) => p,
+        Err(e) => {
+            kill_child(manager);
+            return Err(e);
+        }
+    };
+    let url = dsh_url_for_port(port);
+    // 就绪确认的一环:帧嵌入回归检查(命中 XFO / frame-ancestors = iframe 架构
+    // 无法呈现该版本,按启动失败处理,错误指引回退预案,见 DshError::FrameBlocked)
+    if let Err(e) = tauri::async_runtime::block_on(check_frame_blocking(&url)) {
+        kill_child(manager);
+        return Err(e);
+    }
+    manager.record_dsh_url(url.clone());
+    spawn_reaper(manager.clone(), rx);
+    if suppress_exit_report {
+        set_upgrade_active(false);
+    }
+    log::info!("[dsh] start_service: 就绪,推 URL 给壳页 → {url}");
+    Ok(port)
+}
+
+/// CSP 头是否含 frame-ancestors 指令(纯函数,可测)。
+/// 按指令解析(分号分段,取每段首 token 与指令名比对,大小写不敏感)——
+/// 不按子串匹配,避免 nonce/值里恰好出现同名串的误报。
+fn csp_blocks_framing(csp_value: &str) -> bool {
+    csp_value.split(';').any(|directive| {
+        let mut parts = directive.split_whitespace();
+        parts
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("frame-ancestors"))
+    })
+}
+
+/// 判定响应头是否禁止跨源 iframe 嵌入(纯函数,可测)。命中返回头原文
+/// (供错误展示,前端模板插值);未命中返回 None。
+///
+/// 判据(壳页是本地 origin、dsh 是 127.0.0.1 动态端口,必然跨源):
+/// - 任意 X-Frame-Options 头即禁止——DENY 自不必说,SAMEORIGIN 对跨源
+///   同样拦截(HeaderMap 取值大小写不敏感);
+/// - CSP 含 frame-ancestors 指令即禁止——dsh 服务无从枚举壳页 origin,
+///   出现即几乎必然不含壳页、必拦。
+fn frame_blocking_header(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    if let Some(xfo) = headers.get(reqwest::header::X_FRAME_OPTIONS) {
+        let value = String::from_utf8_lossy(xfo.as_bytes()).to_string();
+        return Some(format!("X-Frame-Options: {value}"));
+    }
+    for csp in headers.get_all(reqwest::header::CONTENT_SECURITY_POLICY) {
+        let value = String::from_utf8_lossy(csp.as_bytes());
+        if csp_blocks_framing(&value) {
+            return Some(format!("Content-Security-Policy: {value}"));
+        }
+    }
+    None
+}
+
+/// 对运行中的 dsh 服务做帧嵌入回归检查(GET 根路径,读响应头)。
+/// 命中 XFO / frame-ancestors → Err(FrameBlocked,start_service 按启动失败处理,
+/// 前端按 errors.UpgradeFrameBlocked 翻译并指引回退预案)。
+/// 请求失败/超时/客户端构造失败 → 记日志放行:探测不确定不等于「被禁止」,
+/// 不为不确定的探测拦掉启动(防御检查是找「已确认的上游耦合」,不是网络
+/// 可用性检查;wait_ready 已确认服务在监听)。
+async fn check_frame_blocking(url: &str) -> Result<(), DshError> {
+    ensure_tls_provider(); // 与 fetch_latest_version 同款:本地请求也经 rustls 客户端
+    let client = reqwest::Client::builder()
+        .timeout(FRAME_CHECK_TIMEOUT)
+        .build()
+        .ok();
+    let Some(client) = client else {
+        return Ok(());
+    };
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("[dsh] 帧嵌入回归检查:请求失败(按未命中放行) {url}: {e}");
+            return Ok(());
+        }
+    };
+    if let Some(header) = frame_blocking_header(resp.headers()) {
+        log::error!("[dsh] 帧嵌入回归检查:命中 {header} → 启动失败");
+        return Err(DshError::FrameBlocked { header });
+    }
+    log::info!("[dsh] 帧嵌入回归检查通过(无 XFO / frame-ancestors) {url}");
+    Ok(())
+}
+
+/// rustls ring provider(与 updater 插件同款):插件在其自身路径懒安装,
+/// 本模块与 upgrade.rs(registry 直查)的请求可能在它之前发生(启动并发),
+/// 显式安装保证确定性(幂等)。
+pub(crate) fn ensure_tls_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
 // ── boot 流水线(运行在工作线程上)─────────────────────────────────
 
 fn boot_pipeline(manager: &DshManager) {
@@ -931,39 +958,19 @@ fn boot_pipeline(manager: &DshManager) {
         }
     };
 
-    // 3. 启动 dsh web
+    // 3. 启动 dsh web 并等待就绪:六步时序(spawn → wait_ready → 帧嵌入检查
+    //    → record_dsh_url → 交 reaper)由 start_service 单点持有,此处只收结果。
+    //    就绪后壳页 set iframe.src(前端 boot 浮层的退出过渡动画由 URL 到达
+    //    触发,useBootExit,fallback 兜底,动画不阻塞呈现)。
     log::info!("[dsh] boot: starting dsh web…");
     manager.set_phase(Phase::Starting, None);
-    let rx = match spawn_dsh(manager, &bin) {
-        Ok(rx) => rx,
-        Err(e) => {
-            manager.set_error(e);
-            return;
+    match start_service(manager, &bin, false) {
+        Ok(port) => {
+            log::info!("[dsh] boot: ready on port {port}");
+            manager.set_phase(Phase::Ready, None);
         }
-    };
-
-    // 4. 等待就绪信号
-    let (port, rx) = match wait_ready(manager, rx) {
-        Ok(p) => p,
-        Err(e) => {
-            kill_child(manager);
-            manager.set_error(e);
-            return;
-        }
-    };
-    log::info!("[dsh] boot: ready on port {port}");
-
-    // 5. 就绪:记录 dsh URL 并推给壳页(单一事实来源 record_dsh_url,
-    //    ADR 0001)——壳页 set iframe.src,dsh 在 iframe 内呈现。前端 boot
-    //    浮层的退出过渡动画由 URL 到达触发(useBootExit,fallback 兜底,
-    //    动画不阻塞呈现),无需任何导航信号。
-    manager.set_phase(Phase::Ready, None);
-    let url = dsh_url_for_port(port);
-    manager.record_dsh_url(url.clone());
-    log::info!("[dsh] boot: ready, 推 URL 给壳页 → {url}");
-
-    // 6. reaper 线程:持续排空输出流(防 64KB 管道阻塞挂死),进程退出后收割
-    spawn_reaper(manager.clone(), rx);
+        Err(e) => manager.set_error(e),
+    }
 }
 
 /// 收割线程:排空 channel 直到读线程结束(进程退出或被杀),再 wait 回收。
@@ -1022,14 +1029,17 @@ pub async fn boot(state: tauri::State<'_, DshManager>) -> Result<BootStateSnapsh
 /// 退出覆盖层的 [重试] 重跑 boot,#40)时才生效,其余阶段 no-op。
 /// BOOTING 标志防并发双流水线(StrictMode 双 invoke + setup 主动启动)。
 pub fn boot_start(manager: &DshManager) {
-    let phase = manager.phase();
-    // Ready 的常规语义是「dsh 在跑」:正常态下 boot 命令 no-op,防误触重启;
-    // 意外退出后 reaper 已收割子进程(句柄为空),Ready + 无进程 = 需要重跑
-    let can_boot = matches!(phase, Phase::Idle | Phase::Error)
-        || (phase == Phase::Ready && !dsh_is_running(manager));
+    // 可重跑判定(service_status 的第一个消费者):Idle 首启 / Error 重试 /
+    // DeadAfterCrash(就绪后意外退出,reaper 已收割)才生效,其余 no-op——
+    // Running 的正常态下 boot 命令 no-op,防误触重启
+    let can_boot = matches!(
+        manager.service_status(),
+        ServiceStatus::NotReady | ServiceStatus::Error | ServiceStatus::DeadAfterCrash
+    );
     if !can_boot {
         return;
     }
+    let phase = manager.phase();
     if BOOTING.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -1054,15 +1064,21 @@ pub fn boot_start(manager: &DshManager) {
     });
 }
 
+/// 程序化退出(所有退出路径统一收敛,调用方只需持有 app):置 QUITTING 标志
+/// 放行 CloseRequested(不再弹关闭询问)→ 杀 dsh 子进程(幂等)→ exit(0)。
+/// 装配细节不外泄;退出收敛的最终防线仍是 lib.rs 的 ExitRequested 兜底再杀一次。
+pub(crate) fn shutdown_and_exit(app: &AppHandle) {
+    set_quitting();
+    if let Some(m) = app.try_state::<DshManager>() {
+        kill_child(m.inner());
+    }
+    app.exit(0);
+}
+
 /// 退出应用:杀子进程 + exit(0)。程序化退出先置 QUITTING 标志放行 CloseRequested。
 #[tauri::command]
-pub async fn quit_app(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DshManager>,
-) -> Result<(), String> {
-    set_quitting();
-    kill_child(state.inner());
-    app.exit(0);
+pub async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    shutdown_and_exit(&app);
     Ok(())
 }
 
@@ -1071,6 +1087,57 @@ pub async fn quit_app(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derive_status_maps_phase_times_alive_exhaustively() {
+        // service_status 的组合语义穷举(谓词是五处调用点的唯一判定来源):
+        // - 只有 Ready 关注子进程死活:「Ready + 句柄空 = 意外退出待重跑」
+        //   (reaper 已收割,DeadAfterCrash 让 boot_start 放行重跑)
+        // - 流水线在途一律 Booting,与子进程是否已 spawn 无关
+        // - Idle/Error 与子进程事实无关(错误态不可能有存活进程)
+        for alive in [false, true] {
+            assert_eq!(derive_status(Phase::Idle, alive), ServiceStatus::NotReady);
+            assert_eq!(derive_status(Phase::Error, alive), ServiceStatus::Error);
+            for phase in [Phase::Checking, Phase::Installing, Phase::Starting] {
+                assert_eq!(derive_status(phase, alive), ServiceStatus::Booting);
+            }
+            assert_eq!(
+                derive_status(Phase::Ready, alive),
+                if alive {
+                    ServiceStatus::Running
+                } else {
+                    ServiceStatus::DeadAfterCrash
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn boot_ready_semantics_match_phase_ready() {
+        // 不变量:升级确认守卫与手动检查 boot 就绪判定用的「Ready 生死两态」,
+        // 与旧 phase()==Ready 的判定等价(Ready 的两种 ServiceStatus 恰是
+        // 它按子进程死活二分的结果)
+        let ready_like = [ServiceStatus::Running, ServiceStatus::DeadAfterCrash];
+        let not_ready_like = [
+            ServiceStatus::NotReady,
+            ServiceStatus::Booting,
+            ServiceStatus::Error,
+        ];
+        for s in ready_like {
+            assert!(matches!(s, ServiceStatus::Running | ServiceStatus::DeadAfterCrash));
+        }
+        for s in not_ready_like {
+            assert!(!matches!(s, ServiceStatus::Running | ServiceStatus::DeadAfterCrash));
+        }
+        // can_boot 的补集:NotReady/Error/DeadAfterCrash 三态可重跑,
+        // Running/Booting 一律 no-op
+        for s in [ServiceStatus::NotReady, ServiceStatus::Error, ServiceStatus::DeadAfterCrash] {
+            assert!(matches!(s, ServiceStatus::NotReady | ServiceStatus::Error | ServiceStatus::DeadAfterCrash));
+        }
+        for s in [ServiceStatus::Running, ServiceStatus::Booting] {
+            assert!(!matches!(s, ServiceStatus::NotReady | ServiceStatus::Error | ServiceStatus::DeadAfterCrash));
+        }
+    }
 
     #[test]
     fn parse_ready_line_extracts_port() {
@@ -1119,18 +1186,6 @@ mod tests {
     }
 
     #[test]
-    fn should_retry_without_cache_requires_cache_and_etarget() {
-        // ETARGET 回退判定(生产路径见 npm_install_global):
-        // 带缓存 + ETARGET → 回退;缺任一条件 → 直接分类返回
-        let etarget = vec!["npm error code ETARGET".to_string()];
-        let network = vec!["npm error code ENOTFOUND".to_string()];
-        assert!(should_retry_without_cache(true, &etarget));
-        assert!(!should_retry_without_cache(false, &etarget)); // 没带缓存,无从回退
-        assert!(!should_retry_without_cache(true, &network)); // 非 ETARGET 不回退
-        assert!(!should_retry_without_cache(true, &[]));
-    }
-
-    #[test]
     fn tcp_wait_detects_open_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1151,6 +1206,127 @@ mod tests {
         // 单一事实来源:boot / 升级链 / 返回 dsh 的导航目标共用同一拼接
         assert_eq!(dsh_url_for_port(3080), "http://127.0.0.1:3080");
         assert_eq!(dsh_url_for_port(0), "http://127.0.0.1:0");
+    }
+
+    // ── 帧嵌入回归检查(上游耦合防线,ADR 0001 / #41,start_service 就绪确认)──
+
+    fn headers(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {
+        let mut m = reqwest::header::HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn frame_blocking_header_detects_xfo() {
+        // X-Frame-Options 任一取值都拦(SAMEORIGIN 对跨源同样拦截)
+        for v in ["DENY", "SAMEORIGIN"] {
+            let h = headers(&[("x-frame-options", v)]); // 头名大小写不敏感
+            assert_eq!(
+                frame_blocking_header(&h),
+                Some(format!("X-Frame-Options: {v}")),
+                "XFO={v} 必须命中"
+            );
+        }
+        // 无帧头 → None
+        assert_eq!(frame_blocking_header(&headers(&[])), None);
+        assert_eq!(
+            frame_blocking_header(&headers(&[("content-type", "text/html")])),
+            None
+        );
+    }
+
+    #[test]
+    fn frame_blocking_header_detects_csp_frame_ancestors() {
+        // frame-ancestors 指令(大小写不敏感)命中
+        let h = headers(&[("content-security-policy", "default-src 'self'; frame-ancestors 'none'")]);
+        assert_eq!(
+            frame_blocking_header(&h),
+            Some("Content-Security-Policy: default-src 'self'; frame-ancestors 'none'".to_string())
+        );
+        // 指令名大小写变体
+        assert!(csp_blocks_framing("default-src 'self'; Frame-Ancestors https://x.com"));
+        // 无 frame-ancestors 的 CSP 不命中(含其它安全指令)
+        let h = headers(&[(
+            "content-security-policy",
+            "default-src 'self'; script-src 'nonce-frame-ancestors-x'",
+        )]);
+        assert_eq!(frame_blocking_header(&h), None);
+        // 值里恰好出现同名串不误报(按指令解析,不按子串)
+        assert!(!csp_blocks_framing("script-src 'nonce-frame-ancestors'"));
+        // 多 CSP 头:任一命中即命中
+        let h = headers(&[
+            ("content-security-policy", "default-src 'self'"),
+            ("content-security-policy", "frame-ancestors 'none'"),
+        ]);
+        assert_eq!(frame_blocking_header(&h).unwrap(), "Content-Security-Policy: frame-ancestors 'none'");
+        // 空值/畸形值不 panic 不命中
+        assert!(!csp_blocks_framing(""));
+        assert!(!csp_blocks_framing(";;;"));
+    }
+
+    #[test]
+    fn frame_blocking_header_prefers_xfo() {
+        // 两者都命中时报告 XFO(先到先报告,判据一致性)
+        let h = headers(&[
+            ("x-frame-options", "DENY"),
+            ("content-security-policy", "frame-ancestors 'none'"),
+        ]);
+        assert_eq!(frame_blocking_header(&h).unwrap(), "X-Frame-Options: DENY");
+    }
+
+    #[test]
+    fn check_frame_blocking_roundtrip_with_local_server() {
+        // 验收(issue #41):本地起一个带 XFO 头的假 dsh 服务,检查能报错。
+        // 用 std TcpListener 起一次性 HTTP 响应(无外部依赖,单测内闭环)。
+        fn serve_once(resp: String) -> (String, std::thread::JoinHandle<()>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut s, _)) = listener.accept() {
+                    // 标准 HTTP 顺序:先读请求再回响应;响应发完保持连接片刻,
+                    // 让客户端完整读完(读请求后立即回包 + 马上关会有 RST 竞态)
+                    let mut buf = [0u8; 1024];
+                    let _ = std::io::Read::read(&mut s, &mut buf);
+                    let _ = std::io::Write::write_all(&mut s, resp.as_bytes());
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+            (format!("http://{addr}"), handle)
+        }
+
+        // 带 X-Frame-Options: DENY 的假服务 → 检查报 FrameBlocked
+        let (url, h) = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Frame-Options: DENY\r\nContent-Length: 4\r\n\r\n<h1>x</h1>"
+                .to_string(),
+        );
+        let err = tauri::async_runtime::block_on(check_frame_blocking(&url)).unwrap_err();
+        assert_eq!(
+            err,
+            DshError::FrameBlocked {
+                header: "X-Frame-Options: DENY".into()
+            }
+        );
+        h.join().unwrap();
+
+        // 无帧头的假服务 → 放行
+        let (url, h) = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 4\r\n\r\n<h1>x</h1>"
+                .to_string(),
+        );
+        tauri::async_runtime::block_on(check_frame_blocking(&url)).unwrap();
+        h.join().unwrap();
+
+        // 服务不存在(连接拒绝)→ 探测不确定,放行
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        tauri::async_runtime::block_on(check_frame_blocking(&format!("http://127.0.0.1:{port}")))
+            .unwrap();
     }
 
     #[test]

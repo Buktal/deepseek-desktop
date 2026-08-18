@@ -22,8 +22,10 @@
 //!            npm_install_global 与 install_pid 治理;进度模拟复用
 //!            install_progress_at / ProgressTicker,锚点 = 进程退出 + 校准 100%)
 //!          → verify(读全局 package.json version == pin 且 bin.js 完整)
-//!          → starting(spawn_dsh + wait_ready,新版 bin 路径不变)
-//!          → ready(record_dsh_url 推新端口 URL 给壳页,iframe 自动切换,#36)
+//!          → starting(dsh::start_service:spawn + wait_ready + 帧嵌入检查
+//!            + record_dsh_url + 交 reaper,六步时序单点持有;成功后方法内
+//!            清 UPGRADE_ACTIVE,新版 bin 路径不变,#2 调研)
+//!          → ready(新端口 URL 已推给壳页,iframe 自动切换,#36)
 //!
 //! 失败处理(#3 §3):失败保留旧版(npm 语义,#2 实测)+ 恢复服务——
 //! [返回 dsh] 经 upgrade_dismiss:Rust 侧检查 dsh 是否在运行,未运行则起当前
@@ -54,8 +56,6 @@ use crate::{dsh, npm, tray, update};
 const REGISTRY_URL: &str = "https://registry.npmjs.org/@deepseek-ai/dsh";
 /// 直查超时(#2 定稿 3-5s):超时/任何异常静默按无新版,不影响启动。
 const CHECK_TIMEOUT: Duration = Duration::from_secs(4);
-/// 帧嵌入回归检查超时(本地 127.0.0.1 服务,3s 足够)。
-const FRAME_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ── 全局守卫(跨线程)────────────────────────────────────────────────
 
@@ -347,6 +347,7 @@ impl UpgradeManager {
     /// 状态归约 + 下发(生产路径唯一入口,测试的 apply_event 即此处的归约)。
     fn reduce(&self, event: UpgradeEvent) {
         let was_running = self.is_pipeline_running();
+        let was_available = self.has_available_version();
         let next = {
             let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
             let next = apply_event(&s, event);
@@ -355,12 +356,26 @@ impl UpgradeManager {
         };
         log::info!("[upgrade] state → {next:?}");
         let _ = self.app.emit_to("main", "upgrade-state", next);
-        // 流水线启停跨界时刷新菜单:「检查更新」disabled 随快照同步
-        // (Started 进入 Active 置灰,成功/失败离开 Active 恢复;#38;
-        // 成功路径的 set_dsh_update(None) 也会刷新一次,幂等无害)
-        if was_running != self.is_pipeline_running() {
+        // 菜单刷新时机(状态迁移 → 刷菜单,副作用显式化;取代旧 set_dsh_update
+        // 的间接触发):
+        // - 流水线启停跨界:「检查更新」disabled 随快照同步
+        //   (Started 进入 Active 置灰,成功/失败离开 Active 恢复;#38)
+        // - 可用版本有无跨界:徽标/动态「升级 dsh 到 vX」项随状态机落定
+        //   (Found/NoneFound/Dismissed/Succeeded 的 Available↔非 Available 翻转)
+        if was_running != self.is_pipeline_running()
+            || was_available != self.has_available_version()
+        {
             tray::refresh_menu(&self.app);
         }
+    }
+
+    /// 是否有可升级版本(菜单徽标/动态项的呈现依据):
+    /// Available / Failed 都算——失败保留托盘重试入口(重试仍从同一 pin 继续)。
+    fn has_available_version(&self) -> bool {
+        matches!(
+            self.snapshot(),
+            UpgradeStateView::Available { .. } | UpgradeStateView::Failed { .. }
+        )
     }
 
     /// 流水线在途(检查与手动入口的 no-op 守卫,#3 边界)。
@@ -395,7 +410,12 @@ impl UpgradeManager {
     /// 守卫(#3 §2):boot 未就绪(phase 非 Ready)拒绝;状态非 Available/Failed
     /// 拒绝;流水线在途拒绝。启动成功后同步归约 Started(前端立即看到 Active)。
     pub(crate) fn confirm_start(&self, dsh: &dsh::DshManager) -> bool {
-        if dsh.phase() != dsh::Phase::Ready {
+        // boot 未就绪(流水线在途)拒绝;Ready 的生死两态都放行——升级本就会
+        // 重启服务,意外退出后升级同样能恢复
+        if !matches!(
+            dsh.service_status(),
+            dsh::ServiceStatus::Running | dsh::ServiceStatus::DeadAfterCrash
+        ) {
             log::warn!("[upgrade] 确认升级被拒:boot 未就绪(启动未完成不升级)");
             return false;
         }
@@ -446,7 +466,13 @@ impl UpgradeManager {
     /// 壳页常驻(ADR 0001 / #36):dsh 在跑时 iframe 仍指向它,无需任何动作,
     /// 只关卡片。
     pub fn dismiss(&self, dsh: &dsh::DshManager) {
-        if dsh::dsh_is_running(dsh) {
+        // 恢复判断:进程存活或流水线在途时再起一个会双写 child 句柄、竞争破坏
+        // 在途流水线——Running/Booting 都按「dsh 在跑」只关卡片;其余状态
+        // 起当前全局安装恢复服务
+        if matches!(
+            dsh.service_status(),
+            dsh::ServiceStatus::Running | dsh::ServiceStatus::Booting
+        ) {
             log::info!("[upgrade] 返回 dsh(dsh 仍在运行),关闭升级卡片");
             self.reduce(UpgradeEvent::Dismissed);
             return;
@@ -458,26 +484,17 @@ impl UpgradeManager {
                 log::error!("[upgrade] 返回 dsh:全局 dsh 不可用(可先重试升级),留在升级卡片");
                 return;
             };
-            let rx = match dsh::spawn_dsh(&dsh, &bin) {
-                Ok(rx) => rx,
-                Err(e) => {
-                    log::error!("[upgrade] 返回 dsh:启动失败 {e:?},留在升级卡片");
-                    return;
+            // 六步时序由 dsh::start_service 单点持有(失败已内部清理,不残留半启动进程)
+            match dsh::start_service(&dsh, &bin, false) {
+                Ok(port) => {
+                    log::info!(
+                        "[upgrade] 返回 dsh:服务已恢复 → {}",
+                        dsh::dsh_url_for_port(port)
+                    );
+                    up.reduce(UpgradeEvent::Dismissed);
                 }
-            };
-            let (port, rx) = match dsh::wait_ready(&dsh, rx) {
-                Ok(p) => p,
-                Err(e) => {
-                    dsh::kill_child(&dsh);
-                    log::error!("[upgrade] 返回 dsh:服务未就绪 {e:?},留在升级卡片");
-                    return;
-                }
-            };
-            let url = dsh::dsh_url_for_port(port);
-            dsh.record_dsh_url(url.clone());
-            dsh::spawn_reaper(dsh.clone(), rx);
-            log::info!("[upgrade] 返回 dsh:服务已恢复 → {url}");
-            up.reduce(UpgradeEvent::Dismissed);
+                Err(e) => log::error!("[upgrade] 返回 dsh:启动失败 {e:?},留在升级卡片"),
+            }
         });
     }
 }
@@ -500,7 +517,7 @@ async fn run_check(app: &AppHandle) -> CheckResult {
     match installed.as_deref() {
         Some(cur) if latest_is_newer(&latest, cur) => {
             log::info!("[upgrade] 发现 dsh 新版本 {latest}(当前 {cur})");
-            tray::set_dsh_update(app, Some(&latest));
+            // 徽标/菜单项由 reduce 的可用版本跨界刷新(单一事实来源 = 状态机)
             up.reduce(UpgradeEvent::Found {
                 version: latest.clone(),
                 current_version: cur.to_string(),
@@ -512,7 +529,6 @@ async fn run_check(app: &AppHandle) -> CheckResult {
         }
         _ => {
             log::info!("[upgrade] dsh 无新版本(当前 {installed:?})");
-            tray::set_dsh_update(app, None);
             up.reduce(UpgradeEvent::NoneFound);
             CheckResult::None {
                 current_version: installed,
@@ -535,7 +551,7 @@ pub(crate) enum CheckResult {
 /// registry 直查 latest(abbreviated packument,install-v1)。
 /// 3-5s 短超时;超时/非 2xx/解析失败一律 None(静默按无新版)。
 async fn fetch_latest_version() -> Option<String> {
-    ensure_tls_provider();
+    dsh::ensure_tls_provider(); // 单一实现:dsh.rs(帧嵌入检查共用)
     let client = reqwest::Client::builder()
         .timeout(CHECK_TIMEOUT)
         .build()
@@ -553,82 +569,6 @@ async fn fetch_latest_version() -> Option<String> {
     parse_dist_latest(&body)
 }
 
-/// rustls ring provider(与 updater 插件同款):插件在其自身路径懒安装,
-/// 本模块的请求可能在它之前发生(启动并发),显式安装保证确定性(幂等)。
-fn ensure_tls_provider() {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
-}
-
-// ── 上游耦合防线:帧嵌入回归检查(ADR 0001 / #29,#41)────────────────
-
-/// CSP 头是否含 frame-ancestors 指令(纯函数,可测)。
-/// 按指令解析(分号分段,取每段首 token 与指令名比对,大小写不敏感)——
-/// 不按子串匹配,避免 nonce/值里恰好出现同名串的误报。
-fn csp_blocks_framing(csp_value: &str) -> bool {
-    csp_value.split(';').any(|directive| {
-        let mut parts = directive.split_whitespace();
-        parts
-            .next()
-            .is_some_and(|name| name.eq_ignore_ascii_case("frame-ancestors"))
-    })
-}
-
-/// 判定响应头是否禁止跨源 iframe 嵌入(纯函数,可测)。命中返回头原文
-/// (供错误展示,前端模板插值);未命中返回 None。
-///
-/// 判据(壳页是本地 origin、dsh 是 127.0.0.1 动态端口,必然跨源):
-/// - 任意 X-Frame-Options 头即禁止——DENY 自不必说,SAMEORIGIN 对跨源
-///   同样拦截(HeaderMap 取值大小写不敏感);
-/// - CSP 含 frame-ancestors 指令即禁止——dsh 服务无从枚举壳页 origin,
-///   出现即几乎必然不含壳页、必拦。
-fn frame_blocking_header(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    if let Some(xfo) = headers.get(reqwest::header::X_FRAME_OPTIONS) {
-        let value = String::from_utf8_lossy(xfo.as_bytes()).to_string();
-        return Some(format!("X-Frame-Options: {value}"));
-    }
-    for csp in headers.get_all(reqwest::header::CONTENT_SECURITY_POLICY) {
-        let value = String::from_utf8_lossy(csp.as_bytes());
-        if csp_blocks_framing(&value) {
-            return Some(format!("Content-Security-Policy: {value}"));
-        }
-    }
-    None
-}
-
-/// 对运行中的 dsh 服务做帧嵌入回归检查(GET 根路径,读响应头)。
-/// 命中 XFO / frame-ancestors → Err(UpgradeFrameBlocked,升级流水线失败,
-/// 前端按 errors.UpgradeFrameBlocked 翻译并指引回退预案)。
-/// 请求失败/超时/客户端构造失败 → 记日志放行:探测不确定不等于「被禁止」,
-/// 不为不确定的探测拦掉升级(防御检查是找「已确认的上游耦合」,不是网络
-/// 可用性检查;wait_ready 已确认服务在监听)。
-async fn check_frame_blocking(url: &str) -> Result<(), UpgradeError> {
-    ensure_tls_provider(); // 与 fetch_latest_version 同款:本地请求也经 rustls 客户端
-    let client = reqwest::Client::builder()
-        .timeout(FRAME_CHECK_TIMEOUT)
-        .build()
-        .ok();
-    let Some(client) = client else {
-        return Ok(());
-    };
-    let resp = match client.get(url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            log::warn!("[upgrade] 帧嵌入回归检查:请求失败(按未命中放行) {url}: {e}");
-            return Ok(());
-        }
-    };
-    if let Some(header) = frame_blocking_header(resp.headers()) {
-        log::error!("[upgrade] 帧嵌入回归检查:命中 {header} → 升级失败");
-        return Err(UpgradeError::Kind(UpgradeErrorKind::UpgradeFrameBlocked {
-            header,
-        }));
-    }
-    log::info!("[upgrade] 帧嵌入回归检查通过(无 XFO / frame-ancestors) {url}");
-    Ok(())
-}
-
 /// 托盘「检查更新」手动入口的 dsh 层(组合编排与弹窗/toast 呈现全在
 /// tray::on_check_update,#39):检查 → 结果。boot 未就绪的判定由编排方做
 /// (tray 读 DshManager phase)——本模块只负责「检查」职责,UI 决策不内嵌。
@@ -642,7 +582,7 @@ pub(crate) fn manual_check(app: &AppHandle) -> CheckResult {
 /// 复用、状态机各自独立(#3 §2:语义/失败语义/阶段都不相同,禁止合并状态机)。
 fn upgrade_pipeline(up: &UpgradeManager, dsh: &dsh::DshManager, pin: &str) {
     // 1. killing:杀当前 dsh(UPGRADE_ACTIVE 抑制 reaper 误报,独立于
-    //    set_quitting——升级不退出应用,关闭三选对话框保持有效,#3 §2)
+    //    set_quitting——升级不退出应用,关闭弹窗保持有效,#3 §2)
     dsh::set_upgrade_active(true);
     up.reduce(UpgradeEvent::PhaseChanged {
         phase: UpgradePhase::Killing,
@@ -710,7 +650,12 @@ fn upgrade_pipeline(up: &UpgradeManager, dsh: &dsh::DshManager, pin: &str) {
         return;
     }
 
-    // 4. starting:spawn + wait_ready(新版 bin 路径不变,#2 调研)
+    // 4. starting:spawn + wait_ready + 帧嵌入检查 + record_dsh_url + 交 reaper
+    //    ——六步时序由 dsh::start_service 单点持有(新版 bin 路径不变,#2 调研)。
+    //    失败路径(含帧嵌入检查命中)已在方法内 kill 清理;成功路径由方法清
+    //    UPGRADE_ACTIVE 抑制标志(旧 dsh 的 reaper 在杀后早已过判定点,清除安全,
+    //    #3 §2)。帧嵌入失败注意:该失败模式下 npm install 已成功、旧版已被替换
+    //    (与「保留旧版」的安装失败语义不同),错误文案由前端按 kind 翻译。
     up.reduce(UpgradeEvent::PhaseChanged {
         phase: UpgradePhase::Starting,
         progress: None,
@@ -728,60 +673,27 @@ fn upgrade_pipeline(up: &UpgradeManager, dsh: &dsh::DshManager, pin: &str) {
             return;
         }
     };
-    let rx = match dsh::spawn_dsh(dsh, &bin) {
-        Ok(rx) => rx,
+    let result = dsh::start_service(dsh, &bin, true);
+    match result {
+        Ok(port) => {
+            log::info!(
+                "[upgrade] 升级完成,已推 URL 给壳页 → {}",
+                dsh::dsh_url_for_port(port)
+            );
+            // Ready 瞬态立即消费(壳页常驻后无窗口导航,卡片随 Idle 关闭);
+            // 徽标/菜单项由 reduce 的可用版本跨界刷新(Succeeded 离开 Available/
+            // Failed 即清,不等 6h——用户此刻看到的「升级 dsh 到 vX」必须是新状态)
+            up.reduce(UpgradeEvent::Succeeded);
+            up.reduce(UpgradeEvent::Reset);
+        }
         Err(e) => {
             dsh::set_upgrade_active(false);
             up.reduce(UpgradeEvent::Failed {
                 version: pin.to_string(),
                 error: UpgradeError::Dsh(e),
             });
-            return;
         }
-    };
-    let (port, rx) = match dsh::wait_ready(dsh, rx) {
-        Ok(p) => p,
-        Err(e) => {
-            dsh::kill_child(dsh);
-            dsh::set_upgrade_active(false);
-            up.reduce(UpgradeEvent::Failed {
-                version: pin.to_string(),
-                error: UpgradeError::Dsh(e),
-            });
-            return;
-        }
-    };
-
-    // 4.5 上游耦合防线(ADR 0001 / #29,#41):回归检查新版 dsh 的响应头——
-    // XFO / CSP frame-ancestors 命中 = iframe 架构无法呈现它,升级报明确错误
-    // (指引回退预案 = 恢复整窗互斥导航,git 历史可回)。注意此失败模式
-    // npm install 已成功、旧版已被替换(与「保留旧版」的安装失败语义不同),
-    // 错误文案由前端按 kind 翻译,不在此拼装。
-    if let Err(e) = tauri::async_runtime::block_on(check_frame_blocking(
-        &dsh::dsh_url_for_port(port),
-    )) {
-        dsh::kill_child(dsh);
-        dsh::set_upgrade_active(false);
-        up.reduce(UpgradeEvent::Failed {
-            version: pin.to_string(),
-            error: e,
-        });
-        return;
     }
-
-    // 5. ready:record_dsh_url 推新端口 URL 给壳页(iframe 自动切换,ADR 0001)
-    //    → 清升级抑制标志(旧 dsh 的 reaper 在杀后早已过判定点,此时清除安全,
-    //    #3 §2)→ Ready 瞬态立即消费(壳页常驻后无窗口导航,卡片随 Idle 关闭)
-    let url = dsh::dsh_url_for_port(port);
-    dsh.record_dsh_url(url.clone());
-    dsh::spawn_reaper(dsh.clone(), rx);
-    dsh::set_upgrade_active(false);
-    up.reduce(UpgradeEvent::Succeeded);
-    // 升级成功:清托盘徽标/菜单项(已是最新;下一次检查也会确认并清除,但
-    // 不等 6h——用户此刻看到的「升级 dsh 到 vX」必须是新状态)
-    tray::set_dsh_update(&up.app, None);
-    up.reduce(UpgradeEvent::Reset);
-    log::info!("[upgrade] 升级完成,已推 URL 给壳页 → {url}");
 }
 
 // ── Tauri commands(#3 §5:命令面 +3)────────────────────────────────
@@ -897,127 +809,6 @@ mod tests {
         assert!(version_eq(" 0.1.0-rc.6 ", "0.1.0-rc.6"));
         assert!(!version_eq("0.1.0-rc.6", "0.1.0-rc.5"));
         assert!(!version_eq("0.1.0-rc.6", "0.1.0"));
-    }
-
-    // ── 帧嵌入回归检查(上游耦合防线,ADR 0001 / #41)──────────────
-
-    fn headers(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {
-        let mut m = reqwest::header::HeaderMap::new();
-        for (k, v) in pairs {
-            m.insert(
-                reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                v.parse().unwrap(),
-            );
-        }
-        m
-    }
-
-    #[test]
-    fn frame_blocking_header_detects_xfo() {
-        // X-Frame-Options 任一取值都拦(SAMEORIGIN 对跨源同样拦截)
-        for v in ["DENY", "SAMEORIGIN"] {
-            let h = headers(&[("x-frame-options", v)]); // 头名大小写不敏感
-            assert_eq!(
-                frame_blocking_header(&h),
-                Some(format!("X-Frame-Options: {v}")),
-                "XFO={v} 必须命中"
-            );
-        }
-        // 无帧头 → None
-        assert_eq!(frame_blocking_header(&headers(&[])), None);
-        assert_eq!(
-            frame_blocking_header(&headers(&[("content-type", "text/html")])),
-            None
-        );
-    }
-
-    #[test]
-    fn frame_blocking_header_detects_csp_frame_ancestors() {
-        // frame-ancestors 指令(大小写不敏感)命中
-        let h = headers(&[("content-security-policy", "default-src 'self'; frame-ancestors 'none'")]);
-        assert_eq!(
-            frame_blocking_header(&h),
-            Some("Content-Security-Policy: default-src 'self'; frame-ancestors 'none'".to_string())
-        );
-        // 指令名大小写变体
-        assert!(csp_blocks_framing("default-src 'self'; Frame-Ancestors https://x.com"));
-        // 无 frame-ancestors 的 CSP 不命中(含其它安全指令)
-        let h = headers(&[(
-            "content-security-policy",
-            "default-src 'self'; script-src 'nonce-frame-ancestors-x'",
-        )]);
-        assert_eq!(frame_blocking_header(&h), None);
-        // 值里恰好出现同名串不误报(按指令解析,不按子串)
-        assert!(!csp_blocks_framing("script-src 'nonce-frame-ancestors'"));
-        // 多 CSP 头:任一命中即命中
-        let h = headers(&[
-            ("content-security-policy", "default-src 'self'"),
-            ("content-security-policy", "frame-ancestors 'none'"),
-        ]);
-        assert_eq!(frame_blocking_header(&h).unwrap(), "Content-Security-Policy: frame-ancestors 'none'");
-        // 空值/畸形值不 panic 不命中
-        assert!(!csp_blocks_framing(""));
-        assert!(!csp_blocks_framing(";;;"));
-    }
-
-    #[test]
-    fn frame_blocking_header_prefers_xfo() {
-        // 两者都命中时报告 XFO(先到先报告,判据一致性)
-        let h = headers(&[
-            ("x-frame-options", "DENY"),
-            ("content-security-policy", "frame-ancestors 'none'"),
-        ]);
-        assert_eq!(frame_blocking_header(&h).unwrap(), "X-Frame-Options: DENY");
-    }
-
-    #[test]
-    fn check_frame_blocking_roundtrip_with_local_server() {
-        // 验收(issue #41):本地起一个带 XFO 头的假 dsh 服务,升级检查能报错。
-        // 用 std TcpListener 起一次性 HTTP 响应(无外部依赖,单测内闭环)。
-        fn serve_once(resp: String) -> (String, std::thread::JoinHandle<()>) {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let handle = std::thread::spawn(move || {
-                if let Ok((mut s, _)) = listener.accept() {
-                    // 标准 HTTP 顺序:先读请求再回响应;响应发完保持连接片刻,
-                    // 让客户端完整读完(读请求后立即回包 + 马上关会有 RST 竞态)
-                    let mut buf = [0u8; 1024];
-                    let _ = std::io::Read::read(&mut s, &mut buf);
-                    let _ = std::io::Write::write_all(&mut s, resp.as_bytes());
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            });
-            (format!("http://{addr}"), handle)
-        }
-
-        // 带 X-Frame-Options: DENY 的假服务 → 检查报 UpgradeFrameBlocked
-        let (url, h) = serve_once(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Frame-Options: DENY\r\nContent-Length: 4\r\n\r\n<h1>x</h1>"
-                .to_string(),
-        );
-        let err = tauri::async_runtime::block_on(check_frame_blocking(&url)).unwrap_err();
-        assert_eq!(
-            err,
-            UpgradeError::Kind(UpgradeErrorKind::UpgradeFrameBlocked {
-                header: "X-Frame-Options: DENY".into()
-            })
-        );
-        h.join().unwrap();
-
-        // 无帧头的假服务 → 放行
-        let (url, h) = serve_once(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 4\r\n\r\n<h1>x</h1>"
-                .to_string(),
-        );
-        tauri::async_runtime::block_on(check_frame_blocking(&url)).unwrap();
-        h.join().unwrap();
-
-        // 服务不存在(连接拒绝)→ 探测不确定,放行
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        tauri::async_runtime::block_on(check_frame_blocking(&format!("http://127.0.0.1:{port}")))
-            .unwrap();
     }
 
     // ── 状态机 ─────────────────────────────────────────────────────

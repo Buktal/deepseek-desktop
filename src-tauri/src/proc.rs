@@ -90,11 +90,41 @@ pub(crate) fn kill_pid_tree(pid: u32) {
     }
 }
 
-/// 按进程树杀并回收(等待退出)。**Timeout 与 Io 路径必须调用**——只 return 不杀
-/// 会留下孤儿进程:npm 安装的 Io 路径还曾因 install_pid 已清除、退出收敛也杀不到。
-pub(crate) fn kill_and_reap(child: &mut Child) {
+/// 按进程树杀并回收(等待退出)。「失败必须杀」的义务由 run_with_timeout 统一
+/// 承担(执行器不变量);本函数只在其内部使用。
+fn kill_and_reap(child: &mut Child) {
     kill_pid_tree(child.id());
     let _ = child.wait();
+}
+
+/// 运行失败原因(超时 / 句柄 IO 异常)。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RunError {
+    Timeout(Duration),
+    Io(String),
+}
+
+/// 跑已 spawn 的子进程直到退出或超时。「不泄漏孤儿」是执行器不变量:
+/// 失败(超时 / IO)时自动按进程树 kill_and_reap,返回 Err 时子进程必已终止回收,
+/// 调用方无需(也不得)再补杀。错误到域错误变体的映射由调用方闭包给出
+/// (各调用点语义不同,如 NodeCheckTimeout vs NpmRootTimeout)——域错误映射
+/// 收敛为各调用点的一行闭包。
+pub(crate) fn run_with_timeout<E>(
+    child: &mut Child,
+    timeout: Duration,
+    map_err: impl FnOnce(RunError) -> E,
+) -> Result<Output, E> {
+    match wait_with_timeout(child, timeout) {
+        Ok(out) => Ok(out),
+        Err(ChildWaitError::Timeout(t)) => {
+            kill_and_reap(child);
+            Err(map_err(RunError::Timeout(t)))
+        }
+        Err(ChildWaitError::Io(e)) => {
+            kill_and_reap(child);
+            Err(map_err(RunError::Io(e)))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -134,5 +164,42 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2), "超时检测过慢");
         kill_pid_tree(child.id());
         let _ = child.wait();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_with_timeout_returns_output_on_success() {
+        let mut child = Command::new("cmd")
+            .args(["/c", "echo ok"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = run_with_timeout(&mut child, Duration::from_secs(5), |e| match e {
+            RunError::Timeout(_) => -1,
+            RunError::Io(_) => -2,
+        })
+        .unwrap();
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("ok"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_with_timeout_kills_and_reaps_on_timeout() {
+        // 执行器不变量:超时返回 Err 时子进程已被 kill_and_reap 回收
+        // (不泄漏孤儿),域错误映射闭包拿到 Timeout
+        let mut child = Command::new("cmd")
+            .args(["/c", "ping -n 3 127.0.0.1 >nul"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let r = run_with_timeout(&mut child, Duration::from_millis(200), |e| match e {
+            RunError::Timeout(_) => 42,
+            RunError::Io(_) => 43,
+        });
+        assert_eq!(r, Err(42), "超时经 kill_and_reap 并映射到域错误");
+        assert!(started.elapsed() < Duration::from_secs(2), "超时检测过慢");
     }
 }

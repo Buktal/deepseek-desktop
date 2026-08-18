@@ -211,7 +211,7 @@ pub fn build_snapshot(t: &ShellTexts, s: &MenuState) -> MenuSnapshot {
             behavior.menu_id(),
             match behavior {
                 CloseBehavior::Ask => t.close_ask,
-                // 与关闭三选弹窗按钮同文案(locales 一处,#38)
+                // 与关闭弹窗按钮同文案(locales 一处,#38)
                 CloseBehavior::Minimize => t.close_minimize,
                 CloseBehavior::Quit => t.close_quit,
             },

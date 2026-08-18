@@ -75,6 +75,14 @@ pub enum DshError {
     DshExitedEarlyNoCode,
     /// 启动超时(未收到就绪信号)
     DshStartTimeout { seconds: u64 },
+    /// 帧嵌入防御检查(ADR 0001 核心假设 / #41)失败:页面响应带 X-Frame-Options
+    /// 或 CSP frame-ancestors 头,壳的 iframe 架构无法呈现它。boot 与升级链的
+    /// start_service 就绪确认统一检查。
+    /// 序列化 kind 刻意保持 "UpgradeFrameBlocked"(线上契约:errors.* 翻译键与
+    /// 前端 UpgradeScreen 的「已装新版本、指引回退预案」判定共用此 kind,不因
+    /// 检查归入 dsh 域而改名)。
+    #[serde(rename = "UpgradeFrameBlocked")]
+    FrameBlocked { header: String },
     /// 流水线内部 panic 等未知内部错误
     Internal { message: String },
 }
@@ -102,12 +110,6 @@ pub enum UpgradeErrorKind {
     UpgradeKillFailed { detail: String },
     /// 升级后版本校验失败(全局 version ≠ pin 或 bin.js 缺失)
     UpgradeVerifyFailed,
-    /// 上游耦合防线(ADR 0001 / #29,#41):新版 dsh 的响应带帧嵌入限制头
-    /// (X-Frame-Options / CSP frame-ancestors),壳的 iframe 架构无法呈现它。
-    /// header = 命中的头原文(如 `X-Frame-Options: DENY`),前端按
-    /// errors.UpgradeFrameBlocked 键翻译并指引回退预案(恢复整窗互斥导航,
-    /// git 历史可回)。
-    UpgradeFrameBlocked { header: String },
 }
 
 /// dsh 升级失败的结构化原因:升级特有错误 + 与 dsh 生命周期共用的安装/启动类
@@ -170,21 +172,38 @@ mod tests {
             serde_json::to_value(UpgradeError::Kind(UpgradeErrorKind::UpgradeVerifyFailed)).unwrap(),
             serde_json::json!({ "kind": "UpgradeVerifyFailed" })
         );
+        // DshError 形态透传:untagged 序列化与 DshError 自身一致,前端零额外机制
         assert_eq!(
-            serde_json::to_value(UpgradeError::Kind(UpgradeErrorKind::UpgradeFrameBlocked {
+            serde_json::to_value(UpgradeError::Dsh(DshError::DshStartTimeout { seconds: 180 }))
+                .unwrap(),
+            serde_json::json!({ "kind": "DshStartTimeout", "data": { "seconds": 180 } })
+        );
+    }
+
+    #[test]
+    fn frame_blocked_serializes_as_upgrade_frame_blocked_kind() {
+        // 帧嵌入防御检查归入 DshError 后 kind 保持 "UpgradeFrameBlocked"(线上契约:
+        // errors.* 翻译键与前端 UpgradeScreen 判定共用,见 FrameBlocked 文档)——
+        // 升级链以 UpgradeError::Dsh 形态透传,wire 形态与旧 UpgradeErrorKind 一致
+        assert_eq!(
+            serde_json::to_value(DshError::FrameBlocked {
                 header: "X-Frame-Options: DENY".into()
-            }))
+            })
             .unwrap(),
             serde_json::json!({
                 "kind": "UpgradeFrameBlocked",
                 "data": { "header": "X-Frame-Options: DENY" }
             })
         );
-        // DshError 形态透传:untagged 序列化与 DshError 自身一致,前端零额外机制
         assert_eq!(
-            serde_json::to_value(UpgradeError::Dsh(DshError::DshStartTimeout { seconds: 180 }))
-                .unwrap(),
-            serde_json::json!({ "kind": "DshStartTimeout", "data": { "seconds": 180 } })
+            serde_json::to_value(UpgradeError::Dsh(DshError::FrameBlocked {
+                header: "Content-Security-Policy: frame-ancestors 'none'".into()
+            }))
+            .unwrap(),
+            serde_json::json!({
+                "kind": "UpgradeFrameBlocked",
+                "data": { "header": "Content-Security-Policy: frame-ancestors 'none'" }
+            })
         );
     }
 }

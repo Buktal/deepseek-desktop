@@ -1,7 +1,7 @@
 //! DeepSeek Desktop Tauri backend.
 //!
-//! 组装:dsh 生命周期管理 + 应用自身升级 + 托盘 + 关闭三选(壳页 AlertDialog,
-//! #39)+ 退出收敛(杀子进程)+ 生产日志 + 窗口状态记忆 + 开机自启。
+//! 组装:dsh 生命周期管理 + 应用自身升级 + 托盘 + 关闭询问弹窗(壳页 AlertDialog
+//! 二选 + 遮罩点击/Esc 取消,#39)+ 退出收敛(杀子进程)+ 生产日志 + 窗口状态记忆 + 开机自启。
 
 mod autostart;
 mod close;
@@ -116,7 +116,7 @@ pub fn run() {
             // 托盘
             tray::setup_tray(app.handle())?;
 
-            // 关闭按钮:壳页 AlertDialog 三选(退出应用/最小化到托盘/取消,#39)
+            // 关闭按钮:壳页 AlertDialog 二选(最小化到托盘/退出,遮罩点击/Esc = 取消,#39)
             setup_close_handler(app.handle());
 
             // 立即启动 boot 流水线(窗口显示前就开始安装,前端挂载后拉快照)
@@ -150,14 +150,14 @@ pub fn run() {
         });
 }
 
-/// 窗口 CloseRequested → 壳页 AlertDialog 三选(#31 场景 5 / #39 施工:
+/// 窗口 CloseRequested → 壳页 AlertDialog 二选(#31 场景 5 / #39 施工:
 /// 原生阻塞式 dialog 退役,改 emit `shell-dialog` close-ask,用户选择经
-/// shell_dialog_respond 回流到 tray.rs 统一动作分发)。
+/// shell_dialog_respond 回流到 dialog.rs 统一动作分发)。
 ///
 /// 注意:CloseRequested 在 webview 与 window 层可能各触发一次,用 DIALOG_SHOWN
 /// 守卫防重复弹(弹窗回答时在 dispatch_dialog_response 复位)。
-/// 按钮次序定稿(#31 拍板):[最小化到托盘(默认), 退出应用, 取消]——默认动作
-/// 是收起窗口而非退出应用,回车不误触杀进程。
+/// 按钮次序定稿(#31 拍板,取消按钮已退役):[最小化到托盘(默认), 退出应用]
+/// ——默认动作是收起窗口而非退出应用,回车不误触杀进程;取消经遮罩点击/Esc。
 fn setup_close_handler(app: &tauri::AppHandle) {
     let Some(win) = app.get_webview_window("main") else {
         return;
@@ -176,9 +176,9 @@ fn setup_close_handler(app: &tauri::AppHandle) {
                 CloseBehavior::Quit => close::execute(&app, CloseBehavior::Quit),
                 CloseBehavior::Minimize => close::execute(&app, CloseBehavior::Minimize),
                 CloseBehavior::Ask => {
-                    // Ask 期间:壳页 AlertDialog 三选(带「记住我的选择」勾选);
+                    // Ask 期间:壳页 AlertDialog 二选(带「记住我的选择」勾选);
                     // 记住后 close::set 持久化,下次直接执行不再弹(#31)
-                    if !dsh::try_show_dialog() {
+                    if !dialog::try_show_dialog() {
                         return;
                     }
                     dialog::show_close_ask(&app);

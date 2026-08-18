@@ -3,7 +3,7 @@
 //! #38 施工(拍板 #33「close_behavior 设置」):菜单「设置▸关闭行为」三选,
 //! 勾选状态以本模块内存为事实源(菜单快照构建在 menu.rs,动作分发在 tray.rs);
 //! close handler 读之——非 Ask 直接执行(退出应用 / 最小化到托盘),
-//! Ask 期间暂维持原生三选弹窗(M4 换 UI,见 #31 规格)。
+//! Ask 期间弹壳页关闭询问弹窗(#39/#31 规格,遮罩点击/Esc = 取消)。
 //!
 //! 持久化与 theme.rs 同模式:
 //! - 写 `<app_config_dir>/close.json`(JSON `{"choice": "ask"|"minimize"|"quit"}`,
@@ -22,7 +22,7 @@ use crate::dsh;
 /// 关闭行为:点窗口关闭按钮时的去向(单一事实源)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseBehavior {
-    /// 每次询问(现状:原生三选弹窗,M4 换 UI)
+    /// 每次询问(CloseRequested 弹壳页二选弹窗,#39)
     Ask,
     /// 最小化到托盘
     Minimize,
@@ -126,18 +126,13 @@ pub fn set(app: &AppHandle, behavior: CloseBehavior) {
     }
 }
 
-/// 执行关闭去向(#39:窗口关闭 handler 与关闭三选弹窗 respond 共用,消除两份
-/// 实现漂移;Ask 无执行语义 = no-op)。Quit:程序化退出流程(set_quitting 放行
-/// CloseRequested)+ 杀 dsh 子进程 + exit;Minimize:隐藏主窗口。
+/// 执行关闭去向(#39:窗口关闭 handler 与关闭弹窗 respond 共用,消除两份
+/// 实现漂移;Ask 无执行语义 = no-op)。Quit:程序化退出流程统一收敛到
+/// dsh::shutdown_and_exit(置 QUITTING 放行 CloseRequested + 杀 dsh + exit);
+/// Minimize:隐藏主窗口。
 pub fn execute(app: &AppHandle, behavior: CloseBehavior) {
     match behavior {
-        CloseBehavior::Quit => {
-            dsh::set_quitting();
-            if let Some(m) = app.try_state::<dsh::DshManager>() {
-                dsh::kill_child(m.inner());
-            }
-            app.exit(0);
-        }
+        CloseBehavior::Quit => dsh::shutdown_and_exit(app),
         CloseBehavior::Minimize => {
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.hide();

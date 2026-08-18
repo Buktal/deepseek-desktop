@@ -6,6 +6,10 @@
 //! 故本模块独立维护一份 zh/en 文案选择。
 //! 目前无语言偏好设置页,启动检测即终局;将来若加语言设置,由该设置为单一事实
 //! 来源,设置变更时重建托盘/对话框文案,前端经事件跟随(O_CC_One 的 LanguageSync 模式)。
+//!
+//! 静态文案数据化:一条文案的 zh/en 对只写在 TEXT_ROWS 表里一处(新增静态文案
+//! 只动表 + 结构体字段声明);插值类文案(版本号等)在 ShellTexts 方法内以
+//! format! 模板持有。行序与 ShellTexts 字段声明一一对应,见 TEXT_ROWS 注释。
 
 /// 语言判别。`lang_from_locale` 与前端 src/i18n/languages.ts 的 `resolveLanguage`
 /// 同规则(zh* → zh,en* → en,其余 → zh)。两个运行时各持一份实现——
@@ -50,13 +54,12 @@ pub struct ShellTexts {
     pub close_message: &'static str,
     pub close_quit: &'static str,
     pub close_minimize: &'static str,
-    pub close_cancel: &'static str,
     /// 手动检查发现新版对话框的按钮(升级 / 稍后,见 update.rs)
     pub update_now: &'static str,
     pub update_later: &'static str,
     /// 发现应用新版弹窗标题(dialog.rs;#31 场景 1「发现新版 vX」)
     pub upgrade_found_title: &'static str,
-    /// 「记住我的选择」勾选标签(关闭三选弹窗,dialog.rs;#31 场景 5)
+    /// 「记住我的选择」勾选标签(关闭弹窗,dialog.rs;#31 场景 5)
     pub remember_choice: &'static str,
     /// 「升级正在进行中」toast(升级流水线在途时手动检查被拒的可见反馈,
     /// dialog.rs;#31 行为修正:消除静默 no-op)
@@ -152,59 +155,83 @@ impl ShellTexts {
     }
 }
 
-pub fn shell_texts(lang: Lang) -> ShellTexts {
+/// 文案数据表:每行一条文案的 (zh, en) 对,行序与 ShellTexts 字段声明一一对应
+/// (shell_texts 按索引取用,行注释标注字段名;数组长度与字段数绑定,新增字段
+/// 忘加行会在取用时越界 panic 暴露,并有计数测试守住)。新增静态文案只动这里
+/// + 结构体字段声明两处,不再各语言写一份巨型构造。
+const TEXT_ROWS: [(&str, &str); 20] = [
+    // tray_toggle
+    ("显示/隐藏窗口", "Show/Hide window"),
+    // tray_theme
+    ("主题", "Theme"),
+    // tray_theme_light
+    ("亮色", "Light"),
+    // tray_theme_dark
+    ("暗色", "Dark"),
+    // tray_theme_system
+    ("跟随系统", "System"),
+    // tray_autostart
+    ("开机自启", "Launch at startup"),
+    // tray_settings
+    ("设置", "Settings"),
+    // tray_close_behavior
+    ("关闭行为", "Close behavior"),
+    // close_ask
+    ("每次询问", "Ask each time"),
+    // tray_check_update
+    ("检查更新", "Check for Updates"),
+    // tray_quit
+    ("退出", "Quit"),
+    // menu_button(壳菜单条按钮文案,menu.rs 快照承载,前端不持有第二份文案,#38)
+    ("菜单", "Menu"),
+    // close_message("关闭"而非"退出":对话框同时提供"最小化到托盘",问题只问窗口去向)
+    ("关闭 DeepSeek Desktop?", "Close DeepSeek Desktop?"),
+    // close_quit
+    ("退出应用", "Quit app"),
+    // close_minimize
+    ("最小化到托盘", "Minimize to tray"),
+    // update_now / update_later(手动检查发现新版对话框的按钮)
+    ("升级", "Upgrade"),
+    ("稍后", "Later"),
+    // upgrade_found_title(发现应用新版弹窗标题,dialog.rs;#31 场景 1)
+    ("发现 dsh 新版本", "New dsh version available"),
+    // remember_choice(「记住我的选择」勾选标签,关闭弹窗,dialog.rs;#31 场景 5)
+    ("记住我的选择", "Remember my choice"),
+    // update_running(「升级正在进行中」toast,dialog.rs;#31 行为修正)
+    ("升级正在进行中", "An upgrade is in progress"),
+];
+
+/// 按语言取行(zh 列 / en 列)。
+fn row(lang: Lang, i: usize) -> &'static str {
     match lang {
-        Lang::Zh => ShellTexts {
-            tray_toggle: "显示/隐藏窗口",
-            tray_theme: "主题",
-            tray_theme_light: "亮色",
-            tray_theme_dark: "暗色",
-            tray_theme_system: "跟随系统",
-            tray_autostart: "开机自启",
-            tray_settings: "设置",
-            tray_close_behavior: "关闭行为",
-            close_ask: "每次询问",
-            tray_check_update: "检查更新",
-            tray_quit: "退出",
-            menu_button: "菜单",
-            // "关闭"而非"退出":对话框同时提供"最小化到托盘",问题只问窗口去向
-            close_message: "关闭 DeepSeek Desktop?",
-            close_quit: "退出应用",
-            close_minimize: "最小化到托盘",
-            close_cancel: "取消",
-            update_now: "升级",
-            update_later: "稍后",
-            upgrade_found_title: "发现 dsh 新版本",
-            remember_choice: "记住我的选择",
-            update_running: "升级正在进行中",
-            lang: Lang::Zh,
-        },
-        Lang::En => ShellTexts {
-            tray_toggle: "Show/Hide window",
-            tray_theme: "Theme",
-            tray_theme_light: "Light",
-            tray_theme_dark: "Dark",
-            tray_theme_system: "System",
-            tray_autostart: "Launch at startup",
-            tray_settings: "Settings",
-            tray_close_behavior: "Close behavior",
-            close_ask: "Ask each time",
-            tray_check_update: "Check for Updates",
-            tray_quit: "Quit",
-            menu_button: "Menu",
-            // "Close" instead of "Quit": the dialog also offers "Minimize to tray",
-            // so the question is about the window, not the process
-            close_message: "Close DeepSeek Desktop?",
-            close_quit: "Quit app",
-            close_minimize: "Minimize to tray",
-            close_cancel: "Cancel",
-            update_now: "Upgrade",
-            update_later: "Later",
-            upgrade_found_title: "New dsh version available",
-            remember_choice: "Remember my choice",
-            update_running: "An upgrade is in progress",
-            lang: Lang::En,
-        },
+        Lang::Zh => TEXT_ROWS[i].0,
+        Lang::En => TEXT_ROWS[i].1,
+    }
+}
+
+pub fn shell_texts(lang: Lang) -> ShellTexts {
+    ShellTexts {
+        tray_toggle: row(lang, 0),
+        tray_theme: row(lang, 1),
+        tray_theme_light: row(lang, 2),
+        tray_theme_dark: row(lang, 3),
+        tray_theme_system: row(lang, 4),
+        tray_autostart: row(lang, 5),
+        tray_settings: row(lang, 6),
+        tray_close_behavior: row(lang, 7),
+        close_ask: row(lang, 8),
+        tray_check_update: row(lang, 9),
+        tray_quit: row(lang, 10),
+        menu_button: row(lang, 11),
+        close_message: row(lang, 12),
+        close_quit: row(lang, 13),
+        close_minimize: row(lang, 14),
+        update_now: row(lang, 15),
+        update_later: row(lang, 16),
+        upgrade_found_title: row(lang, 17),
+        remember_choice: row(lang, 18),
+        update_running: row(lang, 19),
+        lang,
     }
 }
 
@@ -226,5 +253,48 @@ mod tests {
         assert!(matches!(lang_from_locale(Some("ja-JP")), Lang::Zh));
         assert!(matches!(lang_from_locale(Some("fr-FR")), Lang::Zh));
         assert!(matches!(lang_from_locale(None), Lang::Zh));
+    }
+
+    #[test]
+    fn text_table_rows_match_struct_field_count() {
+        // 行序与 ShellTexts 字段声明一一对应;数组长度是编译期常量,此处守住
+        // 「新增字段必加行」的计数契约(忘加行 → 取用越界 panic 暴露)
+        assert_eq!(TEXT_ROWS.len(), 20);
+    }
+
+    #[test]
+    fn text_table_has_no_empty_rows() {
+        // 空文案 = 忘了填,直接红(两种语言任一空都不行)
+        for (zh, en) in TEXT_ROWS {
+            assert!(!zh.is_empty(), "zh 空行");
+            assert!(!en.is_empty(), "en 空行");
+        }
+    }
+
+    #[test]
+    fn shell_texts_both_langs_fully_populated() {
+        // 两种语言各取一份:字段数量一致且无空串(数据表投影完整性)
+        let zh = shell_texts(Lang::Zh);
+        let en = shell_texts(Lang::En);
+        let zh_fields = [
+            zh.tray_toggle, zh.tray_theme, zh.tray_theme_light, zh.tray_theme_dark,
+            zh.tray_theme_system, zh.tray_autostart, zh.tray_settings,
+            zh.tray_close_behavior, zh.close_ask, zh.tray_check_update, zh.tray_quit,
+            zh.menu_button, zh.close_message, zh.close_quit, zh.close_minimize,
+            zh.update_now, zh.update_later, zh.upgrade_found_title, zh.remember_choice,
+            zh.update_running,
+        ];
+        let en_fields = [
+            en.tray_toggle, en.tray_theme, en.tray_theme_light, en.tray_theme_dark,
+            en.tray_theme_system, en.tray_autostart, en.tray_settings,
+            en.tray_close_behavior, en.close_ask, en.tray_check_update, en.tray_quit,
+            en.menu_button, en.close_message, en.close_quit, en.close_minimize,
+            en.update_now, en.update_later, en.upgrade_found_title, en.remember_choice,
+            en.update_running,
+        ];
+        assert_eq!(zh_fields.len(), 20);
+        assert_eq!(en_fields.len(), 20);
+        assert!(zh_fields.iter().all(|s| !s.is_empty()));
+        assert!(en_fields.iter().all(|s| !s.is_empty()));
     }
 }
