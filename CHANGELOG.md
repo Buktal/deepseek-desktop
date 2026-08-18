@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-18
+
+### Changed
+
+- **src-tauri 架构深化**(2026-08-18 全量扫描落地):启动六步时序收编为 start_service 单入口(boot / 升级 / 升级卡「稍后」三调用点归一,帧嵌入防御检查两入口统一);升级通知槽位镜像退役(菜单 / 徽标 / tooltip 直读管理器快照,副作用显式化);优雅退出协议 / 弹窗回答闭环 / service_status 谓词 / proc 执行器 / npm 安装域 / 手动检查准入逐一收口——线上契约零变化(wire 兼容有测试守护),cargo test 112 绿 / clippy 0 警告。
+- **src 前端架构深化**(2026-08-18 全量扫描落地):五份监听样板坍缩为 useRustEvent;useUpdateCheck / useDshUpgrade 双胞胎合并为参数化 useTrayCardMirror(requested 生命周期收进纯 reducer);dsh 存活镜像与锚定时钟自治化(useDshLiveness / useAnchoredClock);deriveOverlay 四态判别联合直收原始输入,不可能状态在类型层不可表达——wire 协议零变化(10 事件 / 13 命令逐一比对),vitest 116 测试绿 / biome 0 诊断 / tsc 0 错误。
+- **双轴代码审查收尾**(fixed point b1bdf30):恒真测试重写为经 derive_status 全组合验证的真不变式;托盘通知版本规则下沉为 notify_version 单一谓词(reduce 跨界判据与菜单直读同源);locales 注释勘误(「应用新版弹窗」实为「dsh 新版本」)。
+
 ## [1.0.0] - 2026-08-18
 
 ### Fixed
@@ -81,6 +89,7 @@
 - **界面 i18n**:zh / en 双语,跟随系统语言(中文系统默认中文)。
 - **CI 发布流水线**:打 tag 自动构建、签名并发布 Release(含 latest.json 更新清单)。
 
+[1.1.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v1.0.0
 [0.5.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Buktal/deepseek-desktop/releases/tag/v0.4.0
