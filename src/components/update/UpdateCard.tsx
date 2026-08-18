@@ -47,7 +47,7 @@ export function UpdateCard({
 
   return (
     <main className="flex h-full w-full items-center justify-center bg-background p-10 text-foreground">
-      <Card className="flex w-full max-w-md flex-col items-center gap-5 rounded-2xl p-10 text-center shadow-sm">
+      <Card className="flex w-full max-w-md flex-col items-center gap-5 rounded-3xl p-10 text-center shadow-sm">
       {status === "available" && (
         <>
           <CircleArrowUp className="size-9 text-primary" />

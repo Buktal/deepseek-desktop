@@ -12,6 +12,7 @@
 import { useTranslation } from "react-i18next"
 
 import { Progress } from "@/components/ui/progress"
+import type { InstallStage } from "@/lib/installStage"
 
 export function InstallProgress({
   progress,
@@ -20,16 +21,15 @@ export function InstallProgress({
 }: {
   /** 确定进度 0-100(Rust 侧模拟 + 校准值);null = 不确定进度(滑动指示) */
   progress: number | null
-  /** 子阶段键后缀("fetching"|"reifying"|"finishing"),缺省时只显示百分比 */
-  stage?: string | null
+  /** 子阶段键后缀(InstallStage 联合;缺省时只显示百分比) */
+  stage?: InstallStage | null
   /** 文案键命名空间:boot 安装用 "boot",dsh 升级链用 "upgrade" */
   i18nPrefix: "boot" | "upgrade"
 }) {
   const { t } = useTranslation()
   if (progress !== null) {
-    const stageText = stage
-      ? t(`${i18nPrefix}.installing.stage.${stage}`, { defaultValue: "" })
-      : ""
+    // 键存在由 InstallStage 联合 + installStage.test.ts 守住,无需 defaultValue 兜底
+    const stageText = stage ? t(`${i18nPrefix}.installing.stage.${stage}`) : ""
     return (
       <div className="flex w-full flex-col gap-2">
         <div className="flex items-baseline justify-between text-sm">

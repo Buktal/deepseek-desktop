@@ -1,8 +1,7 @@
 {
   "boot.checking.nodeFound": "Node.js {{version}} detected",
   "boot.checking.title": "Checking the environment…",
-  "boot.elapsed.minSec": "Elapsed {{m}}m {{s}}s",
-  "boot.elapsed.sec": "Elapsed {{s}}s",
+  "boot.elapsed.label": "Elapsed",
   "boot.idle.title": "Starting…",
   "boot.installing.hint": "First install may take a few minutes, please wait",
   "boot.installing.progress": "{{pct}}%",
@@ -57,6 +56,7 @@
   "guide.requirement": "Requirement: {{required}}",
   "guide.title": "Node.js required",
   "update.available.found": "New version v{{version}} available",
+  "update.checking": "Checking for updates…",
   "update.current": "Current v{{version}}",
   "update.downloaded": "Downloaded {{pct}}%",
   "update.downloading": "Downloading update…",

@@ -48,77 +48,83 @@
     --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+/* 色板锚定鲸标品牌(whale.svg):主色取靛蓝渐变亮端(#193CB8 系提亮到
+   可用对比度),中性面微带同相冷调(hue 266);默认紫替换为品牌靛蓝。 */
 :root {
     /* 原生控件/滚动条跟随主题(shadcn dark mode 惯例):亮色系 */
     color-scheme: light;
+    /* 品牌渐变原色(whale.svg 同源):界面上唯一渐变,只落 boot 仪表扫描弧 */
+    --brand-grad-from: #193cb8;
+    --brand-grad-to: #372aac;
     --background: oklch(1 0 0);
-    --foreground: oklch(0.145 0 0);
+    --foreground: oklch(0.16 0.018 265.5);
     --card: oklch(1 0 0);
-    --card-foreground: oklch(0.145 0 0);
+    --card-foreground: oklch(0.16 0.018 265.5);
     --popover: oklch(1 0 0);
-    --popover-foreground: oklch(0.145 0 0);
-    --primary: oklch(0.457 0.24 277.023);
-    --primary-foreground: oklch(0.962 0.018 272.314);
-    --secondary: oklch(0.967 0.001 286.375);
-    --secondary-foreground: oklch(0.21 0.006 285.885);
-    --muted: oklch(0.97 0 0);
-    --muted-foreground: oklch(0.556 0 0);
-    --accent: oklch(0.97 0 0);
-    --accent-foreground: oklch(0.205 0 0);
+    --popover-foreground: oklch(0.16 0.018 265.5);
+    --primary: oklch(0.46 0.216 265.5);
+    --primary-foreground: oklch(0.985 0.005 265);
+    --secondary: oklch(0.958 0.008 266);
+    --secondary-foreground: oklch(0.23 0.025 265);
+    --muted: oklch(0.963 0.005 266);
+    --muted-foreground: oklch(0.52 0.02 265);
+    --accent: oklch(0.953 0.012 267);
+    --accent-foreground: oklch(0.23 0.025 265);
     --destructive: oklch(0.577 0.245 27.325);
-    --border: oklch(0.922 0 0);
-    --input: oklch(0.922 0 0);
-    --ring: oklch(0.708 0 0);
-    --chart-1: oklch(0.785 0.115 274.713);
-    --chart-2: oklch(0.585 0.233 277.117);
-    --chart-3: oklch(0.511 0.262 276.966);
-    --chart-4: oklch(0.457 0.24 277.023);
-    --chart-5: oklch(0.398 0.195 277.366);
+    --border: oklch(0.908 0.008 266);
+    --input: oklch(0.908 0.008 266);
+    --ring: oklch(0.62 0.15 267);
+    --chart-1: oklch(0.694 0.16 272.2);
+    --chart-2: oklch(0.592 0.22 269.6);
+    --chart-3: oklch(0.46 0.216 265.5);
+    --chart-4: oklch(0.424 0.198 265.5);
+    --chart-5: oklch(0.399 0.195 277.3);
     --radius: 0.45rem;
-    --sidebar: oklch(0.985 0 0);
-    --sidebar-foreground: oklch(0.145 0 0);
-    --sidebar-primary: oklch(0.511 0.262 276.966);
-    --sidebar-primary-foreground: oklch(0.962 0.018 272.314);
-    --sidebar-accent: oklch(0.97 0 0);
-    --sidebar-accent-foreground: oklch(0.205 0 0);
-    --sidebar-border: oklch(0.922 0 0);
-    --sidebar-ring: oklch(0.708 0 0);
+    --sidebar: oklch(0.975 0.004 266);
+    --sidebar-foreground: oklch(0.16 0.018 265.5);
+    --sidebar-primary: oklch(0.46 0.216 265.5);
+    --sidebar-primary-foreground: oklch(0.985 0.005 265);
+    --sidebar-accent: oklch(0.953 0.012 267);
+    --sidebar-accent-foreground: oklch(0.23 0.025 265);
+    --sidebar-border: oklch(0.908 0.008 266);
+    --sidebar-ring: oklch(0.62 0.15 267);
 }
 
 .dark {
-    /* 原生控件/滚动条跟随主题:暗色系(与 :root 的 color-scheme 配对) */
+    /* 原生控件/滚动条跟随主题:暗色系(与 :root 的 color-scheme 配对)。
+       暗色主色提到 #6E8BFF 量级保对比,主色前景改深藏青(鲸标描边 #0b1a4d 系) */
     color-scheme: dark;
-    --background: oklch(0.145 0 0);
-    --foreground: oklch(0.985 0 0);
-    --card: oklch(0.205 0 0);
-    --card-foreground: oklch(0.985 0 0);
-    --popover: oklch(0.205 0 0);
-    --popover-foreground: oklch(0.985 0 0);
-    --primary: oklch(0.398 0.195 277.366);
-    --primary-foreground: oklch(0.962 0.018 272.314);
-    --secondary: oklch(0.274 0.006 286.033);
-    --secondary-foreground: oklch(0.985 0 0);
-    --muted: oklch(0.269 0 0);
-    --muted-foreground: oklch(0.708 0 0);
-    --accent: oklch(0.269 0 0);
-    --accent-foreground: oklch(0.985 0 0);
+    --background: oklch(0.148 0.012 266);
+    --foreground: oklch(0.972 0.004 266);
+    --card: oklch(0.203 0.014 266);
+    --card-foreground: oklch(0.972 0.004 266);
+    --popover: oklch(0.203 0.014 266);
+    --popover-foreground: oklch(0.972 0.004 266);
+    --primary: oklch(0.67 0.174 270.5);
+    --primary-foreground: oklch(0.22 0.07 266);
+    --secondary: oklch(0.262 0.016 267);
+    --secondary-foreground: oklch(0.972 0.004 266);
+    --muted: oklch(0.256 0.014 267);
+    --muted-foreground: oklch(0.705 0.012 267);
+    --accent: oklch(0.272 0.02 267);
+    --accent-foreground: oklch(0.972 0.004 266);
     --destructive: oklch(0.704 0.191 22.216);
     --border: oklch(1 0 0 / 10%);
     --input: oklch(1 0 0 / 15%);
-    --ring: oklch(0.556 0 0);
-    --chart-1: oklch(0.785 0.115 274.713);
-    --chart-2: oklch(0.585 0.233 277.117);
-    --chart-3: oklch(0.511 0.262 276.966);
-    --chart-4: oklch(0.457 0.24 277.023);
-    --chart-5: oklch(0.398 0.195 277.366);
-    --sidebar: oklch(0.205 0 0);
-    --sidebar-foreground: oklch(0.985 0 0);
-    --sidebar-primary: oklch(0.585 0.233 277.117);
-    --sidebar-primary-foreground: oklch(0.962 0.018 272.314);
-    --sidebar-accent: oklch(0.269 0 0);
-    --sidebar-accent-foreground: oklch(0.985 0 0);
+    --ring: oklch(0.6 0.14 270);
+    --chart-1: oklch(0.694 0.16 272.2);
+    --chart-2: oklch(0.592 0.22 269.6);
+    --chart-3: oklch(0.46 0.216 265.5);
+    --chart-4: oklch(0.424 0.198 265.5);
+    --chart-5: oklch(0.399 0.195 277.3);
+    --sidebar: oklch(0.203 0.014 266);
+    --sidebar-foreground: oklch(0.972 0.004 266);
+    --sidebar-primary: oklch(0.67 0.174 270.5);
+    --sidebar-primary-foreground: oklch(0.22 0.07 266);
+    --sidebar-accent: oklch(0.272 0.02 267);
+    --sidebar-accent-foreground: oklch(0.972 0.004 266);
     --sidebar-border: oklch(1 0 0 / 10%);
-    --sidebar-ring: oklch(0.556 0 0);
+    --sidebar-ring: oklch(0.6 0.14 270);
 }
 
 @layer base {
@@ -127,6 +133,10 @@
     }
   body {
     @apply bg-background text-foreground;
+    }
+  /* 文本选区随品牌主色(替代系统默认蓝) */
+  ::selection {
+    @apply bg-primary/20;
     }
   button:not(:disabled), [role="button"]:not(:disabled) {
     cursor: pointer;
@@ -151,7 +161,9 @@
 }
 
 /* boot 就绪退出动画(#4):整屏溶解(淡出 + 微缩放)。
-   时长与 src/lib/bootExit.ts 的 BOOT_EXIT_ANIMATION_MS 一致(改动需同步)。
+   时长消费 --boot-exit-ms 变量(bootExit.ts 的 BOOT_EXIT_ANIMATION_MS 单一
+   事实来源,BootScreen 写入);keyframes 名与 src/lib/bootExit.ts 导出的
+   BOOT_EXIT_ANIMATION_NAME / BOOT_EXIT_RING_ANIMATION_NAME 一致。
    动画结束事件经 BootScreen root 上报,兜底定时器保证导航不依赖 CSS 事件 */
 @keyframes boot-exit {
   0% {
@@ -165,7 +177,7 @@
 }
 
 .boot-exit {
-  animation: boot-exit 400ms ease-out forwards;
+  animation: boot-exit var(--boot-exit-ms) ease-out forwards;
 }
 
 /* 旋转圆环收缩收敛:就绪时缩到中心点消失(「加载完成」的视觉表达)。
@@ -182,7 +194,7 @@
 }
 
 .boot-exit-ring {
-  animation: boot-exit-ring 400ms cubic-bezier(0.45, 0, 0.6, 1) forwards;
+  animation: boot-exit-ring var(--boot-exit-ms) cubic-bezier(0.45, 0, 0.6, 1) forwards;
 }
 
 /* reduced-motion:不播放装饰性动画。退出动画不播(CSS 动画事件随之不触发,

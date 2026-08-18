@@ -5,15 +5,17 @@
 //
 // kind 分派(#31 六弹窗):
 // - dialog 类(update-found / upgrade-found / close-ask):AlertDialog,
-//   按钮次序与强调随 payload(疑点 3 结论);Esc/遮罩 = 取消(later 语义同源)
+//   按钮次序与强调随 payload(疑点 3 结论);初始焦点落主按钮(Enter 即默认
+//   动作),Esc/遮罩点击 = 取消(close-ask 复位防双触发守卫;found 类在
+//   Rust 侧与「稍后」同无操作)
 // - toast 类(toast-up-to-date / toast-check-failed / toast-upgrade-running):
 //   Sonner toast,信息性无决策,无需 respond
 //
+// close-ask 无取消按钮(遮罩点击/Esc 即取消语义,窗口保持现状)。
 // 同一时刻只保留一个弹窗:新请求覆盖旧请求(弹窗请求低频,Rust 侧编排互斥)。
 import { invoke } from "@tauri-apps/api/core"
-import { listen } from "@tauri-apps/api/event"
 import { CircleArrowUp, TriangleAlert } from "lucide-react"
-import { useEffect, useState } from "react"
+import { useRef, useState } from "react"
 import { toast } from "sonner"
 
 import {
@@ -28,11 +30,14 @@ import {
 } from "@/components/ui/alert-dialog"
 import { Checkbox } from "@/components/ui/checkbox"
 import { summarizeReleaseNotes } from "@/lib/releaseNotes"
+import { useRustEvent } from "@/lib/useRustEvent"
 import {
+  isCheckUpdateAnswer,
   isShellDialogRequest,
   type DialogButtonVariant,
   type ShellDialogRequest,
 } from "@/lib/shellDialog"
+import { dismissCheckUpdateLoading } from "@/lib/updateCheckToast"
 
 /** 载荷 variant → Button variant(疑点 3:primary/outline/ghost 三种强调)。 */
 const BUTTON_VARIANT: Record<DialogButtonVariant, "default" | "outline" | "ghost"> = {
@@ -43,36 +48,32 @@ const BUTTON_VARIANT: Record<DialogButtonVariant, "default" | "outline" | "ghost
 
 export function ShellDialogs() {
   const [request, setRequest] = useState<ShellDialogRequest | null>(null)
-  // 关闭三选的「记住我的选择」:勾选状态只在弹窗存活期间有效,
+  // 关闭弹窗的「记住我的选择」:勾选状态只在弹窗存活期间有效,
   // 新请求到达时复位(勾选本身不持久化——持久化在 Rust close::set,#31)
   const [remember, setRemember] = useState(false)
+  // 初始焦点目标:主按钮(无 primary 时退首个),Enter 直接执行默认动作
+  const primaryRef = useRef<HTMLButtonElement>(null)
 
-  // 监听 shell-dialog 事件(一次性请求,无快照命令;与 upgrade-card-request
-  // 同款 listen 模式)。Rust 侧 emit 前已 show 窗口,事件不丢。
-  useEffect(() => {
-    let alive = true
-    let stop: (() => void) | undefined
-    void listen("shell-dialog", (e) => {
-      if (!alive) return
-      const req = e.payload
-      if (!isShellDialogRequest(req)) return
+  // 监听 shell-dialog 事件(一次性请求,无快照命令;样板走 useRustEvent)。
+  // Rust 侧 emit 前已 show 窗口,事件不丢;toast 类在此分流(Sonner toast,
+  // 渲染路径不再出现 toast 请求)
+  useRustEvent(
+    "shell-dialog",
+    (req) => {
+      // 检查更新结果到达:关掉手动检查的在途 loading toast(五种回答形态;
+      // close-ask 等无关事件不动它,见 shellDialog.isCheckUpdateAnswer)
+      if (isCheckUpdateAnswer(req.kind)) dismissCheckUpdateLoading()
       if (req.kind.startsWith("toast-")) {
         toast(req.message ?? "")
       } else {
         setRequest(req)
         setRemember(false)
       }
-    }).then((un) => {
-      stop = un
-      if (!alive) un()
-    })
-    return () => {
-      alive = false
-      stop?.()
-    }
-  }, [])
+    },
+    isShellDialogRequest,
+  )
 
-  // 用户选择:respond 回流 Rust 统一分发(关闭三选的记住勾选一并回传);
+  // 用户选择:respond 回流 Rust 统一分发(关闭弹窗的记住勾选一并回传);
   // 未知 kind 由 Rust 侧无操作兜底
   const respond = (choice: string) => {
     if (!request) return
@@ -82,20 +83,27 @@ export function ShellDialogs() {
     setRequest(null)
   }
 
+  // toast 类请求已在监听器里分流(Sonner toast 直接弹出),渲染路径只可能
+  // 承载 dialog 类请求(Q4:此处曾有一段恒假的 isToast 死分支)
   if (!request) return null
 
-  const isToast = request.kind.startsWith("toast-")
-  if (isToast) return null
+  const primaryId =
+    request.buttons.find((b) => b.variant === "primary")?.id ?? request.buttons[0]?.id
 
   return (
     <AlertDialog
       open
       onOpenChange={(open) => {
-        // Esc / 遮罩点击:取消语义(close-ask 复位防双触发守卫;found 类无操作)
+        // Esc:取消语义(close-ask 复位防双触发守卫;found 类无操作)
         if (!open) respond("cancel")
       }}
     >
-      <AlertDialogContent size={request.kind === "close-ask" ? "sm" : "default"}>
+      <AlertDialogContent
+        size={request.kind === "close-ask" ? "sm" : "default"}
+        // 遮罩点击:同 Esc 取消语义(Base UI AlertDialog 默认不因外点自关)
+        onOutsideClick={() => respond("cancel")}
+        initialFocus={primaryRef}
+      >
         {request.kind === "close-ask" ? (
           <>
             <AlertDialogHeader>
@@ -133,6 +141,7 @@ export function ShellDialogs() {
           {request.buttons.map((button) => (
             <AlertDialogAction
               key={button.id}
+              ref={button.id === primaryId ? primaryRef : undefined}
               variant={BUTTON_VARIANT[button.variant]}
               onClick={() => respond(button.id)}
             >

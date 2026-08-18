@@ -7,10 +7,26 @@
 export type ShellDialogKind =
   | "update-found" // 发现应用新版(AlertDialog,notes 承载 release notes 原文)
   | "upgrade-found" // 发现 dsh 新版(AlertDialog)
-  | "close-ask" // 关闭三选(AlertDialog + 记住勾选)
+  | "close-ask" // 关闭二选(AlertDialog + 记住勾选;遮罩点击/Esc = 取消)
   | "toast-up-to-date" // 已是最新(toast)
   | "toast-check-failed" // 检查失败(toast)
   | "toast-upgrade-running" // 升级流水线在途,手动检查被拒(toast)
+
+/** 「检查更新」的回答形态:手动检查(tray.rs on_check_update)的结果必为
+ *  这五种事件之一——两种 found 弹窗 + 三种 toast;close-ask 等无关事件不算。 */
+const CHECK_UPDATE_ANSWERS: ReadonlySet<string> = new Set([
+  "update-found",
+  "upgrade-found",
+  "toast-up-to-date",
+  "toast-check-failed",
+  "toast-upgrade-running",
+])
+
+/** shell-dialog 事件是否为「检查更新」的回答(手动检查在途 loading toast
+ *  的关闭信号,见 updateCheckToast.ts)。 */
+export function isCheckUpdateAnswer(kind: ShellDialogKind): boolean {
+  return CHECK_UPDATE_ANSWERS.has(kind)
+}
 
 export type DialogButtonVariant = "primary" | "outline" | "ghost"
 

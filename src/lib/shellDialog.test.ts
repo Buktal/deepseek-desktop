@@ -2,7 +2,22 @@
 // 按钮 id/label 必填)shape 校验
 import { describe, expect, it } from "vitest"
 
-import { isShellDialogRequest } from "@/lib/shellDialog"
+import { isCheckUpdateAnswer, isShellDialogRequest } from "@/lib/shellDialog"
+
+describe("isCheckUpdateAnswer", () => {
+  // 生产路径:手动检查在途 loading toast 的关闭信号(见 updateCheckToast.ts)
+  it("五种检查结果形态都算回答", () => {
+    expect(isCheckUpdateAnswer("update-found")).toBe(true)
+    expect(isCheckUpdateAnswer("upgrade-found")).toBe(true)
+    expect(isCheckUpdateAnswer("toast-up-to-date")).toBe(true)
+    expect(isCheckUpdateAnswer("toast-check-failed")).toBe(true)
+    expect(isCheckUpdateAnswer("toast-upgrade-running")).toBe(true)
+  })
+
+  it("无关事件不算(close-ask 不打断在途检查的反馈)", () => {
+    expect(isCheckUpdateAnswer("close-ask")).toBe(false)
+  })
+})
 
 describe("isShellDialogRequest", () => {
   it("accepts a well-formed dialog request", () => {
@@ -28,7 +43,6 @@ describe("isShellDialogRequest", () => {
         buttons: [
           { id: "minimize", label: "最小化到托盘", variant: "primary" },
           { id: "quit", label: "退出应用", variant: "outline" },
-          { id: "cancel", label: "取消", variant: "ghost" },
         ],
         rememberLabel: "记住我的选择",
       }),

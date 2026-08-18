@@ -12,7 +12,7 @@ import { useTranslation } from "react-i18next"
 
 import { Progress } from "@/components/ui/progress"
 import { Button } from "@/components/ui/button"
-import { updatePercent } from "@/lib/useUpdateCheck"
+import { updatePercent } from "@/lib/updateShare"
 
 export function UpdateFloat({
   status,
@@ -32,7 +32,7 @@ export function UpdateFloat({
   const pct = updatePercent(downloadedBytes, totalBytes)
 
   return (
-    <div className="fixed right-4 bottom-4 z-30 w-80 rounded-4xl border bg-popover p-4 text-popover-foreground shadow-lg">
+    <div className="fixed right-4 bottom-4 z-30 w-80 animate-in fade-in slide-in-from-bottom-3 motion-reduce:animate-none rounded-3xl border bg-popover p-4 text-popover-foreground shadow-lg">
       {status === "downloading" ? (
         <>
           <div className="flex items-center justify-between gap-2">

@@ -11,6 +11,8 @@
 //   Rust 统一分发;升级槽位非空时按钮显示徽标点(与托盘徽标图标同源,#3 §1)。
 //   勾选态直接取自快照、不维护本地切换状态:Rust 是事实源,新快照覆盖。
 import { CheckIcon, MenuIcon } from "lucide-react"
+import { useCallback } from "react"
+import { useTranslation } from "react-i18next"
 
 import { Button } from "@/components/ui/button"
 import {
@@ -31,6 +33,7 @@ import {
   useMenuSnapshot,
   type MenuItemView,
 } from "@/lib/useMenuSnapshot"
+import { showCheckUpdateLoading } from "@/lib/updateCheckToast"
 import { WindowControls } from "@/components/shell/WindowControls"
 
 /** 快照 → DropdownMenu 纯映射(递归渲染子菜单)。 */
@@ -90,7 +93,18 @@ export function MenuBar() {
   const platform = currentPlatform()
   const layout = menuBarLayout(platform)
   const { snapshot, dispatch } = useMenuSnapshot()
+  const { t } = useTranslation()
   const hasBadge = menuHasBadge(snapshot.items)
+  // 手动检查的在途反馈:派发 check-update 即出 loading toast,结果事件到达
+  // 时由 ShellDialogs 关闭(菜单条路径窗口必可见;托盘路径不经过此处)。
+  // id 契约:menu.rs 的 action 表("check-update",Rust 单一事实源)。
+  const handleDispatch = useCallback(
+    (id: string) => {
+      if (id === "check-update") showCheckUpdateLoading(t("update.checking"))
+      dispatch(id)
+    },
+    [dispatch, t],
+  )
   return (
     <div
       {...dragRegionProps()}
@@ -124,7 +138,7 @@ export function MenuBar() {
         {/* 快照未到达(items 为空)时不渲染下拉:按钮保持占位(IPC 毫秒级) */}
         {snapshot.items.length > 0 ? (
           <DropdownMenuContent align="start" sideOffset={4} className="min-w-48">
-            <MenuItems items={snapshot.items} dispatch={dispatch} />
+            <MenuItems items={snapshot.items} dispatch={handleDispatch} />
           </DropdownMenuContent>
         ) : null}
       </DropdownMenu>

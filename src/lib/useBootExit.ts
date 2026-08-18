@@ -6,9 +6,9 @@
 // → signaled。守卫:重复 ready 幂等(快照+事件双到达不重启动画)、signaled 后
 // 不再变更、phase 离开 ready(错误/重试)复位。
 //
-// 动画时长常量与 index.css 的 boot-exit / boot-exit-ring keyframes 时长一致
-// (两处各持一份,改动时同步);兜底定时器只保证「退出不依赖 CSS 事件」,
-// 动画本身在 CSS 侧完成,这里不复制动画逻辑。
+// 动画时长常量单一事实来源在 bootExit.ts(Q1):index.css 经 --boot-exit-ms
+// 变量消费(BootScreen 写入),兜底定时器时长由此推导;兜底定时器只保证
+// 「退出不依赖 CSS 事件」,动画本身在 CSS 侧完成,这里不复制动画逻辑。
 import { useCallback, useEffect, useReducer } from "react"
 
 import { BOOT_EXIT_FALLBACK_MS, reduceBootExit } from "@/lib/bootExit"

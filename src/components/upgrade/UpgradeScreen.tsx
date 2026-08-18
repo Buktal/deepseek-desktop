@@ -1,6 +1,7 @@
-// dsh 升级全屏覆盖层(#17,#3 §1 定稿形态 + #32/#40 迁移):boot / dsh 升级 /
-// 意外退出三路互斥覆盖层之一(deriveOverlay 编排)。升级流水线在途时 dsh 已杀
-// (iframe 无内容),覆盖层即主画面;菜单条不参与互斥,任何阶段常驻。
+// dsh 升级全屏覆盖层(#17,#3 §1 定稿形态 + #32/#40 迁移):四路互斥覆盖层
+// 之一(deriveOverlay 编排,F4 优先级 Error > Upgrade > Boot > Update)。
+// 升级流水线在途时 dsh 已杀(iframe 无内容),覆盖层即主画面;菜单条不参与
+// 互斥,任何阶段常驻。
 //
 // 视觉(#20 审核定稿 + #30 原型疑点 7 结论):决策面(available/failed)= 收容
 // 卡片(shadcn Card)——升级是用户可执行的动作面板;状态面(active)= 开放画布
@@ -26,6 +27,7 @@ import { InstallProgress } from "@/components/install/InstallProgress"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { localizeStructuredError, type StructuredError } from "@/lib/error"
+import type { InstallStage } from "@/lib/installStage"
 import type { DshUpgradePhase, DshUpgradeStatus } from "@/lib/useDshUpgrade"
 
 /** 四阶段步进(疑点 7 定稿形态):键 = Rust phase 串,文案经 upgrade.stage.* 翻译 */
@@ -52,7 +54,7 @@ export function UpgradeScreen({
   currentVersion: string | null
   phase: DshUpgradePhase | null
   progress: number | null
-  stage: string | null
+  stage: InstallStage | null
   error: StructuredError | null
   onConfirm: () => void
   onDismiss: () => void
@@ -76,7 +78,7 @@ export function UpgradeScreen({
   if (status === "available" || status === "failed") {
     return (
       <main className="flex h-full w-full items-center justify-center bg-background p-10 text-foreground">
-        <Card className="flex w-full max-w-md flex-col items-center gap-5 rounded-2xl p-10 text-center shadow-sm">
+        <Card className="flex w-full max-w-md flex-col items-center gap-5 rounded-3xl p-10 text-center shadow-sm">
           {status === "available" && (
             <>
               <CircleArrowUp className="size-9 text-primary" />

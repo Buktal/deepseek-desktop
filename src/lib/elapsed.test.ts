@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { formatElapsed, interpolateElapsed } from "@/lib/elapsed"
+import { formatClock, formatElapsed, interpolateElapsed } from "@/lib/elapsed"
 
 describe("formatElapsed", () => {
   it("formats seconds below one minute (issue spec: 1 秒)", () => {
@@ -24,8 +24,27 @@ describe("formatElapsed", () => {
   })
 })
 
+describe("formatClock", () => {
+  // 生产路径:BootScreen 仪表中心读数(chronometer 形态)
+  it("秒位补零,分位不补", () => {
+    expect(formatClock(0)).toBe("0:00")
+    expect(formatClock(5)).toBe("0:05")
+    expect(formatClock(59)).toBe("0:59")
+    expect(formatClock(83)).toBe("1:23")
+  })
+
+  it("分钟位超 59 按累计走(不进位小时位)", () => {
+    expect(formatClock(3600)).toBe("60:00")
+  })
+
+  it("异常输入按 0 处理(与 formatElapsed 同守卫)", () => {
+    expect(formatClock(-5)).toBe("0:00")
+    expect(formatClock(Number.NaN)).toBe("0:00")
+  })
+})
+
 describe("interpolateElapsed", () => {
-  // 生产路径:useBoot 的 displayElapsedSecs 按锚点插值(挂载晚于启动也不丢已过时间)
+  // 生产路径:useAnchoredClock 的 elapsedSecs 按锚点插值(挂载晚于启动也不丢已过时间)
   it("按锚点插值:每秒 tick 显示递增不漂移", () => {
     expect(interpolateElapsed(10, 1000, 1000)).toBe(10)
     expect(interpolateElapsed(10, 1000, 1999)).toBe(10) // 不足一秒不跳

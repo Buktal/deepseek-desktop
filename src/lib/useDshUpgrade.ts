@@ -2,20 +2,23 @@
 //
 // 架构与 useUpdateCheck 同款(#9 约束):检查/流水线全在 Rust 侧(upgrade.rs:
 // 启动探测 + 6h 轮询 + 托盘手动入口),本 hook 只是本地页上的镜像视图——
-// 挂载时拉 `upgrade_state` 快照 + 监听 `upgrade-state` 事件(同步骨架走
-// useRustStateSync,先注册监听再拉快照,后到者覆盖),动作走命令
-// (upgrade_confirm / upgrade_dismiss)。StrictMode 双挂载无害:监听注册/清理
-// 成对,快照拉取幂等。
+// 挂载时拉 `upgrade_state` 快照 + 监听 `upgrade-state` 事件,动作走命令
+// (upgrade_confirm / upgrade_dismiss)。
+//
+// 升级卡镜像基建(F1):requested 生命周期 / card-request 监听走
+// useTrayCardMirror 共享实现(useUpdateCheck 同款),本 hook 只声明差异面:
+// 字段映射(apply)、快照命令与动作命令表;卡片可见性由 deriveOverlay 内部
+// 策略判定(F4),本 hook 暴露原始输入(status + requested)。
 //
 // 错误跨边界保持结构化形态({kind,data}),卡片渲染时才经 localizeStructuredError
 // 翻译(语言切换可重译,见 src/lib/error.ts 与 #12)。
 
 import { invoke } from "@tauri-apps/api/core"
-import { listen } from "@tauri-apps/api/event"
-import { useCallback, useEffect, useState } from "react"
+import { useState } from "react"
 
 import { toStructuredError, type RustErrorPayload, type StructuredError } from "@/lib/error"
-import { useRustStateSync } from "@/lib/useRustStateSync"
+import type { InstallStage } from "@/lib/installStage"
+import { useTrayCardMirror } from "@/lib/useTrayCardMirror"
 
 export type DshUpgradeStatus =
   | "idle" // 无待升级(初始 / 无新版 / 升级成功消费完毕)
@@ -33,89 +36,48 @@ export interface DshUpgradeStateView {
   currentVersion?: string | null
   phase?: DshUpgradePhase | null
   progress?: number | null
-  stage?: string | null
+  stage?: InstallStage | null
   error?: RustErrorPayload | null
 }
 
-/**
- * 升级卡片是否可见(纯函数,可测)。壳页常驻后(#36)卡片是浮层,可见性 =
- * 流水线活跃态(active/ready/failed 必有卡片,流水线是用户动作触发的)
- * + available 需显式请求(托盘「升级 dsh 到 vX」菜单 → upgrade-card-request
- * 事件;自动检测只亮托盘徽标,不弹卡片,#3 §1)。
- */
-export function isUpgradeCardVisible(status: DshUpgradeStatus, requested: boolean): boolean {
-  return status === "available" ? requested : status !== "idle"
-}
-
 export function useDshUpgrade() {
-  const [status, setStatus] = useState<DshUpgradeStatus>("idle")
   // 跨边界保持结构化形态,卡片渲染时才翻译(语言切换不冻结旧文案)
   const [error, setError] = useState<StructuredError | null>(null)
   const [version, setVersion] = useState<string | null>(null)
   const [currentVersion, setCurrentVersion] = useState<string | null>(null)
   const [phase, setPhase] = useState<DshUpgradePhase | null>(null)
   const [progress, setProgress] = useState<number | null>(null)
-  const [stage, setStage] = useState<string | null>(null)
-  // 卡片显式请求:托盘「升级 dsh 到 vX」点击(壳页常驻后无页面切换,available
-  // 态需此请求才弹卡;状态离开 available 即复位,不跨轮残留)
-  const [requested, setRequested] = useState(false)
+  const [stage, setStage] = useState<InstallStage | null>(null)
 
-  // 托盘「升级 dsh 到 vX」菜单 → 显示升级卡片(事件由 tray.rs 推送)
-  useEffect(() => {
-    let alive = true
-    let stop: (() => void) | undefined
-    void listen("upgrade-card-request", () => {
-      if (alive) setRequested(true)
-    }).then((un) => {
-      stop = un
-      if (!alive) un()
-    })
-    return () => {
-      alive = false
-      stop?.()
-    }
-  }, [])
-
-  // 事件与快照来自同一 Rust 状态,后到者覆盖,无竞态
-  const applyView = useCallback((view: DshUpgradeStateView) => {
-    setStatus(view.status)
-    setError(toStructuredError(view.error ?? null))
-    setVersion(view.version ?? null)
-    setCurrentVersion(view.currentVersion ?? null)
-    setPhase(view.phase ?? null)
-    setProgress(view.progress ?? null)
-    setStage(view.stage ?? null)
-    // 请求只对 available 有意义:进入流水线/消费完毕(Idle)后复位,
-    // 避免旧请求在下一轮自动检测命中时误弹卡片
-    if (view.status !== "available") setRequested(false)
-  }, [])
-
-  useRustStateSync({
-    event: "upgrade-state",
+  const mirror = useTrayCardMirror({
+    stateEvent: "upgrade-state",
+    cardRequestEvent: "upgrade-card-request",
     snapshot: () => invoke<DshUpgradeStateView>("upgrade_state"),
-    apply: applyView,
+    // status/requested 由 mirror 接管,这里只写其余字段(事件与快照同构,
+    // 后到者覆盖,无竞态)
+    apply: (view) => {
+      setError(toStructuredError(view.error ?? null))
+      setVersion(view.version ?? null)
+      setCurrentVersion(view.currentVersion ?? null)
+      setPhase(view.phase ?? null)
+      setProgress(view.progress ?? null)
+      setStage(view.stage ?? null)
+    },
+    actions: {
+      confirm: "upgrade_confirm",
+      dismiss: "upgrade_dismiss",
+    },
     // 监听/快照失败:保持 idle,升级卡片不出现(升级是增强,不是硬依赖)
     onError: (e) => console.warn("[upgrade] dsh 升级状态同步失败,保持 idle", e),
   })
 
-  // 卡片动作:全部走 Rust 命令(检测/流水线/恢复服务都在 Rust 侧,见 upgrade.rs)
-  const confirm = useCallback(() => {
-    void invoke("upgrade_confirm").catch(() => {})
-  }, [])
-  const dismiss = useCallback(() => {
-    void invoke("upgrade_dismiss").catch(() => {})
-  }, [])
-
   return {
-    status,
+    ...mirror,
     error,
     version,
     currentVersion,
     phase,
     progress,
     stage,
-    visible: isUpgradeCardVisible(status, requested),
-    confirm,
-    dismiss,
   }
 }

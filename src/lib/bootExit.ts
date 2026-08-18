@@ -8,12 +8,18 @@
 // → signaled。守卫:重复 ready 幂等(快照+事件双到达不重启动画)、signaled 后
 // 不再变更(动画结束事件可能重复触发)、phase 离开 ready(错误/重试)复位。
 //
-// 动画时长常量与 index.css 的 boot-exit / boot-exit-ring keyframes 时长一致
-// (两处各持一份,改动时同步);兜底定时器只保证「退出不依赖 CSS 事件」,
-// 动画本身在 CSS 侧完成,这里不复制动画逻辑。
+// 动画契约单一出口(Q1):时长与动画名全部从这里导出——BootScreen 把时长写
+// 进 --boot-exit-ms 变量(index.css 消费)并用于 onAnimationEnd 过滤,兜底
+// 定时器时长由此推导;index.css 不再硬编码时长。兜底定时器只保证「退出
+// 不依赖 CSS 事件」,动画本身在 CSS 侧完成,这里不复制动画逻辑。
 
-/** 退出动画时长(ms)。与 index.css 的 boot-exit / boot-exit-ring 时长一致 */
+/** 退出动画时长(ms)。单一事实来源:index.css 经 --boot-exit-ms 变量消费,
+ * BootScreen 从本常量写入该变量;BOOT_EXIT_FALLBACK_MS 由此推导 */
 export const BOOT_EXIT_ANIMATION_MS = 400
+/** 退出动画名(单一事实来源:BootScreen 的 onAnimationEnd 过滤用) */
+export const BOOT_EXIT_ANIMATION_NAME = "boot-exit"
+/** 旋转圆环收缩动画名(单一事实来源:同上) */
+export const BOOT_EXIT_RING_ANIMATION_NAME = "boot-exit-ring"
 /** 兜底信号定时器时长:动画时长 + 余量。CSS 动画事件在 reduced-motion 下
  * 不触发(animation: none),定时器保证导航不依赖 CSS 事件 */
 export const BOOT_EXIT_FALLBACK_MS = BOOT_EXIT_ANIMATION_MS + 100
