@@ -6,7 +6,7 @@
 // - Windows/Linux:无边框窗口一行——行本身为拖拽区(同上豁免与内建),
 //   左侧菜单按钮,右侧自绘窗口控制贴右缘(WindowControls,#42)。
 // - 菜单按钮(M3):快照渲染的 shadcn DropdownMenu——与托盘同源(useMenuSnapshot
-//   镜像 Rust 的 MenuSnapshot),items 纯映射(check 勾选列 / disabled 禁用 /
+//   镜像 Rust 的 MenuSnapshot),items 纯映射(check 行尾勾选 / disabled 禁用 /
 //   submenu 嵌套 / separator 分隔),动作点击全部 invoke menu_action 回流
 //   Rust 统一分发;升级槽位非空时按钮显示徽标点(与托盘徽标图标同源,#3 §1)。
 //   勾选态直接取自快照、不维护本地切换状态:Rust 是事实源,新快照覆盖。
@@ -64,11 +64,10 @@ function MenuItems({
                 disabled={item.disabled}
                 onClick={() => dispatch(item.id)}
               >
-                {/* 勾选列固定宽度:勾选/未勾选标签对齐(与托盘原生勾选同视觉) */}
-                <span className="flex size-4 shrink-0 items-center justify-center">
-                  {item.checked ? <CheckIcon /> : null}
-                </span>
                 {item.label}
+                {/* 勾选标记放行尾:所有菜单文字统一左起(勾选列在左会让该行
+                    文字比普通项缩进);托盘原生菜单的勾选位由平台决定,不受此影响 */}
+                {item.checked ? <CheckIcon className="ml-auto" /> : null}
               </DropdownMenuItem>
             )
           default:
